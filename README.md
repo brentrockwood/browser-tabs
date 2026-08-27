@@ -10,6 +10,10 @@ A deterministic, local-first browser adapter for inspecting open browser windows
 
 The extension never rearranges, closes, creates, or navigates tabs in this phase.
 
+`browser.read_tab` returns the document body's rendered text (`innerText`) in
+document order, normalizes CRLF to LF, and caps `text` at 500,000 characters.
+It reports the full `characterCount` and `truncated: true` when the cap applies.
+
 ## Support boundary
 
 The code targets Manifest V3 WebExtensions: Chrome, Edge, Brave, Opera, and Firefox. Browsers may refuse content access to internal pages, extension-store pages, or other protected contexts. Those cases are returned as explicit outcomes, never as empty or invented page content.

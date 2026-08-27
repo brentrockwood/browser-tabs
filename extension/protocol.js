@@ -1,4 +1,5 @@
 export const SNAPSHOT_SCHEMA_VERSION = 1;
+export const MAX_TEXT_CHARACTERS = 500_000;
 
 export function unsupportedSnapshot(tabId, reason) {
   return {
@@ -40,13 +41,16 @@ export function pageTextSnapshot() {
     return { status: "not_ready", reason: "document_has_no_body" };
   }
 
-  const text = body.innerText.replace(/\r\n/g, "\n");
+  const fullText = body.innerText.replace(/\r\n/g, "\n");
+  const truncated = fullText.length > MAX_TEXT_CHARACTERS;
+  const text = fullText.slice(0, MAX_TEXT_CHARACTERS);
   return {
     status: "ok",
     title: document.title,
     url: location.href,
     text,
-    characterCount: text.length,
+    characterCount: fullText.length,
+    truncated,
     documentReadyState: document.readyState,
   };
 }
