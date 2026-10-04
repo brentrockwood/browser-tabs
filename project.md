@@ -110,24 +110,27 @@ the function or defined inside it.
 
 Implementation:
 
-- [ ] Fix page snapshot injection so it runs in the target tab.
-- [ ] Test successful snapshots, missing bodies, CRLF normalization,
+- [x] Fix page snapshot injection so it runs in the target tab.
+- [x] Test successful snapshots, missing bodies, CRLF normalization,
   character counts, and truncation at the configured limit.
-- [ ] Test `readTab` success, empty injection results, and rejected injection.
-- [ ] Validate message parameters before calling browser APIs.
-- [ ] Return stable error codes while retaining browser error text only as
+- [x] Test `readTab` success, empty injection results, and rejected injection.
+- [x] Validate message parameters before calling browser APIs.
+- [x] Return stable error codes while retaining browser error text only as
   diagnostic detail.
-- [ ] Add a Chromium smoke test that loads the unpacked extension and exercises
+- [x] Add a Chromium smoke test that loads the unpacked extension and exercises
   window listing, tab listing, a readable page, and a protected page.
-- [ ] Make the README's support claims match what the smoke tests establish.
+- [x] Make the README's support claims match what the smoke tests establish.
 
 Exit criteria:
 
-- [ ] `npm test` passes from a clean checkout.
-- [ ] The smoke test proves all three README operations in Chromium.
-- [ ] A protected page produces an explicit unsupported or permission-denied
-  result rather than empty content.
-- [ ] No operation creates, closes, moves, groups, or navigates a tab.
+- [x] `npm test` passes from a clean checkout. (29/29 passing.)
+- [x] The smoke test proves all three README operations in Chromium. (Passed
+  against a real Chrome for Testing browser, via the extension's actual
+  `runtime.onMessage` listener.)
+- [x] A protected page produces an explicit unsupported or permission-denied
+  result rather than empty content. (`status: "unsupported"`,
+  `code: "injection_rejected"`, verified in the smoke test.)
+- [x] No operation creates, closes, moves, groups, or navigates a tab.
 
 ### Stage 1 — Prove the local bridge
 
@@ -375,18 +378,24 @@ review.
 
 ## Current repository state
 
-The repository contains a small Manifest V3 inspector. It normalizes
-extension-visible windows and tabs and intends to read bounded rendered text
+The repository contains a small, stabilized Manifest V3 inspector. It
+normalizes extension-visible windows and tabs and reads bounded rendered text
 from a tab when script injection is permitted. It has no network service,
 derived store, review UI, browser-history query, tab-group support, or browser
 mutations.
 
-The existing unit tests cover record normalization and unsupported snapshot
-formatting. They do not yet exercise page extraction, the service worker, or a
-real browser. The injected snapshot function currently depends on a module
-constant that will not exist when the browser serializes the function into a
-tab; Stage 0 treats that as the first blocking defect rather than assuming the
-prototype is already a working integration base.
+The injected snapshot function no longer depends on module lexical scope: the
+text limit is passed into it as an argument, so it runs correctly once the
+browser serializes it into the target tab. Unit tests (29/29 passing) cover
+record normalization, page-text extraction (successful snapshots, missing
+bodies, CRLF normalization, character counts, truncation), the service
+worker's `readTab`/`listTabs`/`listWindows` functions, and the registered
+`runtime.onMessage` listener's routing and error responses. A real-browser
+smoke test additionally loads the unpacked extension in Chrome for Testing
+and, through the extension's actual `runtime.onMessage` entry point, confirms
+window listing, tab listing, and reading an ordinary page, plus that a
+protected page returns an explicit `unsupported`/`injection_rejected` result
+rather than empty content.
 
 Completed foundation:
 
@@ -395,6 +404,10 @@ Completed foundation:
 - [x] Explicit snapshot schema version and status field.
 - [x] Bounded-response intent and truncation metadata.
 - [x] No browser mutation operations.
+- [x] Page-snapshot injection fixed to run correctly in a real browser tab.
+- [x] Unit test coverage for page extraction, the service worker, and the
+  registered message listener.
+- [x] Repeatable Chromium smoke test, verified against Chrome for Testing.
 - [x] Dependency-free Node.js unit-test command.
 
 ## Definition of done for any stage

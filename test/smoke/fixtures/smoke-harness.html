@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Tabs smoke-test harness</title>
+  </head>
+  <body>
+    <p>
+      Test-only extension page used by <code>npm run test:smoke</code>. It is
+      copied into a staged, temporary copy of the extension (never into the
+      shipped <code>extension/</code> directory) so the smoke test can call
+      <code>chrome.runtime.sendMessage</code> from a genuine separate
+      extension context and exercise the real
+      <code>runtime.onMessage</code> listener in
+      <code>service-worker.js</code>, instead of importing and calling its
+      exported functions directly.
+    </p>
+  </body>
+</html>
