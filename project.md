@@ -302,24 +302,24 @@ not choose or call a model in Phase 1.
 
 Implementation:
 
-- [ ] Publish a compact client contract for listing sources, reading captures,
+- [x] Publish a compact client contract for listing sources, reading captures,
   and writing summaries and proposals.
-- [ ] Provide one small reference client or CLI flow using the same public API
+- [x] Provide one small reference client or CLI flow using the same public API
   as other callers.
-- [ ] Require source IDs on summaries and proposals.
-- [ ] Preserve caller-supplied model and prompt metadata without treating it as
+- [x] Require source IDs on summaries and proposals.
+- [x] Preserve caller-supplied model and prompt metadata without treating it as
   trusted browser evidence.
-- [ ] Prevent proposals from invoking extension methods or changing approval
+- [x] Prevent proposals from invoking extension methods or changing approval
   policy.
-- [ ] Add an end-to-end example: capture selected tabs, attach summaries, and
+- [x] Add an end-to-end example: capture selected tabs, attach summaries, and
   propose collections without changing the browser.
 
 Exit criteria:
 
-- [ ] A caller can complete the example using only documented API operations.
-- [ ] The resulting records identify browser facts, derived text, provenance,
+- [x] A caller can complete the example using only documented API operations.
+- [x] The resulting records identify browser facts, derived text, provenance,
   and proposal state separately.
-- [ ] Malicious instructions inside captured page text cannot create a new API
+- [x] Malicious instructions inside captured page text cannot create a new API
   method or mark a proposal approved.
 
 ### Stage 5 — Local review UI
@@ -701,6 +701,82 @@ Completed foundation (Stage 0):
   files. (Stage 1 added the `ws` runtime dependency — see its README
   section — so the *overall* `npm test` now requires `npm install` first;
   Stage 0's own files still need nothing beyond `node:test`.)
+
+Stage 4 (the external-agent workflow) has been implemented against this
+revision, including a remediation pass after an independent (Terra) review
+found the first implementation was "client-only theater": there was no
+real trust-boundary distinction between an "agent" caller and the owner —
+a single shared credential granted full access either way, and the
+reference client's own generic `call(method, ...)` escape hatch meant any
+caller could reach `store.captures.create` (forging arbitrary "evidence")
+or `store.proposals.update` (self-approving a proposal) merely by not
+using the narrower convenience methods.
+
+The fix is a real, server-side trust boundary:
+`service/credential.mjs` manages a second, independently-generated,
+`0600`-permissioned credential file (`agent-token`, distinct from the
+owner's own `credential` file) via `loadOrCreateAgentCredential`;
+`service/server.mjs`'s `createService` accepts it as `agentCredentialToken`
+and `authenticate(req)` reports whether a request carries `"owner"` or
+`"agent"` scope. Agent scope is restricted to three explicit allowlists
+(`AGENT_ALLOWED_BROWSER_METHODS`/`_WORKFLOW_METHODS`/`_STORE_METHODS`),
+checked before dispatch; anything else is `403 forbidden_scope`, including
+`/control/stop` and every `store.*` mutation route except
+`store.summaries.create`/`store.proposals.create`. A new operation,
+`workflow.capture_tab`, is the *only* capture-creation path agent scope
+can reach: it takes no request body at all — the service performs the
+real `browser.read_tab` round trip itself and persists exactly that
+result — so an agent caller cannot forge stored browser evidence no
+matter what JSON it sends, because there is no route that accepts one.
+For every agent-scoped write, the server discards whatever
+`creatorType`/`creatorName` the request body claims and substitutes a
+fixed, server-controlled external-agent identity, unconditionally.
+`client/browser-tabs-client.mjs` was narrowed to match: it now exports
+`BrowserTabsAgentClient` with no generic `call()`, no `createCapture`, no
+proposal-decision method, no `creatorType`/`creatorName` parameter
+anywhere, strict loopback-only `baseUrl` validation, `redirect: "error"`
+on every fetch, full response-envelope validation (protocolVersion, exactly
+one of result/error, matching request id), and deeply bounded,
+finite-integer/plain-object input validation throughout; `client/cli.mjs`
+dispatches only through that same method allowlist, reads its (agent)
+credential via a bounded `open`/`stat`/`read` sequence rather than
+`readFile`'s whole-file read, and reads its request document the same
+bounded way.
+
+`test/credential.test.mjs` now also covers the agent credential's
+independent lifecycle (distinct file/value, same race-safe/crash-safe/
+permission-repairing behavior as the owner's). `test/scoped-auth.test.mjs`
+is new: real-HTTP integration tests proving the full allowlist (every
+agent-allowed route, a long list of explicitly forbidden ones, a 404 for
+an unknown route regardless of scope, the agent token rejected by the
+extension's own WebSocket auth, and the creator-identity override).
+`test/stage4-e2e.test.mjs` is the deterministic end-to-end example,
+rewritten to use `BrowserTabsAgentClient` exclusively for the agent side
+(no direct `store.captures.create`/generic calls), with the captured page
+text itself embedding an adversarial instruction, and with all
+final-state assertions (proposal still pending, no collection exists)
+made through the **owner's** own public HTTP API, not a direct store
+call. `test/client.test.mjs` was rewritten for the new class's contract
+and bounds. `test/smoke/stage1-bridge-smoke.mjs` (the real Chrome for
+Testing smoke test) was extended with a new Step 2.6 exercising this same
+workflow against a real browser tab and a real, separately-printed agent
+credential — see README.md's "Real-browser bridge smoke test" section.
+
+See README.md's "Stage 4: the external-agent workflow" section for the
+full contract, allowlist table, threat/provenance documentation, and
+usage.
+
+**Stage 4 verification:** the orchestrator ran `npm test` (295/295
+passing), the focused client/scope/workflow suite (39/39 passing),
+`npm audit --omit=dev` (no vulnerabilities), syntax and diff checks, and
+the expanded real Chrome for Testing bridge smoke. The smoke captured a
+real page containing an adversarial instruction, created a scoped-agent
+summary and pending collection proposal, and verified through the owner's
+public API that no collection or browser mutation occurred. Independent
+Terra review found the original client-only trust boundary insufficient;
+its findings were remediated with the scoped server credential/allowlist,
+server-issued capture path, strict client transport, and subsequent
+hardening tests. The Stage 4 checklist above is complete.
 
 ## Definition of done for any stage
 

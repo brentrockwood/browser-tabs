@@ -126,6 +126,12 @@ export const ERROR_CODES = Object.freeze({
   INVALID_REQUEST: "invalid_request",
   MISSING_CREDENTIAL: "missing_credential",
   INVALID_CREDENTIAL: "invalid_credential",
+  // Stage 4: the presented credential authenticated successfully (it is a
+  // real owner or external-agent token), but the scope it carries does not
+  // permit the requested method — distinct from INVALID_CREDENTIAL, which
+  // means the credential itself did not authenticate at all. See
+  // service/server.mjs's AGENT_ALLOWED_* allowlists.
+  FORBIDDEN_SCOPE: "forbidden_scope",
   ORIGIN_REJECTED: "origin_rejected",
   AUTH_TIMEOUT: "auth_timeout",
   DISCONNECTED: "disconnected",

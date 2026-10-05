@@ -11,7 +11,8 @@
     "test:store": "node --test test/store.test.mjs test/store-routes.test.mjs",
     "test:smoke": "node test/smoke/chromium-smoke.mjs",
     "test:smoke:bridge": "node test/smoke/stage1-bridge-smoke.mjs",
-    "service": "node service/cli.mjs"
+    "service": "node service/cli.mjs",
+    "client": "node client/cli.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

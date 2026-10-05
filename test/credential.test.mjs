@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { ensureDataDir, getCredentialPath, loadOrCreateCredential } from "../service/credential.mjs";
+import {
+  ensureDataDir,
+  getAgentCredentialPath,
+  getCredentialPath,
+  loadOrCreateAgentCredential,
+  loadOrCreateCredential,
+} from "../service/credential.mjs";
 
 async function withTempDataDir(run) {
   const dataDir = await mkdtemp(join(tmpdir(), "browser-tabs-credential-"));
@@ -75,5 +81,67 @@ test("creates the credential exactly once under concurrent, racing callers", asy
 
     const onDisk = await loadOrCreateCredential(dataDir);
     assert.equal(onDisk.token, [...tokens][0]);
+  });
+});
+
+// Stage 4: the external-agent credential is a distinct file with a
+// distinct value, generated and managed with the exact same race-safe,
+// crash-safe, permission-repairing lifecycle as the owner credential above
+// — but the two must never be the same value, and clearing/rotating one
+// must never affect the other.
+test("the external-agent credential is a distinct file and a distinct value from the owner credential, with user-only permissions on first run", async () => {
+  await withTempDataDir(async (dataDir) => {
+    const owner = await loadOrCreateCredential(dataDir);
+    const agent = await loadOrCreateAgentCredential(dataDir);
+
+    assert.notEqual(getAgentCredentialPath(dataDir), getCredentialPath(dataDir));
+    assert.notEqual(agent.token, owner.token);
+    assert.equal(agent.created, true);
+    assert.match(agent.token, /^[0-9a-f]{64}$/);
+
+    const info = await stat(getAgentCredentialPath(dataDir));
+    assert.equal(info.mode & 0o777, 0o600);
+
+    // The owner credential's own file must be completely unaffected by
+    // having also created an agent credential in the same data directory.
+    const ownerAfter = await loadOrCreateCredential(dataDir);
+    assert.equal(ownerAfter.token, owner.token);
+    assert.equal(ownerAfter.created, false);
+  });
+});
+
+test("reuses an existing external-agent credential instead of regenerating it", async () => {
+  await withTempDataDir(async (dataDir) => {
+    const first = await loadOrCreateAgentCredential(dataDir);
+    const second = await loadOrCreateAgentCredential(dataDir);
+    assert.equal(second.created, false);
+    assert.equal(second.token, first.token);
+  });
+});
+
+test("repairs an existing external-agent credential file left with looser permissions", async () => {
+  await withTempDataDir(async (dataDir) => {
+    const { token } = await loadOrCreateAgentCredential(dataDir);
+    await chmod(getAgentCredentialPath(dataDir), 0o644);
+
+    const repaired = await loadOrCreateAgentCredential(dataDir);
+    assert.equal(repaired.token, token);
+
+    const fileInfo = await stat(getAgentCredentialPath(dataDir));
+    assert.equal(fileInfo.mode & 0o777, 0o600);
+  });
+});
+
+test("creates the external-agent credential exactly once under concurrent, racing callers, independent of the owner credential", async () => {
+  await withTempDataDir(async (dataDir) => {
+    const [ownerResults, agentResults] = await Promise.all([
+      Promise.all(Array.from({ length: 4 }, () => loadOrCreateCredential(dataDir))),
+      Promise.all(Array.from({ length: 4 }, () => loadOrCreateAgentCredential(dataDir))),
+    ]);
+    const ownerTokens = new Set(ownerResults.map((result) => result.token));
+    const agentTokens = new Set(agentResults.map((result) => result.token));
+    assert.equal(ownerTokens.size, 1);
+    assert.equal(agentTokens.size, 1);
+    assert.notEqual([...ownerTokens][0], [...agentTokens][0]);
   });
 });

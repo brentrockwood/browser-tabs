@@ -87,6 +87,70 @@ const ERROR_STATUS = Object.freeze({
   [ERROR_CODES.SERVICE_SHUTTING_DOWN]: 503,
 });
 
+// Stage 4: the one new operation exposed under /api/workflow.<method>,
+// alongside the existing browser.* (forward-to-extension) and store.*
+// (local-store) namespaces. `workflow.capture_tab` is the *only*
+// capture-creation path exposed to external-agent scope (see
+// AGENT_ALLOWED_STORE_METHODS below, which deliberately excludes
+// `store.captures.create`): it takes a tabId/browserSessionId, performs the
+// real `browser.read_tab` round trip itself, and persists exactly that
+// freshly-fetched, already-validated result — never a caller-supplied
+// capture body — so stored browser evidence cannot be forged by submitting
+// arbitrary JSON (see handleWorkflowMethod below).
+const WORKFLOW_ROUTES = new Map([
+  [
+    "workflow.capture_tab",
+    {
+      httpMethod: "POST",
+      paramsFromQuery: (url) => ({ tabId: numberParam(url, "tabId"), browserSessionId: stringParam(url, "browserSessionId") }),
+    },
+  ],
+]);
+
+// Stage 4: the server-side allowlists an external-agent credential's scope
+// is restricted to (project.md Stage 4 remediation: "external-agent scope
+// must be server-side allowlisted only to Stage4 operations needed"). The
+// owner credential bypasses these entirely (see `authenticate` below) — it
+// always has full, unscoped access, exactly as before this stage. Anything
+// not listed here is unreachable for agent scope even if the underlying
+// route exists for the owner: a 403 `forbidden_scope`, never a silent
+// allow, and never implemented as "everything except a denylist."
+//
+// browser.*: every Stage 2 read-only route — listing/reading browser
+// sources is always safe; none of them mutate the browser or persist
+// anything.
+const AGENT_ALLOWED_BROWSER_METHODS = new Set([
+  "browser.list_windows",
+  "browser.list_tabs",
+  "browser.list_tab_groups",
+  "browser.read_tab",
+  "browser.query_history",
+  "browser.get_capabilities",
+]);
+// workflow.*: the one capture-creation path agent scope may use.
+const AGENT_ALLOWED_WORKFLOW_METHODS = new Set(["workflow.capture_tab"]);
+// store.*: read evidence already captured, and write only the two derived
+// record types Stage 4's workflow needs (summaries, proposals) — never
+// update/delete, never tags/collections/queue, never retention/clear, and
+// never a direct `store.captures.create` (which would let a caller assert
+// arbitrary "evidence" instead of going through workflow.capture_tab above).
+const AGENT_ALLOWED_STORE_METHODS = new Set([
+  "store.captures.list",
+  "store.captures.read",
+  "store.summaries.create",
+  "store.summaries.list",
+  "store.proposals.create",
+  "store.proposals.list",
+]);
+
+function forbiddenScopeResponse(requestId, name) {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    requestId,
+    error: { code: ERROR_CODES.FORBIDDEN_SCOPE, detail: `"${name}" is not permitted for this credential's scope` },
+  };
+}
+
 function timingSafeTokenEquals(candidate, expected) {
   if (typeof candidate !== "string") return false;
   const a = Buffer.from(candidate);
@@ -97,6 +161,17 @@ function timingSafeTokenEquals(candidate, expected) {
 
 function isTrustedExtensionOrigin(origin) {
   return typeof origin === "string" && origin.startsWith("chrome-extension://");
+}
+
+// True if the request declares any body framing at all — a `Content-Length`
+// other than exactly "0", or any `Transfer-Encoding` (chunked bodies carry
+// no Content-Length). Used to reject a body on a route that never reads
+// one (workflow.capture_tab), so a forged body can never be silently
+// ignored and then mistaken for having had no effect.
+function hasRequestBodyFraming(req) {
+  const contentLength = req.headers["content-length"];
+  if (typeof contentLength === "string" && contentLength !== "0") return true;
+  return req.headers["transfer-encoding"] !== undefined;
 }
 
 function respondJson(res, status, body) {
@@ -114,6 +189,18 @@ function respondJson(res, status, body) {
 // bind an ephemeral port.
 export function createService({
   credentialToken,
+  // Stage 4: the separate, scoped external-agent credential (see
+  // service/credential.mjs's loadOrCreateAgentCredential). Optional so
+  // every existing Stage 1/2/3 test/caller that never configures one keeps
+  // exactly its prior behavior: with no agent token configured, only
+  // `credentialToken` (owner) authenticates at all, same as before this
+  // stage.
+  agentCredentialToken = null,
+  // Stage 4: the fixed, server-controlled creator identity bound to every
+  // derived record an agent-scoped write creates (summaries, proposals) —
+  // never the identity the caller's request body claims. See
+  // handleStoreMethod's creator-override step below.
+  agentCreatorName = "reference-agent",
   host = "127.0.0.1",
   port = 0,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
@@ -145,6 +232,16 @@ export function createService({
   onControlStop = async () => {},
   log = () => {},
 }) {
+  // Fails fast, before any socket is ever opened: an agent credential equal
+  // to the owner credential would let the external-agent token authenticate
+  // with full owner scope (see `authenticate` below, which checks the owner
+  // token first but would still grant "owner" for a presented token equal
+  // to it either way) — exactly the privilege escalation Stage 4's separate
+  // scoped credential exists to prevent.
+  if (typeof agentCredentialToken === "string" && agentCredentialToken.length > 0 && timingSafeTokenEquals(agentCredentialToken, credentialToken)) {
+    throw new Error("agentCredentialToken must not equal credentialToken: a shared token would grant the external-agent credential owner scope");
+  }
+
   const startedAt = Date.now();
   let extensionSocket = null;
   let extensionConnectedAt = null;
@@ -167,14 +264,27 @@ export function createService({
     return rateWindowCount <= rateLimitMaxRequests;
   }
 
-  function checkAuth(req) {
+  // Authenticates a request and reports which *scope* the presented
+  // credential carries — `"owner"` (the original pairing credential, full
+  // access, unchanged from before Stage 4) or `"agent"` (the separate,
+  // restricted external-agent credential; see the AGENT_ALLOWED_* sets
+  // above). Returns `{ ok: true, scope }` on success or `{ ok: false,
+  // status, error }` on failure, so every call site can branch on scope
+  // without re-deriving it. Both tokens are compared with the same
+  // timing-safe comparison used before this stage; agentCredentialToken
+  // being unset (the default) means no token other than the owner's can
+  // ever authenticate, exactly matching this project's behavior before
+  // Stage 4.
+  function authenticate(req) {
     const header = req.headers.authorization;
     const match = typeof header === "string" ? /^Bearer\s+(.+)$/.exec(header) : null;
-    if (!match) return { status: 401, error: { code: ERROR_CODES.MISSING_CREDENTIAL } };
-    if (!timingSafeTokenEquals(match[1], credentialToken)) {
-      return { status: 401, error: { code: ERROR_CODES.INVALID_CREDENTIAL } };
+    if (!match) return { ok: false, status: 401, error: { code: ERROR_CODES.MISSING_CREDENTIAL } };
+    const presented = match[1];
+    if (timingSafeTokenEquals(presented, credentialToken)) return { ok: true, scope: "owner" };
+    if (typeof agentCredentialToken === "string" && agentCredentialToken.length > 0 && timingSafeTokenEquals(presented, agentCredentialToken)) {
+      return { ok: true, scope: "agent" };
     }
-    return null;
+    return { ok: false, status: 401, error: { code: ERROR_CODES.INVALID_CREDENTIAL } };
   }
 
   // Strictly required, not merely validated-if-present: a caller that never
@@ -230,9 +340,18 @@ export function createService({
 
   async function handleApiMethod(method, req, res, url) {
     const requestId = requestIdFor(req);
-    const authFailure = checkAuth(req);
-    if (authFailure) {
-      respondJson(res, authFailure.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: authFailure.error });
+    const auth = authenticate(req);
+    if (!auth.ok) {
+      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
+      return;
+    }
+    // Stage 4: explicit, server-side scope allowlist — the owner scope
+    // bypasses this entirely; agent scope may only reach the browser.*
+    // methods named in AGENT_ALLOWED_BROWSER_METHODS. Checked before rate
+    // limiting/forwarding so a forbidden request never reaches the
+    // extension at all.
+    if (auth.scope === "agent" && !AGENT_ALLOWED_BROWSER_METHODS.has(method)) {
+      respondJson(res, 403, forbiddenScopeResponse(requestId, method));
       return;
     }
 
@@ -377,9 +496,17 @@ export function createService({
   // content out of logs by default").
   async function handleStoreMethod(name, route, req, res, url) {
     const requestId = requestIdFor(req);
-    const authFailure = checkAuth(req);
-    if (authFailure) {
-      respondJson(res, authFailure.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: authFailure.error });
+    const auth = authenticate(req);
+    if (!auth.ok) {
+      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
+      return;
+    }
+    // Stage 4: agent scope may reach only the store.* methods named in
+    // AGENT_ALLOWED_STORE_METHODS — deliberately excluding
+    // store.captures.create, every update/delete route, tags/collections/
+    // queue entirely, and retention/clear. The owner scope is unaffected.
+    if (auth.scope === "agent" && !AGENT_ALLOWED_STORE_METHODS.has(name)) {
+      respondJson(res, 403, forbiddenScopeResponse(requestId, name));
       return;
     }
     if (!checkRateLimit()) {
@@ -415,6 +542,19 @@ export function createService({
       }
     }
 
+    // Stage 4: an agent-scoped write cannot assert its own creator identity
+    // — in particular it cannot claim `creatorType: "user"` to impersonate
+    // the local human. Whatever the request body contains for
+    // creatorType/creatorName is discarded and replaced with the fixed,
+    // server-controlled external-agent identity before the store ever sees
+    // it. This is unconditional for any agent-scoped POST/PATCH body (not
+    // only the two routes that use these fields): agent scope cannot reach
+    // any other mutating store.* route at all (see the allowlist check
+    // above), so there is nothing else for this override to affect.
+    if (auth.scope === "agent" && body !== undefined && body !== null && typeof body === "object" && !Array.isArray(body)) {
+      body = { ...body, creatorType: "agent", creatorName: agentCreatorName };
+    }
+
     try {
       const result = route.run({ store, url, body });
       const responseBody = { protocolVersion: PROTOCOL_VERSION, requestId, result };
@@ -440,6 +580,130 @@ export function createService({
     }
   }
 
+  // Stage 4: `workflow.capture_tab` — the only capture-creation path
+  // exposed to external-agent scope (AGENT_ALLOWED_STORE_METHODS
+  // deliberately excludes `store.captures.create` for that reason). Unlike
+  // every store.* route, this one does not take a caller-supplied capture
+  // body at all: it performs the real `browser.read_tab` extension round
+  // trip itself (exactly like handleApiMethod above), validates that
+  // result the same way handleApiMethod does, and persists *that*
+  // server-fetched, already-validated result — never anything read from
+  // the HTTP request body, because there is no such body. A caller cannot
+  // forge stored browser evidence through this route no matter what JSON
+  // it sends, because nothing it sends is ever stored.
+  //
+  // Non-"ok" `browser.read_tab` outcomes (stale handle, protected page,
+  // tab still loading, ...) are persisted too, not discarded: the capture
+  // row then records the envelope's `code`/`detail` only (no invented page
+  // content — the same rule validateCaptureInput already enforces for any
+  // caller), which preserves a documented record of "this is what happened
+  // when tab X was read," matching how store.captures.create already
+  // supports non-"ok" captures (see service/validation.mjs). The response
+  // is always the same bounded capture projection store.captures.create
+  // returns, regardless of status.
+  async function handleWorkflowMethod(name, route, req, res, url) {
+    const requestId = requestIdFor(req);
+    const auth = authenticate(req);
+    if (!auth.ok) {
+      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
+      return;
+    }
+    if (auth.scope === "agent" && !AGENT_ALLOWED_WORKFLOW_METHODS.has(name)) {
+      respondJson(res, 403, forbiddenScopeResponse(requestId, name));
+      return;
+    }
+    if (!checkRateLimit()) {
+      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
+      return;
+    }
+    if (!store) {
+      respondJson(res, 503, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: "store_unavailable" } });
+      return;
+    }
+    if (req.method !== route.httpMethod) {
+      respondJson(res, 405, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        error: { code: "method_not_allowed", detail: `"${name}" expects ${route.httpMethod}` },
+      });
+      return;
+    }
+
+    // `workflow.capture_tab` is a no-body POST (see this function's header
+    // comment): any caller-supplied body is simply never read or inspected,
+    // so a caller asserting one via Content-Length or chunked
+    // Transfer-Encoding framing is rejected explicitly, before the
+    // extension round trip or any persistence, rather than having that body
+    // silently ignored.
+    if (hasRequestBodyFraming(req)) {
+      respondJson(res, 400, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        error: { code: ERROR_CODES.INVALID_REQUEST, detail: `"${name}" does not accept a request body` },
+      });
+      return;
+    }
+
+    let params;
+    try {
+      params = route.paramsFromQuery(url);
+    } catch (error) {
+      respondJson(res, 500, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        error: { code: ERROR_CODES.INTERNAL_ERROR, detail: error instanceof Error ? error.message : String(error) },
+      });
+      return;
+    }
+
+    try {
+      const extensionResult = await sendExtensionRequest("browser.read_tab", params);
+
+      let validation;
+      try {
+        validation = validateMethodResult("browser.read_tab", extensionResult);
+      } catch (error) {
+        validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      if (!validation.valid) {
+        respondJson(res, 502, {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId,
+          error: { code: ERROR_CODES.INVALID_EXTENSION_RESPONSE, detail: validation.reason },
+        });
+        return;
+      }
+
+      let result;
+      try {
+        // The server's own freshly-validated result, exactly as received —
+        // never the HTTP request body (there isn't one for this route).
+        result = store.createCapture(extensionResult);
+      } catch (error) {
+        const storeError =
+          error instanceof StoreError ? error : new StoreError(STORE_ERROR_CODES.DB_ERROR, error instanceof Error ? error.message : String(error));
+        const status = STORE_ERROR_STATUS[storeError.code] ?? 500;
+        respondJson(res, status, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: storeError.code, detail: storeError.message } });
+        return;
+      }
+
+      const body = { protocolVersion: PROTOCOL_VERSION, requestId, result };
+      const payload = JSON.stringify(body);
+      if (Buffer.byteLength(payload) > maxResponseBytes) {
+        respondJson(res, 502, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RESPONSE_TOO_LARGE } });
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) });
+      res.end(payload);
+    } catch (error) {
+      const status = ERROR_STATUS[error.code] ?? 502;
+      const code = error.code in ERROR_STATUS ? error.code : ERROR_CODES.INTERNAL_ERROR;
+      const body = { protocolVersion: PROTOCOL_VERSION, requestId, error: { code } };
+      if (!(error.code in ERROR_STATUS)) body.error.detail = error.message;
+      respondJson(res, status, body);
+    }
+  }
+
   function handleHealth(_req, res) {
     respondJson(res, 200, {
       protocolVersion: PROTOCOL_VERSION,
@@ -451,9 +715,17 @@ export function createService({
   }
 
   async function handleControlStop(req, res) {
-    const authFailure = checkAuth(req);
-    if (authFailure) {
-      respondJson(res, authFailure.status, { protocolVersion: PROTOCOL_VERSION, error: authFailure.error });
+    const auth = authenticate(req);
+    if (!auth.ok) {
+      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, error: auth.error });
+      return;
+    }
+    // Stage 4: shutting the service down is never in an agent's scope,
+    // regardless of the AGENT_ALLOWED_* sets above (control/stop is not
+    // even a /api/ route, so it is not reachable through them at all) —
+    // this is an explicit, separate check for the same reason.
+    if (auth.scope !== "owner") {
+      respondJson(res, 403, { protocolVersion: PROTOCOL_VERSION, error: { code: ERROR_CODES.FORBIDDEN_SCOPE, detail: '"control/stop" is owner-only' } });
       return;
     }
     respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, ok: true });
@@ -500,6 +772,10 @@ export function createService({
       const name = url.pathname.slice("/api/".length);
       if (req.method === "GET" && API_ROUTES.has(name)) {
         handleApiMethod(name, req, res, url);
+        return;
+      }
+      if (WORKFLOW_ROUTES.has(name)) {
+        handleWorkflowMethod(name, WORKFLOW_ROUTES.get(name), req, res, url);
         return;
       }
       if (STORE_ROUTES.has(name)) {

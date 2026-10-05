@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-// Development service CLI: `start` (foreground), `status`, `stop`, and
-// `show-token` (re-display the pairing credential).
+// Development service CLI: `start` (foreground), `status`, `stop`,
+// `show-token` (re-display the owner pairing credential), and
+// `show-agent-token` (re-display the separate, scoped Stage 4
+// external-agent credential — see service/credential.mjs).
 //
 // `status` and `stop` identify a running service by actually probing the
 // port recorded at `start` (GET /health), and `stop` tears it down through
@@ -10,14 +12,14 @@
 // a port file left over from a crashed/killed previous run is detected by
 // the probe failing, not trusted at face value, and is cleaned up.
 //
-// Usage: node service/cli.mjs <start|status|stop|show-token>
+// Usage: node service/cli.mjs <start|status|stop|show-token|show-agent-token>
 
 import http from "node:http";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { createService } from "./server.mjs";
-import { getDataDir, loadOrCreateCredential } from "./credential.mjs";
+import { getDataDir, loadOrCreateAgentCredential, loadOrCreateCredential } from "./credential.mjs";
 import { openStore } from "./store.mjs";
 import { DEFAULT_SERVICE_PORT, PROTOCOL_VERSION } from "../extension/protocol.js";
 
@@ -143,6 +145,14 @@ async function cmdStart() {
   }
 
   const { token, created } = await loadOrCreateCredential(dataDir);
+  // Stage 4: a distinct, separately-stored credential for external-agent
+  // callers (see service/credential.mjs). Loaded/created unconditionally,
+  // exactly like the owner credential above, so it is always available for
+  // an operator who wants to hand a scoped token to an agent — but it is a
+  // different value in a different file, and authorizes only the
+  // server-side allowlists in service/server.mjs, never full access.
+  const { token: agentToken, created: agentCreated } = await loadOrCreateAgentCredential(dataDir);
+  const agentCreatorName = process.env.BROWSER_TABS_AGENT_NAME || "reference-agent";
 
   // Stage 3: created on first start, migrated forward on every start (see
   // service/store.mjs). Logging here deliberately never includes
@@ -197,7 +207,15 @@ async function cmdStart() {
     process.exit(0);
   };
 
-  const service = createService({ credentialToken: token, port, host: "127.0.0.1", store, onControlStop: shutdown });
+  const service = createService({
+    credentialToken: token,
+    agentCredentialToken: agentToken,
+    agentCreatorName,
+    port,
+    host: "127.0.0.1",
+    store,
+    onControlStop: shutdown,
+  });
   const address = await service.listen();
 
   await writeFile(portPath, String(address.port), "utf8");
@@ -210,6 +228,13 @@ async function cmdStart() {
     console.log('Not printed again by default; re-display it with "show-token" if needed.');
   } else {
     console.log("Using the existing pairing credential; the extension does not need to re-pair.");
+  }
+  if (agentCreated) {
+    console.log("First run: generated a new, separate external-agent credential.");
+    console.log(`External-agent token (scoped; set as BROWSER_TABS_AGENT_TOKEN for an agent caller): ${agentToken}`);
+    console.log('Not printed again by default; re-display it with "show-agent-token" if needed.');
+  } else {
+    console.log("Using the existing external-agent credential.");
   }
 
   process.on("SIGINT", shutdown);
@@ -276,6 +301,14 @@ async function cmdShowToken() {
   console.log(token);
 }
 
+// Stage 4: re-displays the separate external-agent credential, the same
+// way "show-token" re-displays the owner one — a distinct command because
+// it is a distinct file/token, never printed automatically after first run.
+async function cmdShowAgentToken() {
+  const { token } = await loadOrCreateAgentCredential(dataDir);
+  console.log(token);
+}
+
 const [, , command] = process.argv;
 switch (command) {
   case "start":
@@ -290,7 +323,10 @@ switch (command) {
   case "show-token":
     await cmdShowToken();
     break;
+  case "show-agent-token":
+    await cmdShowAgentToken();
+    break;
   default:
-    console.error("Usage: node service/cli.mjs <start|status|stop|show-token>");
+    console.error("Usage: node service/cli.mjs <start|status|stop|show-token|show-agent-token>");
     process.exitCode = 1;
 }
