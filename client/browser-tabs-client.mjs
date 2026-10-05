@@ -59,7 +59,7 @@ export const DEFAULT_BASE_URL = "http://127.0.0.1:8743";
 // have this repository's source tree at all, and the service rejects a
 // mismatched version explicitly (`400 unsupported_protocol_version`) rather
 // than silently misbehaving if this ever drifts.
-export const DEFAULT_PROTOCOL_VERSION = 3;
+export const DEFAULT_PROTOCOL_VERSION = 4;
 
 // Defense in depth on top of the service's own response-size bound
 // (`MAX_RESPONSE_BYTES`/`MAX_WS_MESSAGE_BYTES`, documented in README.md's

@@ -148,7 +148,7 @@
 <section id="actions-section" aria-labelledby="actions-heading">
   <h2 id="actions-heading" tabindex="-1">Open a URL in a new tab</h2>
   <p>
-    The only place this page can change the browser, and only in two steps. <strong>Preview</strong> records
+    The only place this page can change the browser (this and the tab-group form below), and only in two steps. <strong>Preview</strong> records
     exactly which address would be opened and for which browser session; nothing opens yet. Then
     <strong>Open</strong> on that preview opens it, once, or <strong>Reject</strong> discards it. A preview can
     be decided only once. If the browser has restarted since the preview, it is refused as stale and nothing
@@ -164,6 +164,47 @@
     <button type="submit" id="preview-button" disabled>Preview</button>
   </form>
   <p id="action-form-status" role="status" aria-live="polite"></p>
+
+  <h3 id="group-heading">Create or change a tab group</h3>
+  <p>
+    The same two steps for tab groups, in Chromium-family browsers only (a browser without tab groups answers
+    "unsupported" and nothing changes). Under "Windows, tabs, and groups" above, choose
+    <strong>Group this tab…</strong> to create a new group around that one ungrouped tab, or
+    <strong>Edit this group…</strong> to rename or recolor an existing group. <strong>Preview</strong> records the
+    exact tab or group, the browser session, and its current state; then <strong>Apply</strong> on that preview
+    changes the browser once, only if the tab or group is still exactly as previewed, or <strong>Reject</strong>
+    discards it. Moving other tabs into a group is not offered.
+  </p>
+  <form id="group-form">
+    <p id="group-target">No tab or group chosen yet.</p>
+    <div class="field">
+      <label for="group-title-input">Title</label>
+      <input type="text" id="group-title-input" name="title" autocomplete="off" spellcheck="false" maxlength="100" aria-describedby="group-title-help">
+      <p id="group-title-help">Up to 100 characters. Leave empty to keep the current title.</p>
+    </div>
+    <div class="field">
+      <input type="checkbox" id="group-clear-title" name="clearTitle">
+      <label for="group-clear-title">Remove the group's current title (only when editing a group)</label>
+    </div>
+    <div class="field">
+      <label for="group-color-select">Color</label>
+      <select id="group-color-select" name="color">
+        <option value="">Keep the current color (or the browser's choice for a new group)</option>
+        <option value="grey">grey</option>
+        <option value="blue">blue</option>
+        <option value="red">red</option>
+        <option value="yellow">yellow</option>
+        <option value="green">green</option>
+        <option value="pink">pink</option>
+        <option value="purple">purple</option>
+        <option value="cyan">cyan</option>
+        <option value="orange">orange</option>
+      </select>
+    </div>
+    <button type="submit" id="group-preview-button" disabled>Preview group change</button>
+  </form>
+  <p id="group-form-status" role="status" aria-live="polite"></p>
+
   <p id="action-decision-status" role="status" aria-live="polite"></p>
   <button type="button" id="refresh-actions-button" disabled>Refresh actions</button>
   <p id="actions-status" role="status" aria-live="polite"></p>

@@ -64,6 +64,15 @@ export function createListVersionGuard() {
   };
 }
 
+// True only when a fresh result names a browser session different from the
+// previous *known* one — i.e. the browser session was replaced, so handles
+// chosen under the old one (e.g. the tab-group form's target) must not be
+// carried over. The first session ever learned, a missing/invalid value, and
+// the same session seen again are all not a replacement.
+export function isReplacedSession(previous, next) {
+  return typeof previous === "string" && previous.length > 0 && typeof next === "string" && next.length > 0 && previous !== next;
+}
+
 export const DECISION_STATES = Object.freeze({
   IDLE: "idle",
   SUBMITTING: "submitting",

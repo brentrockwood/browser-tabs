@@ -389,7 +389,7 @@ test("actions and their audit events survive a store restart, and ids keep count
   });
 });
 
-test("migration v3 is additive: it creates the action tables and is recorded as a non-breaking migration", async () => {
+test("migration v3 creates the action tables and is recorded as a non-breaking migration (v4 later widens them for group actions)", async () => {
   await withTempDir(async (dataDir) => {
     const store = await openStore({ dataDir });
     store.close();
@@ -403,7 +403,9 @@ test("migration v3 is additive: it creates the action tables and is recorded as 
       raw.close();
     }
     const { MIGRATIONS } = await import("../service/store.mjs");
-    assert.equal(MIGRATIONS.at(-1).version, 3);
+    const v3 = MIGRATIONS.find((migration) => migration.version === 3);
+    assert.equal(v3.breaking, false);
+    assert.equal(MIGRATIONS.at(-1).version, 4);
     assert.equal(MIGRATIONS.at(-1).breaking, false);
   });
 });

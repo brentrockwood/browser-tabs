@@ -248,3 +248,54 @@ test("ui/app.js guards action decisions against double submits and stale list re
     assert.match(appJsSource, new RegExp(`"${id}"`));
   }
 });
+
+// ---- Phase 2 Action 2: the tab-group form ----
+
+test("ui/index.html's tab-group form has labelled fields, a select of exactly the native colors, and a Preview button disabled until connected", () => {
+  assert.match(indexHtmlSource, /<form id="group-form">/);
+  assert.match(indexHtmlSource, /<label for="group-title-input">/);
+  assert.match(indexHtmlSource, /<input type="text" id="group-title-input"[^>]*maxlength="100"[^>]*aria-describedby="group-title-help"/);
+  assert.match(indexHtmlSource, /<label for="group-clear-title">/);
+  assert.match(indexHtmlSource, /<label for="group-color-select">/);
+  const colors = [...indexHtmlSource.matchAll(/<option value="([a-z]+)">/g)].map((m) => m[1]);
+  assert.deepEqual(colors, ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
+  assert.match(indexHtmlSource, /<button type="submit" id="group-preview-button" disabled>Preview group change<\/button>/);
+  assert.match(indexHtmlSource, /id="group-form-status" role="status" aria-live="polite"/);
+  // Apply and Reject exist only on rendered previews, never as static buttons.
+  assert.doesNotMatch(indexHtmlSource, /id="apply-button"|id="group-apply-button"/);
+  assert.match(appJsSource, /"group-preview-button"/);
+});
+
+test("ui/app.js sends a group preview with only the chosen operation, one handle, and the requested change, and decides by id alone", () => {
+  assert.match(appJsSource, /apiRequest\("\/api\/action\.configure_group\.preview", \{ method: "POST", body \}\)/);
+  const decisions = [...appJsSource.matchAll(/apiRequest\(`\/api\/action\.configure_group\.\$\{operation\}\?id=\$\{id\}`[^)]*\)/g)];
+  assert.equal(decisions.length, 1, "exactly one call site decides a group action");
+  assert.doesNotMatch(decisions[0][0], /body/);
+  assert.equal([...appJsSource.matchAll(/action\.configure_group\./g)].length, 2, "only the preview and the id-only decision route are referenced");
+  assert.doesNotMatch(appJsSource, /browser\.configure_group|browser\.inspect_group_target/, "the page never names the extension-level methods");
+  // The target is only ever { operation, tabId } or { operation, groupId }: no session, no window.
+  assert.match(appJsSource, /chooseGroupTarget\(\{ operation: "create", tabId: t\.tabId \}/);
+  assert.match(appJsSource, /chooseGroupTarget\(\{ operation: "update", groupId: g\.groupId \}/);
+  const form = appJsSource.slice(appJsSource.indexOf("// ---- tab groups: create around one tab"), appJsSource.indexOf("// ---- tags ----"));
+  assert.ok(form.length > 500, "expected to locate the tab-group form section of app.js");
+  assert.doesNotMatch(form, /sessionId|browserSessionId|windowId/, "the form never supplies a session or a window");
+});
+
+test("ui/app.js drops the chosen group target when a fresh session replaces the known one, before rendering, and only then", () => {
+  assert.match(appJsSource, /import \{[^}]*\bisReplacedSession\b[^}]*\} from "\.\/lib\.mjs";/);
+  const remember = appJsSource.slice(appJsSource.indexOf("function rememberSessionFromWindowsResult"), appJsSource.indexOf("// True if `result` is the server's explicit"));
+  assert.match(remember, /if \(isReplacedSession\(state\.sessionId, result\.browserSessionId\)\) clearGroupTarget\(\);\n\s+state\.sessionId = result\.browserSessionId;/, "checked against the previous id, before it is overwritten");
+  assert.equal([...appJsSource.matchAll(/isReplacedSession\(/g)].length, 1, "one call site: no unconditional clearing on load");
+  // rememberSessionFromWindowsResult runs before the window list is rendered.
+  const load = appJsSource.slice(appJsSource.indexOf('qs("load-windows-button").addEventListener'));
+  assert.ok(load.indexOf("rememberSessionFromWindowsResult(result)") < load.indexOf("renderWindowRow(w)"));
+});
+
+test("ui/app.js renders a group preview's tab text as text only and keeps the chosen target from outliving its browser session", () => {
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- browser actions"), appJsSource.indexOf("// ---- tags ----"));
+  assert.match(section, /text: describeGroupBinding\(a\.binding\)/);
+  assert.doesNotMatch(section, /\bhref\b|\bsrc\b|window\.open|\.innerHTML/);
+  const stale = appJsSource.slice(appJsSource.indexOf("function handleStaleBrowserSession"), appJsSource.indexOf("// ---- connection status"));
+  assert.match(stale, /clearGroupTarget\(\)/, "a stale browser session discards the chosen tab or group");
+  assert.match(appJsSource, /clearGroupTarget\(\);\n/, "Disconnect resets the chosen target through resetDisplayedData");
+});

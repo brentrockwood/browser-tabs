@@ -26,6 +26,7 @@ import {
   MAX_OBSERVED_URL_LENGTH,
   MAX_REQUEST_BODY_BYTES,
   clipText,
+  validateGroupPreviewRequest,
 } from "./validation.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -124,14 +125,39 @@ const WORKFLOW_ROUTES = new Map([
 // and handleActionMethod additionally refuses every non-owner scope
 // explicitly. All are `POST` with the operation named by the route, never by
 // a body field.
+//
+// Phase 2 Action 2 adds the same three routes for `configure_group` (create a
+// tab group around one chosen ungrouped tab, or rename/recolor a group). Each
+// route is bound to its kind: a decision on one kind's route for another
+// kind's action id is a 404 that decides nothing.
 const ACTION_ROUTES = new Map([
-  ["action.open_tab.preview", { operation: "preview" }],
-  ["action.open_tab.approve", { operation: "approve" }],
-  ["action.open_tab.reject", { operation: "reject" }],
+  ["action.open_tab.preview", { kind: "open_tab", operation: "preview" }],
+  ["action.open_tab.approve", { kind: "open_tab", operation: "approve" }],
+  ["action.open_tab.reject", { kind: "open_tab", operation: "reject" }],
+  ["action.configure_group.preview", { kind: "configure_group", operation: "preview" }],
+  ["action.configure_group.approve", { kind: "configure_group", operation: "approve" }],
+  ["action.configure_group.reject", { kind: "configure_group", operation: "reject" }],
 ]);
-// A preview body is one short URL (see MAX_OPEN_URL_LENGTH); anything near
-// the store routes' 8 MiB request bound is refused as oversized long before.
+// A preview body is one short URL (see MAX_OPEN_URL_LENGTH) or a handle and a
+// short title; anything near the store routes' 8 MiB request bound is refused
+// as oversized long before.
 const MAX_ACTION_REQUEST_BODY_BYTES = 16 * 1024;
+// Statuses for the stable codes a *preview* can be refused with because of
+// what the browser reported (the target is gone, or the browser has no tab
+// groups). Not part of ERROR_STATUS, which the read routes also use.
+const PREVIEW_REFUSAL_STATUS = Object.freeze({
+  [ERROR_CODES.STALE_HANDLE]: 409,
+  [ERROR_CODES.UNSUPPORTED_FEATURE]: 501,
+});
+// A group action the extension refuses with one of these changed nothing
+// because what was previewed no longer holds: a stale (not merely failed) outcome.
+const STALE_GROUP_CODES = Object.freeze([ERROR_CODES.STALE_SESSION, ERROR_CODES.STALE_HANDLE, ERROR_CODES.STATE_MISMATCH]);
+
+function codedError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
 
 // Stage 4: the server-side allowlists an external-agent credential's scope
 // is restricted to (project.md Stage 4 remediation: "external-agent scope
@@ -825,6 +851,62 @@ export function createService({
     return store.createAction({ url: checked.url, browserSessionId: capabilities.browserSessionId });
   }
 
+  // Phase 2 Action 2, step one: records a group preview and changes nothing.
+  // The body is exactly an operation, one handle (`tabId` to create a group
+  // around that tab, `groupId` to rename/recolor that group) and the requested
+  // `title`/`color` — never a session or window. The extension is asked
+  // (read-only) about that one handle: the answer's own envelope supplies the
+  // browser session the preview is bound to, and its current state (the tab's
+  // window and that it is ungrouped; the group's window, title, and color) is
+  // what the preview binds and the extension re-checks before mutating.
+  async function previewConfigureGroup(req) {
+    const request = validateGroupPreviewRequest(parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES)));
+    const creating = request.operation === "create";
+    const inspected = await sendExtensionRequest("browser.inspect_group_target", creating ? { tabId: request.tabId } : { groupId: request.groupId });
+    let validation;
+    try {
+      validation = validateMethodResult("browser.inspect_group_target", inspected);
+    } catch (error) {
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!validation.valid) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
+    if (inspected.status === "unsupported") throw codedError(ERROR_CODES.UNSUPPORTED_FEATURE, "this browser does not support tab groups; nothing was changed");
+    if (inspected.status !== "ok") {
+      if (inspected.code === ERROR_CODES.STALE_HANDLE) throw codedError(ERROR_CODES.STALE_HANDLE, "the tab or group no longer exists");
+      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tab or group");
+    }
+
+    let binding;
+    if (creating) {
+      const { tab } = inspected;
+      if (tab === null || tab.tabId !== request.tabId) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported a different tab than the one requested");
+      if (tab.grouped) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tab is already in a group; only an ungrouped tab can be put in a new group");
+      if (tab.pinned) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tab is pinned; a pinned tab cannot be put in a group");
+      binding = {
+        operation: "create",
+        tabId: tab.tabId,
+        windowId: tab.windowId,
+        title: request.title,
+        color: request.color,
+        tabTitle: clipText(tab.title, MAX_OBSERVED_TITLE_LENGTH),
+        tabUrl: clipText(tab.url, MAX_OBSERVED_URL_LENGTH),
+      };
+    } else {
+      const { group } = inspected;
+      if (group === null || group.groupId !== request.groupId) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported a different group than the one requested");
+      binding = {
+        operation: "update",
+        groupId: group.groupId,
+        windowId: group.windowId,
+        expectedTitle: group.title ?? "",
+        expectedColor: group.color,
+        title: request.title,
+        color: request.color,
+      };
+    }
+    return store.createAction({ kind: "configure_group", browserSessionId: inspected.browserSessionId, binding });
+  }
+
   // Interprets the extension's answer to one approved `browser.open_tab`
   // into the outcome recorded on the action. Never throws: whatever
   // happened, the approved action must end in a recorded result, because
@@ -896,18 +978,107 @@ export function createService({
     };
   }
 
-  // Phase 2 Action 1, step two: the one terminal decision on a stored
-  // preview, by id alone — no body and no other query parameter, so the
-  // caller cannot restate or alter what is being decided. A reject only
-  // records the decision. An approve first requires a connected extension
-  // (so a merely-unplugged browser does not consume the preview), then
-  // commits the decision — the race-safe single transition in
-  // store.decideAction, which only one of any number of concurrent
-  // approve/reject calls can win — and only the winner executes, exactly
-  // once, then records the result. The response is the action as finally
-  // recorded, HTTP 200 even if the outcome was `failed`, `stale`, or
+  // Phase 2 Action 2: interprets the extension's answer to one approved
+  // `browser.configure_group` into the outcome recorded on the action, on the
+  // same terms as executeOpenTab: never throws, and `mutation` is "none" only
+  // when nothing was sent or changed, "unknown" when the request may have been
+  // acted on but the answer was lost or unusable. The extension refusing
+  // because the previewed session, handle, or bound state no longer holds is
+  // `stale`; a browser without tab groups, or any other refusal, is `failed`
+  // with mutation "none". A change that was made but not completed or
+  // observed is `partial`, with the handles known.
+  async function executeConfigureGroup(action) {
+    const failed = (mutation, code, detail) => ({
+      state: "failed",
+      mutation,
+      code,
+      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
+      tabId: null,
+      groupId: null,
+      windowId: null,
+      observed: null,
+    });
+    // The stored display-only tab title/address are not part of what the
+    // extension is asked to do.
+    const { tabTitle, tabUrl, ...bound } = action.binding;
+    const creating = bound.operation === "create";
+
+    let result;
+    try {
+      result = await sendExtensionRequest("browser.configure_group", { browserSessionId: action.browserSessionId, ...bound });
+    } catch (error) {
+      const code = Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR;
+      return error?.requestSent === false
+        ? failed("none", code, "the request was never sent to the extension")
+        : failed("unknown", code, "the request was sent but no answer arrived; the browser may or may not have applied the change");
+    }
+
+    let validation;
+    try {
+      validation = validateMethodResult("browser.configure_group", result);
+    } catch (error) {
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!validation.valid) return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
+
+    const detail = typeof result.detail === "string" ? clipText(result.detail, MAX_ACTION_DETAIL_LENGTH) : null;
+    if (!result.changed) {
+      const state = STALE_GROUP_CODES.includes(result.code) ? "stale" : "failed";
+      return { state, mutation: "none", code: clipText(result.code, MAX_CODE_LENGTH), detail, tabId: null, groupId: null, windowId: null, observed: null };
+    }
+
+    // Something was changed. Its answer must still be about *this* preview.
+    const mutation = creating ? "created" : "updated";
+    const mismatch = () => failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview");
+    if (result.browserSessionId !== action.browserSessionId) return mismatch();
+    if (result.status !== "ok") {
+      // The handles must be the preview's own: a partial create names its tab
+      // and window (the new group's handle is the one thing newly assigned), a
+      // partial update names its group and window and no tab.
+      const ownHandles = creating
+        ? result.tabId === bound.tabId && result.windowId === bound.windowId
+        : result.groupId === bound.groupId && result.windowId === bound.windowId && result.tabId === null;
+      if (!ownHandles) return mismatch();
+      return { state: "partial", mutation, code: result.code, detail, tabId: result.tabId, groupId: result.groupId, windowId: result.windowId, observed: null };
+    }
+    const { group } = result;
+    if (
+      result.operation !== bound.operation ||
+      group.windowId !== bound.windowId ||
+      (creating ? result.tabId !== bound.tabId : group.groupId !== bound.groupId)
+    ) {
+      return mismatch();
+    }
+    return {
+      state: "executed",
+      mutation,
+      code: null,
+      detail: null,
+      tabId: result.tabId,
+      groupId: group.groupId,
+      windowId: group.windowId,
+      observed: {
+        windowId: group.windowId,
+        title: clipText(group.title, MAX_OBSERVED_TITLE_LENGTH),
+        color: clipText(group.color, MAX_OBSERVED_STATUS_LENGTH),
+        collapsed: group.collapsed,
+      },
+    };
+  }
+
+  // Phase 2 Action 1, step two (and Action 2's, by kind): the one terminal
+  // decision on a stored preview, by id alone — no body and no other query
+  // parameter, so the caller cannot restate or alter what is being decided.
+  // The route names the action kind and an action of another kind is simply
+  // not found there. A reject only records the decision. An approve first
+  // requires a connected extension (so a merely-unplugged browser does not
+  // consume the preview), then commits the decision — the race-safe single
+  // transition in store.decideAction, which only one of any number of
+  // concurrent approve/reject calls can win — and only the winner executes,
+  // exactly once, then records the result. The response is the action as
+  // finally recorded, HTTP 200 even if the outcome was `failed`, `stale`, or
   // `partial`: the decision committed, and the record says what happened.
-  async function decideOpenTab(operation, req, url) {
+  async function decideBrowserAction(kind, operation, req, url) {
     if (hasRequestBodyFraming(req)) {
       throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, "this route takes no request body; the action is identified by id alone");
     }
@@ -915,6 +1086,9 @@ export function createService({
       if (key !== "id") throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, `${key}: unexpected query parameter; only "id" is accepted`);
     }
     const id = requireIdParam(url);
+    // An action's kind is fixed when it is previewed, so this check cannot be
+    // invalidated between here and the decision below.
+    if (store.listActions({ id }).items[0]?.kind !== kind) throw new StoreError(STORE_ERROR_CODES.NOT_FOUND, `action ${id} not found`);
     if (operation === "reject") return store.decideAction(id, "reject");
 
     if (extensionSocket === null) {
@@ -923,7 +1097,7 @@ export function createService({
       throw error;
     }
     const action = store.decideAction(id, "approve");
-    const outcome = await executeOpenTab(action);
+    const outcome = await (kind === "open_tab" ? executeOpenTab(action) : executeConfigureGroup(action));
     try {
       return store.recordActionResult(id, outcome);
     } catch (error) {
@@ -975,15 +1149,18 @@ export function createService({
     }
 
     try {
-      const result = route.operation === "preview" ? await previewOpenTab(req) : await decideOpenTab(route.operation, req, url);
+      let result;
+      if (route.operation !== "preview") result = await decideBrowserAction(route.kind, route.operation, req, url);
+      else result = route.kind === "open_tab" ? await previewOpenTab(req) : await previewConfigureGroup(req);
       respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result });
     } catch (error) {
       const known =
         Object.hasOwn(STORE_ERROR_STATUS, error?.code) ||
         Object.hasOwn(ERROR_STATUS, error?.code) ||
+        Object.hasOwn(PREVIEW_REFUSAL_STATUS, error?.code) ||
         error?.code === ERROR_CODES.INVALID_EXTENSION_RESPONSE;
       const code = known ? error.code : ERROR_CODES.INTERNAL_ERROR;
-      const status = STORE_ERROR_STATUS[code] ?? ERROR_STATUS[code] ?? (code === ERROR_CODES.INTERNAL_ERROR ? 500 : 502);
+      const status = STORE_ERROR_STATUS[code] ?? ERROR_STATUS[code] ?? PREVIEW_REFUSAL_STATUS[code] ?? (code === ERROR_CODES.INTERNAL_ERROR ? 500 : 502);
       respondJson(res, status, {
         protocolVersion: PROTOCOL_VERSION,
         requestId,

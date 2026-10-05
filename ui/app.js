@@ -12,12 +12,12 @@
 // older list refresh overwriting a newer one — using the small, pure
 // helpers in ui/lib.mjs (see that file and test/ui-lib.test.mjs for the
 // deterministic, DOM-free unit tests of the actual race-prevention logic).
-import { createDecisionTracker, createGenerationCounter, createListVersionGuard } from "./lib.mjs";
+import { createDecisionTracker, createGenerationCounter, createListVersionGuard, isReplacedSession } from "./lib.mjs";
 
 // Must match extension/protocol.js's PROTOCOL_VERSION. Duplicated here
 // (not imported) because this is a standalone static page with no build
 // step and no access to that module's path.
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 
 // Mirrors extension/protocol.js's ERROR_CODES.STALE_SESSION — the one
 // code this page must react to specially (see handleStaleBrowserSession
@@ -98,6 +98,9 @@ const actionDecisions = createDecisionTracker();
 const actionsListGuard = createListVersionGuard();
 const auditListGuard = createListVersionGuard();
 let actionDecisionsInFlight = 0;
+// The tab or group chosen for the tab-group form (`{ operation, tabId |
+// groupId }`), or null — see "tab groups" below.
+let groupTarget = null;
 
 function qs(id) {
   return document.getElementById(id);
@@ -217,6 +220,10 @@ async function apiRequest(path, { method = "GET", body, auth = true, signal } = 
 // change browserSessionId. Never adopt it from history/stale responses").
 function rememberSessionFromWindowsResult(result) {
   if (result && typeof result.browserSessionId === "string" && result.browserSessionId.length > 0) {
+    // A different session than the one previously known replaces it: the chosen
+    // tab-group target belongs to the old one, so drop it before anything from
+    // the new list is rendered. The same session leaves the target alone.
+    if (isReplacedSession(state.sessionId, result.browserSessionId)) clearGroupTarget();
     state.sessionId = result.browserSessionId;
   }
 }
@@ -239,6 +246,7 @@ function isStaleSessionResult(result) {
 function handleStaleBrowserSession() {
   state.browserGeneration.bump();
   state.sessionId = null;
+  clearGroupTarget();
   clearChildren(qs("windows-list"));
   setStatus(
     qs("inspector-status"),
@@ -274,6 +282,7 @@ const AUTH_GATED_BUTTON_IDS = [
   "refresh-summaries-button",
   "refresh-proposals-button",
   "preview-button",
+  "group-preview-button",
   "refresh-actions-button",
   "refresh-audit-button",
   "refresh-tags-button",
@@ -296,7 +305,8 @@ function resetDisplayedData() {
   clearChildren(qs("proposals-list"));
   clearChildren(qs("actions-list"));
   clearChildren(qs("audit-list"));
-  for (const id of ["action-form-status", "action-decision-status", "actions-status", "audit-status"]) qs(id).textContent = "";
+  for (const id of ["action-form-status", "group-form-status", "action-decision-status", "actions-status", "audit-status"]) qs(id).textContent = "";
+  clearGroupTarget();
   clearChildren(qs("tags-list"));
   clearChildren(qs("collections-list"));
   clearChildren(qs("queue-list"));
@@ -422,13 +432,19 @@ function renderTabRow(t) {
   const titleLine = el("p", { text: `Title: ${t.title ?? "(none)"}` });
   const urlLine = el("p", { text: `URL: ${t.url ?? "(none)"}` });
 
-  return el("li", {}, [infoLine, titleLine, urlLine, captureButton, el("span", { text: " " }), captureStatus]);
+  // Choosing a target only fills the tab-group form below; nothing is sent
+  // until that form's own Preview, and nothing changes until Apply.
+  const groupButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Group this tab…")]);
+  groupButton.addEventListener("click", () => chooseGroupTarget({ operation: "create", tabId: t.tabId }, `Tab ${t.tabId} — ${t.title ?? "(none)"}`));
+
+  return el("li", {}, [infoLine, titleLine, urlLine, captureButton, el("span", { text: " " }), groupButton, el("span", { text: " " }), captureStatus]);
 }
 
 function renderGroupRow(g) {
-  return el("li", {
-    text: `Group ${g.groupId} — title: ${g.title ?? "(none)"}, color: ${g.color ?? "(none)"}, collapsed: ${g.collapsed}`,
-  });
+  const description = `Group ${g.groupId} — title: ${g.title ?? "(none)"}, color: ${g.color ?? "(none)"}, collapsed: ${g.collapsed}`;
+  const editButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Edit this group…")]);
+  editButton.addEventListener("click", () => chooseGroupTarget({ operation: "update", groupId: g.groupId }, description));
+  return el("li", {}, [el("p", { text: description }), editButton]);
 }
 
 function renderWindowRow(w) {
@@ -1008,6 +1024,44 @@ const ACTION_MUTATION_LABELS = {
   unknown: "unknown — the request may have been acted on, but no usable answer came back",
 };
 
+// Phase 2 Action 2 (tab groups) states and wording, kept apart from the
+// open-a-tab ones above because every sentence there is about a tab.
+const GROUP_STATE_LABELS = {
+  previewed: "awaiting your decision — nothing has been changed",
+  approved: "approved — no result recorded yet",
+  rejected: "rejected — nothing was changed",
+  executed: "applied",
+  partial: "partly done — a change was made but could not be completed or observed afterwards",
+  stale: "refused as stale — what was previewed no longer holds, nothing was changed",
+  failed: "failed",
+};
+
+const GROUP_MUTATION_LABELS = {
+  created: "yes — one new group was created around the chosen tab",
+  updated: "yes — one existing group was changed",
+  none: "no — nothing was changed",
+  unknown: "unknown — the request may have been acted on, but no usable answer came back",
+};
+
+function actionStateLabel(a) {
+  const labels = a.kind === "configure_group" ? GROUP_STATE_LABELS : ACTION_STATE_LABELS;
+  return labels[a.state] ?? a.state;
+}
+
+// The exact target and requested change a stored group preview binds. The
+// tab's title/address and the group's current title are untrusted browser
+// text; this is only ever rendered with textContent.
+function describeGroupBinding(b) {
+  const change = [];
+  if (b.title !== null) change.push(b.title === "" ? "remove the title" : `title "${b.title}"`);
+  if (b.color !== null) change.push(`color ${b.color}`);
+  if (b.operation === "create") {
+    const what = change.length > 0 ? ` with ${change.join(" and ")}` : "";
+    return `Create a new group${what} around tab ${b.tabId} in window ${b.windowId} (ungrouped when previewed) — "${b.tabTitle ?? ""}" ${b.tabUrl ?? ""}`;
+  }
+  return `Change group ${b.groupId} in window ${b.windowId} (currently titled "${b.expectedTitle}", color ${b.expectedColor}): ${change.join(" and ")}`;
+}
+
 function setActionsRefreshDisabled(disabled) {
   qs("refresh-actions-button").disabled = disabled;
 }
@@ -1018,9 +1072,11 @@ function setActionsRefreshDisabled(disabled) {
 // never turned into a link or navigated to by this page.
 function renderActionItem(a) {
   const urlId = `action-${a.id}-url`;
+  const isGroup = a.kind === "configure_group";
   const li = el("li", { attrs: { id: `action-${a.id}`, tabindex: "-1" } });
-  li.appendChild(el("p", { text: `Action #${a.id} — open in a new tab — ${ACTION_STATE_LABELS[a.state] ?? a.state}` }));
-  li.appendChild(el("p", { text: `Address: ${a.url}`, attrs: { id: urlId } }));
+  li.appendChild(el("p", { text: `Action #${a.id} — ${isGroup ? "tab group" : "open in a new tab"} — ${actionStateLabel(a)}` }));
+  if (isGroup) li.appendChild(el("p", { text: describeGroupBinding(a.binding), attrs: { id: urlId } }));
+  else li.appendChild(el("p", { text: `Address: ${a.url}`, attrs: { id: urlId } }));
 
   const dl = el("dl");
   dlEntry(dl, "Previewed at", formatTimestamp(a.previewedAt));
@@ -1029,11 +1085,21 @@ function renderActionItem(a) {
   if (a.completedAt !== null) dlEntry(dl, "Completed at", formatTimestamp(a.completedAt));
   if (a.result) {
     const r = a.result;
-    dlEntry(dl, "Browser changed", ACTION_MUTATION_LABELS[r.mutation] ?? r.mutation);
+    dlEntry(dl, "Browser changed", (isGroup ? GROUP_MUTATION_LABELS : ACTION_MUTATION_LABELS)[r.mutation] ?? r.mutation);
     if (r.code) dlEntry(dl, "Outcome code", r.code);
     if (r.detail) dlEntry(dl, "Detail", r.detail);
-    if (r.tabId !== null) dlEntry(dl, "Tab / window", `tab ${r.tabId} in window ${r.windowId ?? "—"}`);
-    if (r.observed) {
+    if (isGroup) {
+      if (r.groupId !== null) dlEntry(dl, "Group / window", `group ${r.groupId} in window ${r.windowId ?? "—"}`);
+      if (r.tabId !== null) dlEntry(dl, "Tab", `tab ${r.tabId}`);
+      if (r.observed) {
+        dlEntry(dl, "Observed title (untrusted browser text)", r.observed.title ?? "—");
+        dlEntry(dl, "Observed color", r.observed.color ?? "—");
+        dlEntry(dl, "Observed collapsed", formatBoolean(r.observed.collapsed));
+      }
+    } else if (r.tabId !== null) {
+      dlEntry(dl, "Tab / window", `tab ${r.tabId} in window ${r.windowId ?? "—"}`);
+    }
+    if (!isGroup && r.observed) {
       dlEntry(dl, "Observed status", r.observed.status);
       dlEntry(dl, "Observed title (untrusted browser text)", r.observed.title ?? "—");
       dlEntry(dl, "Observed address (untrusted browser text)", r.observed.url ?? "—");
@@ -1043,7 +1109,7 @@ function renderActionItem(a) {
   li.appendChild(dl);
 
   if (a.state === "previewed") {
-    const openButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode("Open")]);
+    const openButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode(isGroup ? "Apply" : "Open")]);
     const rejectButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode("Reject")]);
     li.appendChild(el("div", { className: "decision-buttons" }, [openButton, rejectButton]));
     // A row rebuilt while its own decision is still in flight (any refresh
@@ -1052,8 +1118,8 @@ function renderActionItem(a) {
       openButton.disabled = true;
       rejectButton.disabled = true;
     }
-    openButton.addEventListener("click", () => decideAction(a.id, "approve", [openButton, rejectButton]));
-    rejectButton.addEventListener("click", () => decideAction(a.id, "reject", [openButton, rejectButton]));
+    openButton.addEventListener("click", () => decideAction(a.id, "approve", [openButton, rejectButton], a.kind));
+    rejectButton.addEventListener("click", () => decideAction(a.id, "reject", [openButton, rejectButton], a.kind));
   }
   return li;
 }
@@ -1062,18 +1128,20 @@ function renderActionItem(a) {
 // body). Whatever happens — success, a refusal, or a network error whose
 // outcome is unknown — the page then rereads the list from the service
 // instead of guessing, so what is shown is always the recorded state.
-async function decideAction(id, operation, buttons) {
+async function decideAction(id, operation, buttons, kind) {
   if (!actionDecisions.begin(id)) return; // already submitting
   const gen = state.generation.snapshot();
   for (const button of buttons) button.disabled = true;
   actionDecisionsInFlight += 1;
   setActionsRefreshDisabled(true);
-  const verb = operation === "approve" ? "Open" : "Reject";
+  const verb = operation === "approve" ? (kind === "configure_group" ? "Apply" : "Open") : "Reject";
   setStatus(qs("action-decision-status"), `${verb} for action #${id}: submitting…`);
   try {
-    const { result } = await apiRequest(`/api/action.open_tab.${operation}?id=${id}`, { method: "POST" });
+    const { result } = await (kind === "configure_group"
+      ? apiRequest(`/api/action.configure_group.${operation}?id=${id}`, { method: "POST" })
+      : apiRequest(`/api/action.open_tab.${operation}?id=${id}`, { method: "POST" }));
     if (!state.generation.isStale(gen)) {
-      setStatus(qs("action-decision-status"), `Action #${id}: ${ACTION_STATE_LABELS[result.state] ?? result.state}.`, result.state === "failed");
+      setStatus(qs("action-decision-status"), `Action #${id}: ${actionStateLabel(result)}.`, result.state === "failed");
     }
   } catch (error) {
     if (!state.generation.isStale(gen)) {
@@ -1178,6 +1246,66 @@ async function refreshAudit() {
   }
 }
 qs("refresh-audit-button").addEventListener("click", refreshAudit);
+
+// ---- tab groups: create around one tab, or rename/recolor (Phase 2 Action 2) ----
+
+// Choosing a tab or group from the lists above only fills in this form; the
+// request that stores a preview sends the operation, that one handle, and the
+// requested title/color — no browser session and no window (the service
+// learns those from the browser itself). Nothing changes in the browser until
+// the preview's own Apply, decided by its id alone like any other action.
+function clearGroupTarget() {
+  groupTarget = null;
+  qs("group-target").textContent = "No tab or group chosen yet.";
+  qs("group-clear-title").checked = false;
+}
+
+function chooseGroupTarget(target, description) {
+  groupTarget = target;
+  qs("group-target").textContent = `${target.operation === "create" ? "New group around" : "Editing"}: ${description}`;
+  const clearTitle = qs("group-clear-title");
+  clearTitle.checked = false;
+  clearTitle.disabled = target.operation === "create";
+  qs("group-title-input").focus();
+}
+
+qs("group-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = qs("group-form-status");
+  if (!groupTarget) {
+    setStatus(status, 'Choose a tab ("Group this tab…") or a group ("Edit this group…") above first.', true);
+    return;
+  }
+  const title = qs("group-title-input").value;
+  const clearTitle = qs("group-clear-title").checked;
+  const color = qs("group-color-select").value;
+  if (title !== "" && clearTitle) {
+    setStatus(status, "Enter a title or choose to remove it, not both.", true);
+    return;
+  }
+  const body = { ...groupTarget };
+  if (title !== "") body.title = title;
+  else if (clearTitle) body.title = "";
+  if (color !== "") body.color = color;
+
+  const button = qs("group-preview-button");
+  const gen = state.generation.snapshot();
+  button.disabled = true;
+  setStatus(status, "Creating preview…");
+  try {
+    const { result } = await apiRequest("/api/action.configure_group.preview", { method: "POST", body });
+    if (state.generation.isStale(gen)) return;
+    setStatus(status, `Preview #${result.id} created. Nothing has been changed yet: review it below, then choose Apply or Reject.`);
+    await refreshActions();
+    if (state.generation.isStale(gen)) return;
+    qs(`action-${result.id}`)?.focus();
+  } catch (error) {
+    if (state.generation.isStale(gen)) return;
+    setStatus(status, `Could not create a preview: ${describeError(error)}`, true);
+  } finally {
+    if (!state.generation.isStale(gen)) button.disabled = false;
+  }
+});
 
 // ---- tags ----
 

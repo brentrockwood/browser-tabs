@@ -125,10 +125,10 @@ reporting it at face value.
 ### Calling the API
 
 ```sh
-curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 3" http://127.0.0.1:8743/api/browser.list_windows
+curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 4" http://127.0.0.1:8743/api/browser.list_windows
 ```
 
-Returns `{"protocolVersion": 3, "requestId": "...", "result": {...}}`, where
+Returns `{"protocolVersion": 4, "requestId": "...", "result": {...}}`, where
 `result` is the same capture-provenance-wrapped object the extension's
 `runtime.onMessage` listener produces (see "Stage 2: the read API" below).
 `requestId` echoes an `X-Request-Id` header you send, or is generated if you
@@ -1256,7 +1256,7 @@ listing, and this script never logs the token itself:
 | `BROWSER_TABS_URL` | `http://127.0.0.1:8743` |
 | `BROWSER_TABS_AGENT_TOKEN` | _(unset; takes precedence over the file below)_ |
 | `BROWSER_TABS_AGENT_CREDENTIAL_FILE` | `~/.browser-tabs/agent-token` |
-| `BROWSER_TABS_PROTOCOL_VERSION` | `3` |
+| `BROWSER_TABS_PROTOCOL_VERSION` | `4` |
 
 Note this is the **agent** credential, read via a bounded `open`/`stat`/
 `read` sequence capped well below the file's expected size — never
@@ -2252,7 +2252,7 @@ committing an approval and recording its result, the action is persisted as
 binds its port and before it handles any request, every action still
 `approved` becomes terminal `failed` with `mutation: "unknown"`, code
 `interrupted_by_restart`, a fixed detail ("the browser may or may not have
-opened the tab"), a `completedAt`, and an audit `result` event (so its trail
+applied it"), a `completedAt`, and an audit `result` event (so its trail
 is `preview`, `approve`, `result`). This relies on **one service process per
 data directory, which `start` enforces** with an exclusive lock file,
 `service.lock` (see "Single service per data directory" below), taken before
@@ -2273,9 +2273,10 @@ commits first deletes the preview, and a later approval is a `404` that sends
 nothing to the browser and records no event; an approval that commits first
 makes the clear a `409` until its result is terminal.
 
-### Protocol: version 3, strict validation
+### Protocol: version 3 (now 4), strict validation
 
-`PROTOCOL_VERSION` is `3`. `browser.open_tab` is the first extension request
+`PROTOCOL_VERSION` became `3` here and is now `4` (see Action 2 below).
+`browser.open_tab` is the first extension request
 that mutates the browser, and a version-2 extension does not know its
 contract (it would answer `unknown_method` with no `created` flag), so the
 handshake refuses a version mismatch instead of the service ever sending a
@@ -2287,7 +2288,7 @@ observed tab record; every non-`ok` result must state `created` consistently
 `observe_failed` partial outcome). An answer that fails validation, names a
 different session or URL than the stored preview, or is for another method is
 recorded as `failed` with `mutation: "unknown"` — never forwarded as success.
-The review UI and the reference agent client send version `3`.
+The review UI and the reference agent client now send version `4`.
 
 ### The audit log
 
@@ -2441,8 +2442,228 @@ repeat-decision refusal, content-free audit events, and stale-session refusal
 after browser restart. Independent Terra review passed after findings around
 `store.clear` races, interrupted-action reconciliation, audit content, and
 single-service ownership were fixed. The Firefox smoke was not extended for
-this mutation checkpoint; Firefox packaging builds under protocol version 3,
-but the recorded real-browser mutation proof is Chrome.
+this mutation checkpoint; Firefox packaging built under protocol version 3 at
+that point (it now builds under 4), but the recorded real-browser mutation
+proof is Chrome.
+
+## Phase 2, Action 2: create, rename, or recolor a tab group
+
+The second action project.md lists: configuring a tab group. It reuses Action
+1's contract unchanged — owner-only; a stored preview, then one terminal
+decision by id alone; execute once; a recorded, audited result — and adds a
+second action kind, `configure_group`, to the same store, state machine, and
+audit log. **Status: complete.** Independent review found four issues, all
+fixed with regression coverage: a create that did not name the tab's window
+(it could move the tab to the current window), pinned tabs not being refused,
+a UI group target surviving a replaced browser session, and partial results
+accepted with unrelated handles. The final gate passed `npm test` (587/587),
+`npm audit --omit=dev`, version/build/lifecycle checks, the real Chrome for
+Testing bridge smoke including a second non-current window and a pinned tab,
+the real Firefox smoke (tab groups cleanly unsupported), and Terra re-review
+with no remaining blocker.
+
+Two operations, both for Chromium-family browsers (native `tabGroups` API):
+
+- **create** — a new group around **exactly one** chosen, existing, ungrouped
+  tab, optionally setting its title and/or color;
+- **update** — rename and/or recolor an existing group. It must actually change
+  the title or the color.
+
+Moving arbitrary selected tabs into groups (project.md's Action 3) is not
+offered: nothing here adds a second tab to a group or moves a tab between
+groups.
+
+### The two steps
+
+1. **Preview** — `POST /api/action.configure_group.preview`. The body is an
+   operation, **one exact handle**, and the requested change, and nothing else
+   (any other field, including a session or window, is a `400`):
+
+   ```json
+   {"operation": "create", "tabId": 5, "title": "Reading", "color": "blue"}
+   {"operation": "update", "groupId": 9, "title": "", "color": "red"}
+   ```
+
+   `title` is plain text of at most 100 characters with no control characters;
+   absent means "leave it alone", and on an **update** the empty string `""` is
+   the explicit "remove the title" value (a create with `""` is refused — a new
+   group has no title to clear). `color` is Chrome's native `tabGroups.Color`
+   enum — `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`,
+   `orange` — and nothing else. The service asks the extension (a **read-only**
+   `browser.inspect_group_target` request, never reachable over HTTP) about that
+   one tab or group. The extension's answer supplies the **`browserSessionId`
+   the preview is bound to** (the caller can never supply one) and the current
+   state the preview binds: for a create, the tab's window and that it is
+   **ungrouped and unpinned** (a pinned tab is refused, `409 conflict`, so
+   grouping cannot unpin or reorder it) (plus its title and address, shown so the preview can be
+   recognized, never matched against); for an update, the group's window,
+   current title, and current color. Nothing is changed. A preview is refused
+   up front, and nothing stored, when the tab is already grouped (`409
+   conflict`), an update would change nothing (`400 validation_error`), the
+   tab or group no longer exists (`409 stale_handle`), or the browser has no tab
+   groups (`501 unsupported_feature`, no mutation).
+2. **Decide** — `POST /api/action.configure_group.approve?id=<n>` or
+   `.../reject?id=<n>`: the id alone, no body and no other query parameter (a
+   `400`). A route decides only its own kind: another kind's action id on it
+   is a `404` that decides nothing. Approve requires a connected extension (the
+   preview is not consumed otherwise), commits the decision with the same
+   race-safe conditional `UPDATE`, and only the winner sends one
+   `browser.configure_group` request built from the **stored** binding.
+
+The service's three routes are the only HTTP surface. `browser.configure_group`
+and `browser.inspect_group_target` have no HTTP route (`404` for either
+credential), the external-agent credential gets `403 forbidden_scope` on all
+three action routes, and the extension's `runtime.onMessage` listener answers
+both as `unknown_method` — they are dispatched only from the authenticated
+service connection, like `browser.open_tab`.
+
+### Execution: revalidate, mutate once, observe
+
+In the extension, `configureGroup`:
+
+- checks `browserSessionId` (`stale_session` — the browser restarted since the
+  preview) and re-validates the whole request with the same rules the preview
+  used (`normalizeGroupConfig` in `extension/protocol.js`, one definition shared
+  by both sides), then feature-detects `tabGroups` **and** `tabs.group`: a
+  browser without them answers `unsupported` / `unsupported_feature` before
+  anything is read or changed;
+- re-reads the bound state, with **no `await` between that read and the
+  mutation**. A create needs the tab still ungrouped and unpinned in the previewed window; an
+  update needs the group still in the previewed window with the previewed title
+  and color. A vanished handle is `stale_handle`; anything else that moved is
+  `state_mismatch`; either changes nothing;
+- calls `tabs.group({ tabIds: [tabId], createProperties: { windowId } })`
+  (create — the previewed window is named explicitly, so the tab is never moved
+  to the browser's current window) and/or
+  `tabGroups.update(groupId, { title?, color? })` **at most once each, never
+  retried**, then reports the group **as read back** with `tabGroups.get`, not
+  an echo of the request.
+
+| Action `state` | Meaning | `result.mutation` |
+| --- | --- | --- |
+| `executed` | the change was made and observed (`result.observed`: window, title, color, collapsed; `groupId`, and `tabId` for a create) | `created` (new group) / `updated` (existing group) |
+| `partial` | a change was made but not completed or observed: for a create, the group exists but its title/color update failed (`group_update_failed`) or it could not be read back (`observe_failed`); for an update, the change was made but not read back (`observe_failed`). Known handles are recorded, but only if they are the preview's own (a create's tab and window; an update's group and window and no tab; only a new group's handle is newly assigned) — otherwise the answer is unusable and recorded `failed`/`unknown` | `created` / `updated` |
+| `stale` | `stale_session`, `stale_handle`, or `state_mismatch`: what was previewed no longer holds; nothing changed | `none` |
+| `failed` | the extension refused or failed with no change (`unsupported_feature`, `group_failed`, `group_update_failed` on an update, `invalid_params`), or the request was never sent | `none` |
+| `failed` | the request was sent but no usable answer came back (`request_timeout`, `disconnected` mid-request, `invalid_extension_response`, an answer for a different session/operation/tab/group) | `unknown` |
+| `rejected` | you rejected the preview; nothing changed (no result) | — |
+
+HTTP `200` once the decision committed; a decided action is never retried (a
+new preview is the only way to try again). The service validates the
+extension's answer like every other (`validateMethodResult`): an `ok` result
+must say `changed: true`, name its operation, and carry a valid observed group;
+every non-`ok` result must state `changed` consistently (`false` for any refusal
+or failure; `true` only for the `incomplete` partial outcomes). Crash/restart
+reconciliation and `store.clear` refusal while an action is in flight apply to
+group actions exactly as to tab actions.
+
+### Protocol: version 4
+
+`PROTOCOL_VERSION` is `4`. A version-3 extension would answer
+`browser.configure_group` with a bare `unknown_method` and no `changed` flag,
+so the handshake refuses the mismatch (`unsupported_protocol_version`) rather
+than the service ever sending it a second mutating request. The review UI, the
+reference agent client, and every test client send version `4`.
+
+### Storage and audit
+
+Migration v4 (non-breaking, in its own transaction) rebuilds `actions` — SQLite
+cannot widen a `CHECK` in place — to allow the new kind, make `url` nullable,
+and add a `binding` column holding the group preview's handles and bound state
+as JSON (constraint-enforced: a tab action has a URL and no binding, a group
+action the reverse). Existing rows, their ids, the AUTOINCREMENT counter (so ids
+the audit log already names are never reused), and the immutability triggers
+are carried over; `action_audit` is not touched. The preview binding and the
+result live in `actions`, which holds the chosen tab's (untrusted, clipped)
+title/address and the observed group's title, and is wiped by `store.clear`.
+
+The audit log is unchanged in shape and content: `kind` is now `open_tab` or
+`configure_group`, a result's `mutation` may also be `updated`, and nothing else
+— **no title, color, URL, handle, session id, or extension-supplied
+code/detail** — ever enters it.
+
+### In the review UI
+
+"Windows, tabs, and groups" gains **Group this tab…** on each tab row and
+**Edit this group…** on each group row. Choosing one only fills the "Create or
+change a tab group" form's target line (current tabs/groups you loaded; nothing
+is sent) and moves focus to its labelled Title field. The form has a Title, a
+"Remove the group's current title" checkbox (editing only), and a Color select
+of the native colors; **Preview group change** stores the preview, which then
+appears in the same actions list as **Apply** / **Reject** (only while
+`previewed`), decided by id alone and reread from the service afterwards, with
+the same double-submit and stale-list guards as tab actions. The preview shows
+the exact handles, window, and bound current title/color; results show whether
+the browser changed ("yes — one new group was created…" / "one existing group
+was changed" / "no" / "unknown") and the observed group. Everything
+browser-derived is rendered with `textContent` only. A stale browser session,
+Disconnect, or a "Load windows" that establishes a *different* session than the
+previously known one clears the chosen target (before the new list renders); the
+same session leaves it alone.
+
+### Limitations and assumptions
+
+- **Chromium-family only.** Firefox's package omits the `tabGroups` permission,
+  so every group request there answers `unsupported_feature`; the Firefox build
+  is unchanged and still produced; the Firefox smoke passed before the review
+  fixes and was not extended to exercise group requests.
+- The extension cannot make the browser check-and-change atomically: a user
+  action between its re-read and `tabs.group`/`tabGroups.update` is not
+  detectable. The window is a few microtasks, not zero.
+- A `tabs.group` or `tabGroups.update` that rejects is assumed to have changed
+  nothing (`mutation: none`); a lost answer is `unknown`.
+- Group titles longer than 100 characters, or containing control characters,
+  already on a group in the browser cannot be matched as the bound current title,
+  so that group cannot be renamed through this action (the preview is refused).
+- Previews have no wall-clock expiry; the only staleness boundary is the session
+  and the bound state re-check.
+- `collapsed` is observed and reported but never requested or changed.
+
+### Tests
+
+`test/group-actions-extension.test.mjs`: `normalizeGroupConfig` and the two
+methods' result validation (including every non-`ok` `changed` shape), and the
+worker against a recorded mock browser — read-only inspection; create (exactly
+one `tabs.group` with one tab id, one `tabGroups.update`, a read-back
+observation); update; clear-title; no-change refusal; stale session before any
+read; stale handle and state mismatch with no mutation call; `group_failed`;
+the partial outcomes with no retry; `unsupported` (no `tabGroups`, or no
+`tabs.group`) with no browser call; and routing (`runtime.onMessage` and
+`routeMessage` cannot reach either method). `test/group-actions.test.mjs`: the
+store (binding, result shapes, append-only audit content, immutability and
+constraints against raw SQL, clear, reconciliation, pending bound, migration v4
+over a real v3 database including a gapped id counter) and the HTTP routes
+(exact body, preview binding, every refusal, owner-only/agent/no-route, id-only
+decisions, kind-bound routes, stale/partial/failed/unknown outcomes, timeout and
+disconnect, clipping, concurrent decisions, hostile-extension audit content,
+`store.clear` during an in-flight approval, no logging of content) plus
+end-to-end tests through the **real** worker, service client, and service over a
+mock browser (create, update, clear title, reject, an earlier-session preview,
+tab grouped / group renamed / recolored / moved / closed after the preview,
+unsupported, partial). `test/ui.test.mjs`, `test/protocol.test.mjs`,
+`test/actions.test.mjs` were adjusted only for the new protocol/schema versions
+and the generalized UI. Review-fix coverage: the create names the previewed
+window (`createProperties.windowId`) in the worker and end to end; a pinned tab
+is reported by inspection, refused at preview (`409`), refused again at action
+time (`state_mismatch`, no mutation), and an inspection answer without `pinned`
+is invalid; a partial create must name the previewed tab and window and a
+partial update the previewed group and window with no tab, otherwise it is
+recorded `failed`/`unknown` (including a hostile extension's unrelated handles);
+and `isReplacedSession` (`test/ui-lib.test.mjs`) plus static checks that the UI
+drops its chosen target only when a new session replaces a known one.
+
+`npm run test:smoke:bridge` gained Step 2.9 (real Chrome for Testing, checked
+against `chrome.tabs`/`chrome.tabGroups`): agent refusal and no extension-level
+route; a preview changes nothing; Apply groups exactly the previewed tab with
+the requested title/color and the recorded group matches the real one; repeats
+refused; update renames/recolors; an empty title clears it; Reject changes
+nothing; a group recolored or a tab grouped after the preview is refused as
+`state_mismatch` with no change; an already-grouped tab, a no-op update, missing
+handles, and a caller-supplied session are refused at preview; audit has no
+content; and a preview left pending is refused as `stale_session` after the
+browser restart; a tab in a non-current second window staying in that window
+with its group; and a pinned tab refused at preview and left pinned and
+ungrouped. The complete smoke passed against the fixed revision.
 
 ## Local development
 

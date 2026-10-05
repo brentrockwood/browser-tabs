@@ -217,7 +217,8 @@ export const STORE_ROUTES = new Map([
   // Phase 2 Action 1: read-only views of the action records and their
   // append-only audit log. Deliberately no create/update/delete route here —
   // actions are created, decided, and completed only through the
-  // `action.open_tab.*` routes in service/server.mjs, and the audit log has
+  // `action.open_tab.*` / `action.configure_group.*` routes in
+  // service/server.mjs, and the audit log has
   // no mutation route at all. Owner-only like every route outside the agent
   // allowlist.
   [

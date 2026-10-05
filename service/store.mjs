@@ -436,6 +436,60 @@ export const MIGRATIONS = [
       `);
     },
   },
+  {
+    // Phase 2 Action 2: a second action kind, `configure_group`. A CHECK
+    // constraint cannot be altered in place, so `actions` is rebuilt — in this
+    // migration's own transaction, so it either completes or leaves the v3 table
+    // untouched — with the kind list widened, `url` nullable (a group action has
+    // none), and a new `binding` column holding the group preview's exact handles
+    // and bound state as JSON. Existing rows are copied unchanged. An
+    // AUTOINCREMENT counter lives in `sqlite_sequence` and would otherwise reset
+    // (dropping the old table deletes its entry), re-using ids that the
+    // append-only audit log already refers to: it is carried over explicitly.
+    // `action_audit` is not touched. Not marked breaking: nothing is lost, so no
+    // backup copy of the database (and the browser content in it) is made.
+    version: 4,
+    breaking: false,
+    apply: (db) => {
+      db.exec(`
+        CREATE TABLE actions_v4 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL CHECK (kind IN ('open_tab','configure_group')),
+          url TEXT,
+          binding TEXT,
+          browser_session_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('previewed','approved','rejected','executed','partial','stale','failed')),
+          previewed_at INTEGER NOT NULL,
+          decided_at INTEGER,
+          completed_at INTEGER,
+          result TEXT,
+          CHECK (
+            (kind = 'open_tab' AND url IS NOT NULL AND binding IS NULL) OR
+            (kind = 'configure_group' AND url IS NULL AND binding IS NOT NULL)
+          )
+        );
+        INSERT INTO actions_v4 (id, kind, url, browser_session_id, state, previewed_at, decided_at, completed_at, result)
+          SELECT id, kind, url, browser_session_id, state, previewed_at, decided_at, completed_at, result FROM actions;
+        DELETE FROM sqlite_sequence WHERE name = 'actions_v4';
+        INSERT INTO sqlite_sequence (name, seq) SELECT 'actions_v4', seq FROM sqlite_sequence WHERE name = 'actions';
+        DROP TABLE actions;
+        ALTER TABLE actions_v4 RENAME TO actions;
+        CREATE INDEX idx_actions_state ON actions(state);
+
+        CREATE TRIGGER actions_bound_fields_immutable
+        BEFORE UPDATE OF kind, url, binding, browser_session_id, previewed_at ON actions
+        BEGIN
+          SELECT RAISE(ABORT, 'a previewed action''s kind, url, binding, session, and timestamp are immutable');
+        END;
+        CREATE TRIGGER actions_terminal_state_immutable
+        BEFORE UPDATE OF state ON actions
+        WHEN OLD.state NOT IN ('previewed','approved')
+        BEGIN
+          SELECT RAISE(ABORT, 'a terminal action state cannot change');
+        END;
+      `);
+    },
+  },
 ];
 
 // Copies the database file aside before an incompatible migration is
@@ -1349,6 +1403,7 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
       id: row.id,
       kind: row.kind,
       url: row.url,
+      binding: row.binding === null ? null : JSON.parse(row.binding),
       browserSessionId: row.browser_session_id,
       state: row.state,
       previewedAt: row.previewed_at,
@@ -1394,8 +1449,8 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
       }
       const now = nowMs();
       const result = db
-        .prepare("INSERT INTO actions (kind, url, browser_session_id, state, previewed_at) VALUES (?, ?, ?, 'previewed', ?)")
-        .run(data.kind, data.url, data.browserSessionId, now);
+        .prepare("INSERT INTO actions (kind, url, binding, browser_session_id, state, previewed_at) VALUES (?, ?, ?, ?, 'previewed', ?)")
+        .run(data.kind, data.url, data.binding === null ? null : JSON.stringify(data.binding), data.browserSessionId, now);
       const id = Number(result.lastInsertRowid);
       appendActionAudit(id, "preview", now, { kind: data.kind });
       return rowToAction(db.prepare("SELECT * FROM actions WHERE id = ?").get(id));
@@ -1433,8 +1488,12 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
   // can be completed, and only once (the same conditional-UPDATE pattern as
   // decideAction); the result and its audit event commit together.
   function recordActionResult(id, input) {
-    const data = validateActionResultInput(input);
     if (!Number.isSafeInteger(id) || id <= 0) throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, "id: must be a positive integer");
+    // The result's shape depends on the action's kind (immutable once previewed).
+    // An unknown id is validated as the default kind and then reported as not
+    // found by the completion itself.
+    const kind = db.prepare("SELECT kind FROM actions WHERE id = ?").get(id)?.kind;
+    const data = validateActionResultInput(input, kind);
     return runInTransaction(db, () => completeApprovedAction(id, data));
   }
 
@@ -1448,6 +1507,8 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
       code: data.code,
       detail: data.detail,
       tabId: data.tabId,
+      // Only a group action's result carries a group handle.
+      ...(data.groupId === undefined ? {} : { groupId: data.groupId }),
       windowId: data.windowId,
       observed: data.observed,
     });
@@ -1477,19 +1538,22 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
   // does not call it; the lock is what makes "no other process" true.
   function reconcileInterruptedActions() {
     return runInTransaction(db, () => {
-      const ids = db.prepare("SELECT id FROM actions WHERE state = 'approved' ORDER BY id").all().map((row) => row.id);
-      for (const id of ids) {
+      const rows = db.prepare("SELECT id, kind FROM actions WHERE state = 'approved' ORDER BY id").all();
+      for (const { id, kind } of rows) {
         completeApprovedAction(
           id,
-          validateActionResultInput({
-            state: "failed",
-            mutation: "unknown",
-            code: ACTION_INTERRUPTED_CODE,
-            detail: ACTION_INTERRUPTED_DETAIL,
-          }),
+          validateActionResultInput(
+            {
+              state: "failed",
+              mutation: "unknown",
+              code: ACTION_INTERRUPTED_CODE,
+              detail: ACTION_INTERRUPTED_DETAIL,
+            },
+            kind,
+          ),
         );
       }
-      return { reconciledCount: ids.length };
+      return { reconciledCount: rows.length };
     });
   }
 

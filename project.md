@@ -469,6 +469,57 @@ reinvent:
 See README.md's "Phase 2, Action 1: open a URL in a new tab" for the full
 contract, the UI behavior, and the verification status to update.
 
+### Action 2 (create, rename, or recolor a tab group): complete
+
+Action 2 reuses Action 1's decisions rather than reinventing them: the same
+owner-only preview → decide-by-id-alone → execute-once → recorded, audited
+result, in the same action store, state machine, and append-only audit log
+(`kind` is now `open_tab` or `configure_group`; the audit still holds only
+fixed server enums). It supports (1) a new group around exactly one chosen,
+existing, ungrouped tab, optionally titled/colored, and (2) renaming and/or
+recoloring an existing group; moving arbitrary selected tabs (Action 3) is not
+offered. What is specific to it:
+
+- **The preview binds the browser's own state.** The caller supplies an
+  operation, one exact handle, and the requested title/color — never a
+  session. The service asks the extension (read-only
+  `browser.inspect_group_target`, no HTTP route) and binds the session from that
+  answer plus the current state: the tab's window and that it is ungrouped and
+  unpinned, or
+  the group's window, title, and color. An update must actually change the title
+  or color; `""` is the explicit clear-title value; colors are Chrome's native
+  enum; titles are bounded plain text.
+- **The extension revalidates immediately before mutating**
+  (`browser.configure_group`): session, request shape, the bound state (no
+  `await` between the re-read and the call), `tabs.group` and
+  `tabGroups.update` at most once each, then the group is reported as read
+  back. Vanished handle / moved state → `stale`, no mutation. A browser without
+  `tabGroups`/`tabs.group` answers `unsupported_feature` without reading or
+  changing anything (this is how the Firefox build behaves).
+- **Honest outcomes**, same four states, with `mutation` now `none`,
+  `created`, `updated`, or `unknown`: a partial outcome is a change that was
+  made but whose title/color update or observation failed; a lost answer is
+  `failed`/`unknown`; nothing is retried.
+- **Protocol bumped to 4** (a version-3 peer lacks the method), database schema
+  to 4 (migration v4 rebuilds `actions` to widen its constraints, keeping rows,
+  ids, and the audit log).
+
+Independent review found four issues, all fixed with regression coverage: the
+create did not pass the tab's window to `tabs.group` (so a tab could move to the
+current window — `createProperties.windowId` is now passed, and the smoke checks
+a tab in a non-current second window stays put); pinned tabs were not refused
+(now refused at preview and again at action time, since grouping could unpin or
+reorder them); the review UI's chosen group target survived a replaced browser
+session discovered by "Load windows" (now cleared, only on a real replacement);
+and partial results were accepted with unrelated handles (a partial create must
+name the preview's tab and window, a partial update its group and window and no
+tab, else `failed`/`unknown`). The final gate passed `npm test` (587/587), a
+clean dependency audit, version/build/lifecycle checks, the real Chrome for
+Testing bridge smoke including the new two-window and pinned-tab cases, the
+real Firefox smoke (tab groups cleanly unsupported), and Terra re-review with
+no remaining blocker. See README.md's "Phase 2, Action 2: create, rename, or
+recolor a tab group" for the contract, UI, assumptions, and limitations.
+
 ## Later work
 
 These are intentionally outside the first two phases:
@@ -486,13 +537,15 @@ review.
 
 ## Current repository state
 
-Phase 2 Action 1 (open a URL in a new tab) is complete on top of the completed
-Phase 1 described below. Its final gate passed 478/478 automated tests, a clean
-audit, the real Chrome for Testing bridge smoke, and independent Terra review;
-see "Action 1 (open a URL in a new tab)" under Phase 2 above. It is the only browser mutation in the repository; the
-Phase 1 statements below that no mutation exists describe Phase 1 as it was
-completed and are otherwise unchanged. `PROTOCOL_VERSION` is now `3` and the
-database schema version `3`.
+Phase 2 Actions 1 and 2 are complete on top of the completed Phase 1 described
+below. Action 2's final gate passed 587/587 automated tests, a clean dependency
+audit, version/build/lifecycle checks, real Chrome and Firefox smokes, and
+independent Terra re-review after all four findings were fixed; see "Action 2"
+above.
+These are the only two browser mutations in the repository; the Phase 1
+statements below that no mutation exists describe Phase 1 as it was completed
+and are otherwise unchanged. `PROTOCOL_VERSION` is now `4` and the database
+schema version `4`.
 
 The repository contains a stabilized Manifest V3 inspector (Stage 0, below)
 and an implemented Stage 1 local bridge: a Node.js service (`service/`)

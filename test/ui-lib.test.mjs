@@ -5,7 +5,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createDecisionTracker, createGenerationCounter, createListVersionGuard, DECISION_STATES } from "../ui/lib.mjs";
+import { createDecisionTracker, createGenerationCounter, createListVersionGuard, DECISION_STATES, isReplacedSession } from "../ui/lib.mjs";
+
+test("isReplacedSession: only a different session than a previously known one is a replacement", () => {
+  assert.equal(isReplacedSession("s1", "s2"), true);
+  assert.equal(isReplacedSession("s1", "s1"), false, "the same session leaves a chosen target alone");
+  assert.equal(isReplacedSession(null, "s1"), false, "the first session learned is not a replacement");
+  assert.equal(isReplacedSession(undefined, "s1"), false);
+  assert.equal(isReplacedSession("", "s1"), false);
+  for (const next of [null, undefined, "", 5, {}]) assert.equal(isReplacedSession("s1", next), false, String(next));
+});
 
 test("createGenerationCounter: bump invalidates every prior snapshot", () => {
   const gen = createGenerationCounter();

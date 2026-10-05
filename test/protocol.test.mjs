@@ -463,8 +463,8 @@ test("validateMethodResult checks get_capabilities-specific fields", () => {
 
 // --- Phase 2 Action 1: browser.open_tab -----------------------------------
 
-test("the protocol version was bumped for the first mutating method", () => {
-  assert.equal(PROTOCOL_VERSION, 3);
+test("the protocol version was bumped for each mutating method (3 for open_tab, 4 for configure_group)", () => {
+  assert.equal(PROTOCOL_VERSION, 4);
 });
 
 test("normalizeOpenUrl accepts absolute http(s) URLs and returns the WHATWG-normalized form", () => {

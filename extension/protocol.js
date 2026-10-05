@@ -65,12 +65,26 @@ export const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 // session-revalidating, create-then-observe contract below (it would answer
 // `unknown_method`, with no `created` field), so the handshake refuses the
 // mismatch outright with `unsupported_protocol_version`.
-export const PROTOCOL_VERSION = 3;
+//
+// Bumped to 4 for Phase 2 Action 2 (`browser.configure_group`, plus the
+// read-only `browser.inspect_group_target` its preview uses): a second
+// mutating request. A version-3 extension would answer it `unknown_method`
+// with no `changed` field, so the handshake refuses the mismatch outright.
+export const PROTOCOL_VERSION = 4;
 
 // Phase 2 Action 1: the longest URL (raw input, and again after
 // normalization) the open-tab action accepts. Bounds the preview, the stored
 // action record, and the `tabs.create` argument.
 export const MAX_OPEN_URL_LENGTH = 2_048;
+
+// Phase 2 Action 2: tab-group configuration. The colors are Chrome's native
+// `tabGroups.Color` enum, passed through unchanged. A title is plain text of
+// at most this many characters; the empty string is the explicit "clear the
+// title" value (an omitted/null title means "leave it alone").
+export const TAB_GROUP_COLORS = Object.freeze(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
+export const MAX_GROUP_TITLE_LENGTH = 100;
+// `tabs.TAB_GROUP_ID_NONE`: a tab's `groupId` when it is in no group.
+export const TAB_GROUP_ID_NONE = -1;
 
 // Single source of truth for the Stage 1 fixed loopback port: both the
 // extension's WebSocket target (extension/service-client.js) and the
@@ -170,6 +184,14 @@ export const ERROR_CODES = Object.freeze({
   // observation did not (a tab *was* created; its final state is unknown).
   OPEN_TAB_FAILED: "open_tab_failed",
   OBSERVE_FAILED: "observe_failed",
+  // Phase 2 Action 2: `tabs.group` rejected (no group was created); the
+  // follow-up `tabGroups.update` rejected (for a new group, the group exists
+  // without its title/color — a partial outcome); and the bound current state
+  // (window, ungrouped tab, group title/color) no longer matching at
+  // execution time, so nothing was changed.
+  GROUP_FAILED: "group_failed",
+  GROUP_UPDATE_FAILED: "group_update_failed",
+  STATE_MISMATCH: "state_mismatch",
   RATE_LIMITED: "rate_limited",
   RESPONSE_TOO_LARGE: "response_too_large",
   // The extension's own response failed the service boundary's envelope/
@@ -261,6 +283,66 @@ export function normalizeOpenUrl(value) {
   return { valid: true, url: parsed.href };
 }
 
+// Phase 2 Action 2: shared by the service (preview) and the extension (re-checked
+// before any mutation). Plain text only: bounded, no control characters. The
+// empty string is valid here — it means "clear the title" where a title is
+// requested at all.
+export function isValidGroupTitle(value) {
+  return typeof value === "string" && value.length <= MAX_GROUP_TITLE_LENGTH && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+export function isValidGroupColor(value) {
+  return typeof value === "string" && TAB_GROUP_COLORS.includes(value);
+}
+
+// Phase 2 Action 2: the one place a group-configuration request is validated,
+// shared by the service (when a preview is stored) and the extension (re-checked
+// before any mutation). `create` groups exactly one existing tab
+// (`tabId`, in `windowId`) and may set a title and/or color; `update` changes an
+// existing group (`groupId`, in `windowId`) whose current title/color the
+// request states (`expectedTitle`/`expectedColor`) and must actually change at
+// least one of them. `title`/`color` of null or absent mean "leave it alone";
+// a `title` of "" clears an existing title. Returns the normalized request
+// with every field present (null where not requested), or the reason it is
+// invalid.
+export function normalizeGroupConfig(value) {
+  const invalid = (reason) => ({ valid: false, reason });
+  if (value === null || typeof value !== "object") return invalid("must be an object");
+  const title = value.title ?? null;
+  const color = value.color ?? null;
+  if (title !== null && !isValidGroupTitle(title)) {
+    return invalid(`title must be plain text of at most ${MAX_GROUP_TITLE_LENGTH} characters with no control characters`);
+  }
+  if (color !== null && !isValidGroupColor(color)) return invalid(`color must be one of: ${TAB_GROUP_COLORS.join(", ")}`);
+  if (!isValidHandle(value.windowId)) return invalid("windowId must be a non-negative safe integer");
+
+  if (value.operation === "create") {
+    if (!isValidHandle(value.tabId)) return invalid("tabId must be a non-negative safe integer");
+    if (title === "") return invalid("a new group cannot be created with an empty title");
+    return { valid: true, config: { operation: "create", tabId: value.tabId, windowId: value.windowId, title, color } };
+  }
+  if (value.operation === "update") {
+    if (!isValidHandle(value.groupId)) return invalid("groupId must be a non-negative safe integer");
+    if (!isValidGroupTitle(value.expectedTitle)) return invalid("expectedTitle must be the group's current title (a string)");
+    if (!isValidGroupColor(value.expectedColor)) return invalid("expectedColor must be the group's current color");
+    const changes = (title !== null && title !== value.expectedTitle) || (color !== null && color !== value.expectedColor);
+    if (!changes) return invalid("the request must change the group's title or color");
+    return {
+      valid: true,
+      config: {
+        operation: "update",
+        groupId: value.groupId,
+        windowId: value.windowId,
+        expectedTitle: value.expectedTitle,
+        expectedColor: value.expectedColor,
+        title,
+        color,
+      },
+    };
+  }
+  return invalid('operation must be "create" or "update"');
+}
+
 // Every status a `browser.*` result's envelope may carry. "incomplete" is
 // used only by `browser.query_history`, when its explicit scan ceiling
 // (MAX_HISTORY_SCAN) is reached before a full page can be determined — see
@@ -324,6 +406,23 @@ function isValidTabGroupRecord(value) {
     isNullableString(value.title) &&
     isNullableString(value.color) &&
     typeof value.collapsed === "boolean"
+  );
+}
+
+// What `browser.inspect_group_target` reports about a tab: enough to bind a
+// preview (its window, whether it is already in a group) and to show the user
+// which tab it is, and whether it is pinned (a pinned tab is never grouped).
+// `title`/`url` are untrusted browser content.
+function isValidInspectedTab(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    isValidHandle(value.tabId) &&
+    isValidHandle(value.windowId) &&
+    typeof value.grouped === "boolean" &&
+    typeof value.pinned === "boolean" &&
+    isNullableString(value.title) &&
+    isNullableString(value.url)
   );
 }
 
@@ -422,6 +521,25 @@ const OK_SHAPE_VALIDATORS = {
     isValidTabRecord(result.tab) &&
     isNullableString(result.pendingUrl),
 
+  // Phase 2 Action 2: a read-only look at the one tab or group a preview is
+  // about — exactly one of `tab` / `group` is an object, the other `null`. A
+  // group's color must be one of the native enum values.
+  "browser.inspect_group_target": (result) => {
+    const { tab, group } = result;
+    if (!((tab === null && group !== null) || (tab !== null && group === null))) return false;
+    if (tab !== null) return isValidInspectedTab(tab);
+    return isValidTabGroupRecord(group) && isValidGroupColor(group.color);
+  },
+
+  // Phase 2 Action 2: a fully observed group change. `group` is the browser's
+  // own `tabGroups.get` answer after the mutation, not an echo of the request.
+  // `tabId` is the grouped tab for a create and `null` for an update.
+  "browser.configure_group": (result) =>
+    result.changed === true &&
+    (result.operation === "create" || result.operation === "update") &&
+    isValidTabGroupRecord(result.group) &&
+    (result.operation === "create" ? isValidHandle(result.tabId) : result.tabId === null),
+
   "browser.get_capabilities": (result) =>
     result.protocolVersion === PROTOCOL_VERSION &&
     typeof result.tabGroups === "boolean" &&
@@ -481,7 +599,27 @@ export function validateMethodResult(method, result) {
   if (method === "browser.open_tab" && !isValidOpenTabNonOkShape(result)) {
     return { valid: false, reason: `a "${result.status}" result for "${method}" must state whether a tab was created, consistently` };
   }
+  if (method === "browser.configure_group" && !isValidConfigureGroupNonOkShape(result)) {
+    return { valid: false, reason: `a "${result.status}" result for "${method}" must state whether the browser was changed, consistently` };
+  }
   return { valid: true };
+}
+
+// A non-"ok" `browser.configure_group` result must say whether the browser was
+// changed. Every refusal or failure is `changed: false`; the partial outcomes —
+// a new group was created but its title/color update failed, or a change was
+// made but the observation was not — are `status: "incomplete"`,
+// `changed: true`, and carry whatever handles are known (null if none).
+function isValidConfigureGroupNonOkShape(result) {
+  if (result.changed === false) return result.status !== "incomplete";
+  return (
+    result.changed === true &&
+    result.status === "incomplete" &&
+    (result.code === ERROR_CODES.OBSERVE_FAILED || result.code === ERROR_CODES.GROUP_UPDATE_FAILED) &&
+    (result.groupId === null || isValidHandle(result.groupId)) &&
+    (result.windowId === null || isValidHandle(result.windowId)) &&
+    (result.tabId === null || isValidHandle(result.tabId))
+  );
 }
 
 // A non-"ok" `browser.open_tab` result must say whether the browser was

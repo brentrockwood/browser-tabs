@@ -5,7 +5,17 @@
 // comes from service/store.mjs always using parameterized `?` placeholders,
 // never string concatenation — this module is the separate, additional
 // defense of rejecting malformed/oversized input outright.
-import { MAX_TEXT_CHARACTERS, isValidHandle, isValidTimestamp, normalizeOpenUrl, validateMethodResult } from "../extension/protocol.js";
+import {
+  MAX_TEXT_CHARACTERS,
+  TAB_GROUP_COLORS,
+  isValidGroupColor,
+  isValidGroupTitle,
+  isValidHandle,
+  isValidTimestamp,
+  normalizeGroupConfig,
+  normalizeOpenUrl,
+  validateMethodResult,
+} from "../extension/protocol.js";
 import { STORE_ERROR_CODES, StoreError } from "./store-errors.mjs";
 
 // Captures persist exactly one Stage 2 result shape — a `browser.read_tab`
@@ -492,19 +502,22 @@ export function validateRetentionUpdateInput(input = {}) {
 
 // ---- Phase 2 Action 1: open a URL in a new tab ----
 
-export const ACTION_KINDS = Object.freeze(["open_tab"]);
+export const ACTION_KINDS = Object.freeze(["open_tab", "configure_group"]);
 // previewed -> approved | rejected; approved -> one of the four result
 // states. Every state after "previewed" other than "approved" is terminal.
 export const ACTION_STATES = Object.freeze(["previewed", "approved", "rejected", "executed", "partial", "stale", "failed"]);
 export const ACTION_RESULT_STATES = Object.freeze(["executed", "partial", "stale", "failed"]);
-// What the browser is known to have undergone: nothing, one new tab, or
-// unknown (the request was sent but its outcome never came back intact).
-export const ACTION_MUTATIONS = Object.freeze(["none", "created", "unknown"]);
+// What the browser is known to have undergone: nothing, one new tab (or, for a
+// group action, one new group), one existing group updated, or unknown (the
+// request was sent but its outcome never came back intact).
+export const ACTION_MUTATIONS = Object.freeze(["none", "created", "updated", "unknown"]);
+// Each kind's own subset: opening a tab never "updates" anything.
+const OPEN_TAB_MUTATIONS = Object.freeze(["none", "created", "unknown"]);
 export const ACTION_AUDIT_EVENTS = Object.freeze(["preview", "approve", "reject", "result"]);
 // The recorded result of an action found still "approved" after a restart.
 export const ACTION_INTERRUPTED_CODE = "interrupted_by_restart";
 export const ACTION_INTERRUPTED_DETAIL =
-  "the service stopped after this action was approved and before its result was recorded; the browser may or may not have opened the tab";
+  "the service stopped after this action was approved and before its result was recorded; the browser may or may not have applied it";
 // Bounds: how many previews may await a decision at once, and how many audit
 // events the append-only log accepts before refusing *new* previews (the
 // decision and result events of an already-previewed action are always
@@ -527,10 +540,53 @@ export function clipText(value, maxLength) {
 // taken in (and, in the store, to its timestamp); see normalizeOpenUrl in
 // extension/protocol.js for what a URL must satisfy.
 export function validateActionPreviewInput(input = {}) {
+  if (input.kind === "configure_group") {
+    const browserSessionId = requireNonEmptyString(input.browserSessionId, "browserSessionId", { maxLength: MAX_SESSION_ID_LENGTH });
+    return { kind: "configure_group", url: null, binding: validateGroupBinding(input.binding), browserSessionId };
+  }
+  if (input.kind !== undefined && input.kind !== "open_tab") fail("kind", `must be one of: ${ACTION_KINDS.join(", ")}`);
   const checked = normalizeOpenUrl(input.url);
   if (!checked.valid) fail("url", checked.reason);
   const browserSessionId = requireNonEmptyString(input.browserSessionId, "browserSessionId", { maxLength: MAX_SESSION_ID_LENGTH });
-  return { kind: "open_tab", url: checked.url, browserSessionId };
+  return { kind: "open_tab", url: checked.url, binding: null, browserSessionId };
+}
+
+// Phase 2 Action 2: what a stored group preview binds — the exact handles and
+// bound current state (see normalizeGroupConfig in extension/protocol.js for
+// the rules, shared with the extension) plus, for a create, the chosen tab's
+// title and address so the preview can be recognized later. Those two are
+// untrusted browser text, clipped, shown but never matched against.
+function validateGroupBinding(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) fail("binding", "must be a plain object");
+  const checked = normalizeGroupConfig(value);
+  if (!checked.valid) fail("binding", checked.reason);
+  if (checked.config.operation !== "create") return checked.config;
+  return {
+    ...checked.config,
+    tabTitle: optionalNullableString(value.tabTitle, "binding.tabTitle", { maxLength: MAX_OBSERVED_TITLE_LENGTH }),
+    tabUrl: optionalNullableString(value.tabUrl, "binding.tabUrl", { maxLength: MAX_OBSERVED_URL_LENGTH }),
+  };
+}
+
+// The HTTP body of a group preview: only the operation, one exact handle, and
+// the requested change — never a session or window (those are learned from
+// the browser), never anything else. `title` is a string when present ("" on
+// an update clears the title); `color` is a native tab-group color.
+export function validateGroupPreviewRequest(body) {
+  const accepted = {
+    create: ["operation", "tabId", "title", "color"],
+    update: ["operation", "groupId", "title", "color"],
+  };
+  if (!Object.hasOwn(accepted, body.operation)) fail("operation", 'must be "create" or "update"');
+  for (const key of Object.keys(body)) {
+    if (!accepted[body.operation].includes(key)) fail(key, `is not accepted for operation "${body.operation}"`);
+  }
+  const handleName = body.operation === "create" ? "tabId" : "groupId";
+  if (!isValidHandle(body[handleName])) fail(handleName, "must be a non-negative safe integer");
+  if (Object.hasOwn(body, "title") && !isValidGroupTitle(body.title)) fail("title", "must be plain text with no control characters, within the bound");
+  if (Object.hasOwn(body, "color") && !isValidGroupColor(body.color)) fail("color", `must be one of: ${TAB_GROUP_COLORS.join(", ")}`);
+  if (body.operation === "create" && body.title === "") fail("title", "a new group cannot be created with an empty title");
+  return { operation: body.operation, [handleName]: body[handleName], title: body.title ?? null, color: body.color ?? null };
 }
 
 function validateObservedTab(value) {
@@ -551,9 +607,10 @@ function validateObservedTab(value) {
 // extension's answer. The combinations are checked, not trusted: "executed"
 // and "partial" mean a tab was created (and only "executed" observed it),
 // "stale" means nothing was.
-export function validateActionResultInput(input = {}) {
+export function validateActionResultInput(input = {}, kind = "open_tab") {
+  if (kind === "configure_group") return validateGroupResultInput(input);
   const state = requireEnum(input.state, ACTION_RESULT_STATES, "state");
-  const mutation = requireEnum(input.mutation, ACTION_MUTATIONS, "mutation");
+  const mutation = requireEnum(input.mutation, OPEN_TAB_MUTATIONS, "mutation");
   if ((state === "executed" || state === "partial") && mutation !== "created") {
     fail("mutation", `must be "created" when state is "${state}"`);
   }
@@ -571,4 +628,49 @@ export function validateActionResultInput(input = {}) {
     fail("tabId/windowId", `must be omitted when state is "${state}"`);
   }
   return { state, mutation, code, detail, tabId, windowId, observed };
+}
+
+function validateObservedGroup(value) {
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) fail("observed", "must be a plain object or null");
+  return {
+    windowId: requireHandle(value.windowId, "observed.windowId"),
+    title: optionalNullableString(value.title, "observed.title", { maxLength: MAX_OBSERVED_TITLE_LENGTH }),
+    color: optionalNullableString(value.color, "observed.color", { maxLength: MAX_OBSERVED_STATUS_LENGTH }),
+    collapsed: requireBoolean(value.collapsed, "observed.collapsed"),
+  };
+}
+
+function requireHandle(value, fieldName) {
+  if (!isValidHandle(value)) fail(fieldName, "must be a non-negative safe integer");
+  return value;
+}
+
+// The group-action counterpart of the above. "executed" means the change was
+// made and observed (`mutation` "created" for a new group, "updated" for an
+// existing one, with the group's handles and observed state); "partial"
+// means a change was made but not completed or observed; "stale" and "failed"
+// carry no handles or observation, and "stale" is always a certain no-op.
+function validateGroupResultInput(input) {
+  const state = requireEnum(input.state, ACTION_RESULT_STATES, "state");
+  const mutation = requireEnum(input.mutation, ACTION_MUTATIONS, "mutation");
+  if ((state === "executed" || state === "partial") && mutation !== "created" && mutation !== "updated") {
+    fail("mutation", `must be "created" or "updated" when state is "${state}"`);
+  }
+  if (state === "stale" && mutation !== "none") fail("mutation", 'must be "none" when state is "stale"');
+  if (state === "failed" && mutation !== "none" && mutation !== "unknown") fail("mutation", 'must be "none" or "unknown" when state is "failed"');
+  const code = state === "executed" ? null : requireNonEmptyString(input.code, "code", { maxLength: MAX_CODE_LENGTH });
+  const detail = optionalNullableString(input.detail, "detail", { maxLength: MAX_ACTION_DETAIL_LENGTH });
+  const tabId = optionalNullableHandle(input.tabId, "tabId");
+  const groupId = optionalNullableHandle(input.groupId, "groupId");
+  const windowId = optionalNullableHandle(input.windowId, "windowId");
+  const observed = validateObservedGroup(input.observed ?? null);
+  if (state === "executed" && (observed === null || groupId === null || windowId === null)) {
+    fail("observed", 'is required, with groupId and windowId, when state is "executed"');
+  }
+  if (state !== "executed" && observed !== null) fail("observed", 'is only allowed when state is "executed"');
+  if ((state === "stale" || state === "failed") && (tabId !== null || groupId !== null || windowId !== null)) {
+    fail("tabId/groupId/windowId", `must be omitted when state is "${state}"`);
+  }
+  return { state, mutation, code, detail, tabId, groupId, windowId, observed };
 }

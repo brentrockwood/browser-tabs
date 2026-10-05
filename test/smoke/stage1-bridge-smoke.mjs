@@ -1501,6 +1501,314 @@ async function main() {
     }
     const staleActionId = stalePreviewResponse.json.result.id;
 
+    // Step 2.9: Phase 2 Action 2 ("create, rename, or recolor a tab group"),
+    // against the real browser's own tabs and groups (chrome.tabs/
+    // chrome.tabGroups from the service worker), never only against what the
+    // service says:
+    //   - a preview changes nothing; Apply on a create preview groups exactly
+    //     the previewed tab, with the requested title/color, and the recorded
+    //     observed group matches the real one; a repeat changes nothing;
+    //   - Apply on an update preview renames/recolors exactly that group, and
+    //     an explicit empty title clears the title;
+    //   - Reject changes nothing, ever;
+    //   - a tab grouped, or a group recolored, by someone else after the
+    //     preview is refused as stale (state_mismatch) and changes nothing;
+    //   - a tab in a non-current second window stays in that window (and its
+    //     group is created there); a pinned tab is refused at preview and
+    //     stays pinned and ungrouped;
+    //   - previews are refused up front for an already-grouped tab, a change
+    //     that changes nothing, and handles that do not exist;
+    //   - the agent credential cannot reach any of it, and the extension-level
+    //     methods have no HTTP route;
+    //   - the append-only audit log holds no title, URL, or handle;
+    //   - one create preview is left pending here and approved only *after*
+    //     the browser restart (Step 5), where it must be refused as stale.
+    // A browser without tab groups must instead answer 501 unsupported at
+    // preview, with nothing changed.
+    console.log("exercising Phase 2 Action 2 (tab groups: create, update, clear title, reject, stale/mismatch refusals)...");
+    let staleGroupActionId = null;
+    {
+      const GROUP_FIXTURE = (name) => `${fixtureUrl}?smoke-group=${name}`;
+      const post = (path, body) => serviceRequest(port, path, { method: "POST", token, body });
+      const decide = (operation, id) => post(`/api/action.configure_group.${operation}?id=${id}`);
+      const preview = (body) => post("/api/action.configure_group.preview", body);
+      const NO_GROUP = -1;
+      const realTabGroupId = (tabId) => evaluate(swCdp, `chrome.tabs.get(${JSON.stringify(tabId)}).then((t) => t.groupId)`);
+      const realGroup = (groupId) =>
+        evaluate(swCdp, `chrome.tabGroups.get(${JSON.stringify(groupId)}).then((g) => ({ title: g.title, color: g.color, windowId: g.windowId }))`);
+      const realGroupTabIds = (groupId) =>
+        evaluate(swCdp, `chrome.tabs.query({ groupId: ${JSON.stringify(groupId)} }).then((tabs) => tabs.map((t) => t.id).sort((a, b) => a - b))`);
+      const check = (condition, message) => {
+        if (!condition) fail(`[Phase 2 configure_group] ${message}`);
+        return Boolean(condition);
+      };
+
+      for (const [path, body, expectedStatus] of [
+        ["/api/action.configure_group.preview", { operation: "create", tabId: 1 }, 403],
+        ["/api/action.configure_group.approve?id=1", undefined, 403],
+        ["/api/action.configure_group.reject?id=1", undefined, 403],
+        ["/api/browser.configure_group", { operation: "create", tabId: 1, browserSessionId: sessionId }, 404],
+        ["/api/browser.inspect_group_target?tabId=1", undefined, 404],
+      ]) {
+        const attempt = await serviceRequest(port, path, { method: "POST", token: agentToken, body });
+        if (!check(attempt.status === expectedStatus, `agent credential POST ${path} expected HTTP ${expectedStatus}, got ${attempt.status} ${JSON.stringify(attempt.json)}`)) return;
+      }
+
+      if (!capabilities.tabGroups) {
+        const tab = await createAndWaitForTab(swCdp, GROUP_FIXTURE("unsupported"));
+        try {
+          const refused = await preview({ operation: "create", tabId: tab.id });
+          if (!check(refused.status === 501 && refused.json?.error?.code === "unsupported_feature", `a browser without tab groups did not answer unsupported: ${refused.status} ${JSON.stringify(refused.json)}`)) return;
+        } finally {
+          await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(tab.id)})`).catch(() => {});
+        }
+        console.log("Phase 2 Action 2: this browser reports no tab groups; preview answered unsupported and nothing changed.");
+      } else {
+        const tabA = await createAndWaitForTab(swCdp, GROUP_FIXTURE("a"));
+        const tabB = await createAndWaitForTab(swCdp, GROUP_FIXTURE("b"));
+        const tabC = await createAndWaitForTab(swCdp, GROUP_FIXTURE("c"));
+        const tabD = await createAndWaitForTab(swCdp, GROUP_FIXTURE("d"));
+        try {
+          // --- Create: exactly the previewed tab, the requested title/color. ---
+          const createPreview = await preview({ operation: "create", tabId: tabA.id, title: "smoke-created", color: "orange" });
+          const created = createPreview.json?.result;
+          if (
+            !check(
+              createPreview.status === 200 &&
+                created?.state === "previewed" &&
+                created.browserSessionId === sessionId &&
+                created.binding?.operation === "create" &&
+                created.binding?.tabId === tabA.id &&
+                created.binding?.title === "smoke-created" &&
+                created.binding?.color === "orange",
+              `the create preview does not bind the exact tab, change, and current session: ${createPreview.status} ${JSON.stringify(createPreview.json)}`,
+            )
+          ) {
+            return;
+          }
+          if (!check((await realTabGroupId(tabA.id)) === NO_GROUP, "a preview grouped the tab")) return;
+
+          const createApproval = await decide("approve", created.id);
+          const createDone = createApproval.json?.result;
+          if (
+            !check(
+              createApproval.status === 200 && createDone?.state === "executed" && createDone.result?.mutation === "created" && Number.isInteger(createDone.result?.groupId),
+              `the approved create was not recorded as executed with a created group: ${createApproval.status} ${JSON.stringify(createApproval.json)}`,
+            )
+          ) {
+            return;
+          }
+          const newGroupId = createDone.result.groupId;
+          if (!check((await realTabGroupId(tabA.id)) === newGroupId, "the previewed tab is not in the group the result names")) return;
+          const realCreated = await realGroup(newGroupId);
+          if (
+            !check(
+              realCreated.title === "smoke-created" &&
+                realCreated.color === "orange" &&
+                createDone.result.observed?.title === realCreated.title &&
+                createDone.result.observed?.color === realCreated.color &&
+                createDone.result.windowId === realCreated.windowId,
+              `the recorded observed group does not match the real one: ${JSON.stringify({ createDone, realCreated })}`,
+            )
+          ) {
+            return;
+          }
+          if (!check(JSON.stringify(await realGroupTabIds(newGroupId)) === JSON.stringify([tabA.id]), "the new group does not contain exactly the previewed tab")) return;
+          for (const operation of ["approve", "reject"]) {
+            const again = await decide(operation, created.id);
+            if (!check(again.status === 409, `a repeated ${operation} of a decided action was not refused: ${again.status} ${JSON.stringify(again.json)}`)) return;
+          }
+          if (!check(JSON.stringify(await realGroupTabIds(newGroupId)) === JSON.stringify([tabA.id]), "a repeated decision changed the group")) return;
+
+          // --- Update: rename and recolor exactly that group. ---
+          const updatePreview = await preview({ operation: "update", groupId: newGroupId, title: "smoke-renamed", color: "purple" });
+          const update = updatePreview.json?.result;
+          if (
+            !check(
+              updatePreview.status === 200 &&
+                update?.binding?.operation === "update" &&
+                update.binding.groupId === newGroupId &&
+                update.binding.expectedTitle === "smoke-created" &&
+                update.binding.expectedColor === "orange",
+              `the update preview does not bind the group's current state: ${updatePreview.status} ${JSON.stringify(updatePreview.json)}`,
+            )
+          ) {
+            return;
+          }
+          if (!check((await realGroup(newGroupId)).title === "smoke-created", "an update preview renamed the group")) return;
+          const updateApproval = await decide("approve", update.id);
+          const updateDone = updateApproval.json?.result;
+          const realUpdated = await realGroup(newGroupId);
+          if (
+            !check(
+              updateApproval.status === 200 &&
+                updateDone?.state === "executed" &&
+                updateDone.result?.mutation === "updated" &&
+                realUpdated.title === "smoke-renamed" &&
+                realUpdated.color === "purple" &&
+                updateDone.result.observed?.title === "smoke-renamed" &&
+                updateDone.result.observed?.color === "purple",
+              `the approved update did not rename/recolor the real group as recorded: ${JSON.stringify({ updateDone, realUpdated })}`,
+            )
+          ) {
+            return;
+          }
+          if (!check(JSON.stringify(await realGroupTabIds(newGroupId)) === JSON.stringify([tabA.id]), "an update changed the group's membership")) return;
+
+          // --- Clear the title with an explicit empty string. ---
+          const clearPreview = await preview({ operation: "update", groupId: newGroupId, title: "" });
+          const clearApproval = await decide("approve", clearPreview.json?.result?.id);
+          const realCleared = await realGroup(newGroupId);
+          if (
+            !check(
+              clearPreview.status === 200 && clearApproval.json?.result?.state === "executed" && realCleared.title === "" && realCleared.color === "purple",
+              `clearing the title did not leave the real group untitled and recolor-free: ${JSON.stringify({ clearPreview: clearPreview.json, clearApproval: clearApproval.json, realCleared })}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- Reject: nothing is ever changed. ---
+          const rejectPreview = await preview({ operation: "create", tabId: tabC.id, title: "smoke-rejected" });
+          const rejectId = rejectPreview.json?.result?.id;
+          const rejected = await decide("reject", rejectId);
+          const lateApprove = await decide("approve", rejectId);
+          await delay(300);
+          if (
+            !check(
+              rejected.json?.result?.state === "rejected" &&
+                rejected.json.result.result === null &&
+                lateApprove.status === 409 &&
+                (await realTabGroupId(tabC.id)) === NO_GROUP,
+              `a rejected preview was approvable or grouped a tab: ${JSON.stringify({ rejected: rejected.json, lateApprove: lateApprove.json })}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- Mismatch: the group is recolored by someone else after the preview. ---
+          const staleUpdatePreview = await preview({ operation: "update", groupId: newGroupId, color: "red" });
+          await evaluate(swCdp, `chrome.tabGroups.update(${JSON.stringify(newGroupId)}, { color: "green" })`);
+          const staleUpdate = await decide("approve", staleUpdatePreview.json?.result?.id);
+          if (
+            !check(
+              staleUpdatePreview.status === 200 &&
+                staleUpdate.json?.result?.state === "stale" &&
+                staleUpdate.json.result.result?.code === "state_mismatch" &&
+                staleUpdate.json.result.result?.mutation === "none" &&
+                (await realGroup(newGroupId)).color === "green",
+              `a group recolored after the preview was not refused as a state mismatch without change: ${JSON.stringify(staleUpdate.json)}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- Mismatch: the tab is grouped by someone else after the preview. ---
+          const staleCreatePreview = await preview({ operation: "create", tabId: tabB.id, title: "smoke-mismatch" });
+          const foreignGroupId = await evaluate(swCdp, `chrome.tabs.group({ tabIds: [${JSON.stringify(tabB.id)}] })`);
+          const staleCreate = await decide("approve", staleCreatePreview.json?.result?.id);
+          const foreignGroup = await realGroup(foreignGroupId);
+          if (
+            !check(
+              staleCreatePreview.status === 200 &&
+                staleCreate.json?.result?.state === "stale" &&
+                staleCreate.json.result.result?.code === "state_mismatch" &&
+                staleCreate.json.result.result?.mutation === "none" &&
+                (await realTabGroupId(tabB.id)) === foreignGroupId &&
+                foreignGroup.title !== "smoke-mismatch" &&
+                JSON.stringify(await realGroupTabIds(foreignGroupId)) === JSON.stringify([tabB.id]),
+              `a tab grouped after the preview was not refused as a state mismatch without change: ${JSON.stringify({ staleCreate: staleCreate.json, foreignGroup })}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- A tab in a non-current second window stays in that window. ---
+          const secondWindow = await evaluate(
+            swCdp,
+            `chrome.windows
+              .create({ url: ${JSON.stringify(GROUP_FIXTURE("window2"))}, focused: false })
+              .then((w) => ({ id: w.id, tabId: w.tabs[0].id }))`,
+          );
+          try {
+            // Make the original window the browser's current one again, so a
+            // group created without naming the tab's window would land there.
+            await evaluate(swCdp, `chrome.windows.update(${JSON.stringify(targetWindowId)}, { focused: true })`);
+            await delay(500);
+            const windowPreview = await preview({ operation: "create", tabId: secondWindow.tabId, title: "smoke-window2" });
+            const windowAction = windowPreview.json?.result;
+            if (!check(windowPreview.status === 200 && windowAction?.binding?.windowId === secondWindow.id, `the preview did not bind the tab's own window: ${JSON.stringify(windowPreview.json)}`)) return;
+            const windowDone = await decide("approve", windowAction.id);
+            const windowTab = await evaluate(swCdp, `chrome.tabs.get(${JSON.stringify(secondWindow.tabId)}).then((t) => ({ windowId: t.windowId, groupId: t.groupId }))`);
+            const windowGroup = windowTab.groupId === NO_GROUP ? null : await realGroup(windowTab.groupId);
+            if (
+              !check(
+                windowDone.json?.result?.state === "executed" &&
+                  windowTab.windowId === secondWindow.id &&
+                  windowGroup?.windowId === secondWindow.id &&
+                  windowDone.json.result.result?.windowId === secondWindow.id,
+                `grouping a tab in a second window moved it or its group: ${JSON.stringify({ windowDone: windowDone.json, windowTab, windowGroup })}`,
+              )
+            ) {
+              return;
+            }
+          } finally {
+            await evaluate(swCdp, `chrome.windows.remove(${JSON.stringify(secondWindow.id)})`).catch(() => {});
+          }
+
+          // --- A pinned tab is refused at preview and stays pinned and ungrouped. ---
+          const pinnedTabId = await evaluate(swCdp, `chrome.tabs.create({ url: ${JSON.stringify(GROUP_FIXTURE("pinned"))}, pinned: true, active: false }).then((t) => t.id)`);
+          try {
+            const pinnedPreview = await preview({ operation: "create", tabId: pinnedTabId, title: "smoke-pinned" });
+            const pinnedReal = await evaluate(swCdp, `chrome.tabs.get(${JSON.stringify(pinnedTabId)}).then((t) => ({ pinned: t.pinned, groupId: t.groupId }))`);
+            if (
+              !check(
+                pinnedPreview.status === 409 && pinnedPreview.json?.error?.code === "conflict" && pinnedReal.pinned === true && pinnedReal.groupId === NO_GROUP,
+                `a pinned tab was not refused at preview, or was changed: ${JSON.stringify({ pinnedPreview: pinnedPreview.json, pinnedReal })}`,
+              )
+            ) {
+              return;
+            }
+          } finally {
+            await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(pinnedTabId)})`).catch(() => {});
+          }
+
+          // --- Refused up front, nothing stored. ---
+          const storedBefore = (await serviceRequest(port, "/api/store.actions.list?limit=1", { token })).json?.result?.total;
+          for (const [name, body, expectedStatus, expectedCode] of [
+            ["an already-grouped tab", { operation: "create", tabId: tabA.id }, 409, "conflict"],
+            ["an update that changes nothing", { operation: "update", groupId: newGroupId, color: "green" }, 400, "validation_error"],
+            ["a group that does not exist", { operation: "update", groupId: 999_999, title: "x" }, 409, "stale_handle"],
+            ["a tab that does not exist", { operation: "create", tabId: 999_999 }, 409, "stale_handle"],
+            ["a caller-supplied session", { operation: "create", tabId: tabD.id, browserSessionId: sessionId }, 400, "validation_error"],
+          ]) {
+            const refused = await preview(body);
+            if (!check(refused.status === expectedStatus && refused.json?.error?.code === expectedCode, `a preview for ${name} was not refused with ${expectedStatus} ${expectedCode}: ${refused.status} ${JSON.stringify(refused.json)}`)) return;
+          }
+          const storedAfter = (await serviceRequest(port, "/api/store.actions.list?limit=1", { token })).json?.result?.total;
+          if (!check(storedBefore === storedAfter, "a refused preview was stored")) return;
+
+          // --- Audit: append-only record, no title, URL, or handle. ---
+          const auditResponse = await serviceRequest(port, "/api/store.actions.audit.list?limit=200", { token });
+          const auditItems = auditResponse.json?.result?.items ?? [];
+          const eventsFor = (id) => auditItems.filter((e) => e.actionId === id).map((e) => e.event);
+          if (!check(JSON.stringify(eventsFor(created.id)) === JSON.stringify(["result", "approve", "preview"]), `the created action's audit events are wrong: ${JSON.stringify(eventsFor(created.id))}`)) return;
+          if (!check(JSON.stringify(eventsFor(rejectId)) === JSON.stringify(["reject", "preview"]), `the rejected action's audit events are wrong: ${JSON.stringify(eventsFor(rejectId))}`)) return;
+          const auditText = JSON.stringify(auditResponse.json);
+          if (!check(!/smoke-|smoke-group|127\.0\.0\.1/.test(auditText), "the audit log contains a title or URL")) return;
+
+          // Left pending on purpose: approved after the browser restart below.
+          const pendingPreview = await preview({ operation: "create", tabId: tabD.id, title: "smoke-stale-group" });
+          if (!check(pendingPreview.status === 200 && pendingPreview.json?.result?.browserSessionId === sessionId, `could not preview the stale-session group action: ${JSON.stringify(pendingPreview.json)}`)) return;
+          staleGroupActionId = pendingPreview.json.result.id;
+
+          console.log("Phase 2 Action 2 proof passed: previews changed nothing; Apply created/renamed/recolored/cleared exactly the previewed group; Reject changed nothing; a changed tab/group was refused as stale; invalid previews refused; audit recorded.");
+        } finally {
+          for (const tab of [tabA, tabB, tabC]) await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(tab.id)})`).catch(() => {});
+        }
+      }
+    }
+
     // Detach from the service worker's own CDP target *before* the idle
     // wait, and do not reattach until a later step genuinely needs it
     // (Step 5's browser restart). A live DevTools Protocol session to a
@@ -1715,6 +2023,29 @@ async function main() {
     if (staleTabCount !== 0) {
       fail(`[Phase 2 open_tab] a stale approval opened ${staleTabCount} tab(s)`);
       return;
+    }
+
+    // Phase 2 Action 2, stale approval: the group preview left pending in
+    // Step 2.9 is bound to the pre-restart browser session, so the extension
+    // must refuse it as stale before reading or changing anything — and the
+    // real browser must have no group for it.
+    if (staleGroupActionId !== null) {
+      const staleGroupApproval = await serviceRequest(port, `/api/action.configure_group.approve?id=${staleGroupActionId}`, { method: "POST", token });
+      const staleGroupOutcome = staleGroupApproval.json?.result;
+      if (
+        staleGroupApproval.status !== 200 ||
+        staleGroupOutcome?.state !== "stale" ||
+        staleGroupOutcome.result?.mutation !== "none" ||
+        staleGroupOutcome.result?.code !== "stale_session"
+      ) {
+        fail(`[Phase 2 configure_group] approving a pre-restart preview was not refused as stale: ${staleGroupApproval.status} ${JSON.stringify(staleGroupApproval.json)}`);
+        return;
+      }
+      const leakedGroups = await evaluate(swCdp, `chrome.tabGroups.query({ title: "smoke-stale-group" }).then((groups) => groups.length)`);
+      if (leakedGroups !== 0) {
+        fail(`[Phase 2 configure_group] a stale approval created ${leakedGroups} group(s)`);
+        return;
+      }
     }
 
     // Step 6: confirm real Origin behavior from an actual (non-extension)
