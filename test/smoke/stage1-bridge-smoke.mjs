@@ -2075,6 +2075,315 @@ async function main() {
       }
     }
 
+    // Step 2.11: Phase 2 Action 4 ("archive a tab": save a capture, then close
+    // exactly that tab), against the real browser's own tabs
+    // (chrome.tabs from the service worker) and the service's own capture
+    // table, never only against what the action record says:
+    //   - a preview saves no capture and closes nothing;
+    //   - Apply saves exactly one capture of exactly that tab and then closes
+    //     exactly that tab (and no other); a protected page is archived as its
+    //     own non-ok capture with no page text;
+    //   - Reject neither saves nor closes; repeats are refused;
+    //   - a tab navigated away after the preview is refused as stale *before*
+    //     any capture is saved, and stays open;
+    //   - a protected page (whose read has no address) pinned after the preview
+    //     is refused by the final pre-capture check: no capture, tab open;
+    //   - a tab that changes between the capture and the close (the worker's
+    //     third tab read, the close's own, is wrapped once to pin the tab first)
+    //     keeps the capture and stays open (partial, mutation none);
+    //   - a tabs.remove that rejects after the tab really closed (the worker's
+    //     call is wrapped once) is failed/unknown with the capture id;
+    //   - the agent credential cannot reach any of it, the extension-level
+    //     methods have no HTTP route, and the audit log holds no title/URL;
+    //   - one archive preview is left pending here and approved only *after*
+    //     the browser restart (Step 5), where it must be refused as stale with
+    //     no capture saved.
+    console.log("exercising Phase 2 Action 4 (archive tab: preview, capture-then-close, reject, stale/changed/unknown, audit)...");
+    let staleArchiveActionId = null;
+    let staleArchiveCaptureTotal = null;
+    {
+      const ARCHIVE_FIXTURE = (name) => `${fixtureUrl}?smoke-archive=${name}`;
+      const post = (path, body) => serviceRequest(port, path, { method: "POST", token, body });
+      const decide = (operation, id) => post(`/api/action.archive_tab.${operation}?id=${id}`);
+      const preview = (tabId) => post("/api/action.archive_tab.preview", { tabId });
+      const captureTotal = async () => (await serviceRequest(port, "/api/store.captures.list?limit=1", { token })).json?.result?.total;
+      const realTab = (tabId) =>
+        evaluate(swCdp, `chrome.tabs.query({}).then((tabs) => { const t = tabs.find((x) => x.id === ${JSON.stringify(tabId)}); return t ? { windowId: t.windowId, url: t.url, groupId: t.groupId, pinned: t.pinned } : null; })`);
+      const check = (condition, message) => {
+        if (!condition) fail(`[Phase 2 archive_tab] ${message}`);
+        return Boolean(condition);
+      };
+      // Wraps one worker-side browser call exactly once: the wrapper puts the
+      // original back before doing anything, so no other call is affected.
+      const wrapOnce = async (path, afterSource) => {
+        const installed = await evaluate(
+          swCdp,
+          `(() => {
+            const [object, name] = ${JSON.stringify(path)};
+            const target = chrome[object];
+            const original = target[name].bind(target);
+            const wrapper = async (...args) => {
+              target[name] = original;
+              ${afterSource}
+            };
+            target[name] = wrapper;
+            return target[name] === wrapper;
+          })()`,
+        );
+        return installed === true;
+      };
+
+      for (const [path, body, expectedStatus] of [
+        ["/api/action.archive_tab.preview", { tabId: 1 }, 403],
+        ["/api/action.archive_tab.approve?id=1", undefined, 403],
+        ["/api/action.archive_tab.reject?id=1", undefined, 403],
+        ["/api/browser.close_tab", { tabId: 1, windowId: 1, url: fixtureUrl, groupId: -1, pinned: false, browserSessionId: sessionId }, 404],
+        ["/api/browser.inspect_archive_target?tabId=1", undefined, 404],
+      ]) {
+        const attempt = await serviceRequest(port, path, { method: "POST", token: agentToken, body });
+        if (!check(attempt.status === expectedStatus, `agent credential POST ${path} expected HTTP ${expectedStatus}, got ${attempt.status} ${JSON.stringify(attempt.json)}`)) return;
+      }
+
+      const a1 = await createAndWaitForTab(swCdp, ARCHIVE_FIXTURE("approve"));
+      const a2 = await createAndWaitForTab(swCdp, ARCHIVE_FIXTURE("reject"));
+      const a3 = await createAndWaitForTab(swCdp, ARCHIVE_FIXTURE("moved"));
+      const a4 = await createAndWaitForTab(swCdp, ARCHIVE_FIXTURE("changes-after-capture"));
+      const a5 = await createAndWaitForTab(swCdp, ARCHIVE_FIXTURE("remove-rejects"));
+      const a6 = await createAndWaitForTab(swCdp, ARCHIVE_FIXTURE("stale"));
+      const protectedArchiveTab = await createAndWaitForTab(swCdp, PROTECTED_URL);
+      const toCleanUp = [a1, a2, a3, a4, a5, a6, protectedArchiveTab].map((tab) => tab.id);
+      try {
+        // --- Approve: one capture of exactly that tab, then that tab is closed. ---
+        const capturesBefore = await captureTotal();
+        const approvePreview = await preview(a1.id);
+        const approvable = approvePreview.json?.result;
+        const a1Real = await realTab(a1.id);
+        if (
+          !check(
+            approvePreview.status === 200 &&
+              approvable?.state === "previewed" &&
+              approvable.browserSessionId === sessionId &&
+              approvable.binding?.tabId === a1.id &&
+              approvable.binding.windowId === a1Real.windowId &&
+              approvable.binding.url === a1Real.url &&
+              approvable.binding.groupId === -1 &&
+              approvable.binding.pinned === false,
+            `the preview does not bind the exact tab, its window, address, group, pinned state, and the current session: ${approvePreview.status} ${JSON.stringify(approvePreview.json)}`,
+          )
+        ) {
+          return;
+        }
+        if (!check((await captureTotal()) === capturesBefore && (await realTab(a1.id)) !== null, "a preview saved a capture or closed the tab")) return;
+
+        const approval = await decide("approve", approvable.id);
+        const done = approval.json?.result;
+        if (
+          !check(
+            approval.status === 200 &&
+              done?.state === "executed" &&
+              done.result?.mutation === "closed" &&
+              Number.isInteger(done.result?.captureId) &&
+              done.result.tabId === a1.id,
+            `the approved archive was not recorded as executed with a capture and a closed tab: ${approval.status} ${JSON.stringify(approval.json)}`,
+          )
+        ) {
+          return;
+        }
+        const savedCapture = (await serviceRequest(port, `/api/store.captures.list?id=${done.result.captureId}`, { token })).json?.result?.items?.[0];
+        if (
+          !check(
+            (await captureTotal()) === capturesBefore + 1 &&
+              savedCapture?.tabId === a1.id &&
+              savedCapture.status === "ok" &&
+              savedCapture.url === a1Real.url,
+            `approval did not save exactly one capture of exactly that tab: ${JSON.stringify({ savedCapture, total: await captureTotal(), capturesBefore })}`,
+          )
+        ) {
+          return;
+        }
+        if (!check((await realTab(a1.id)) === null && (await realTab(a2.id)) !== null && (await realTab(a3.id)) !== null, "approval did not close exactly the previewed tab")) return;
+        for (const operation of ["approve", "reject"]) {
+          const again = await decide(operation, approvable.id);
+          if (!check(again.status === 409, `a repeated ${operation} of a decided archive was not refused: ${again.status} ${JSON.stringify(again.json)}`)) return;
+        }
+        if (!check((await captureTotal()) === capturesBefore + 1, "a repeated decision saved another capture")) return;
+
+        // --- Reject: neither saved nor closed. ---
+        const rejectPreview = await preview(a2.id);
+        const rejectId = rejectPreview.json?.result?.id;
+        const rejected = await decide("reject", rejectId);
+        const lateApprove = await decide("approve", rejectId);
+        if (
+          !check(
+            rejected.json?.result?.state === "rejected" &&
+              rejected.json.result.result === null &&
+              lateApprove.status === 409 &&
+              (await captureTotal()) === capturesBefore + 1 &&
+              (await realTab(a2.id)) !== null,
+            `a rejected archive was approvable, saved a capture, or closed the tab: ${JSON.stringify({ rejected: rejected.json, lateApprove: lateApprove.json })}`,
+          )
+        ) {
+          return;
+        }
+
+        // --- A protected page is archived as exactly that outcome (no page text), then closed. ---
+        const protectedPreview = await preview(protectedArchiveTab.id);
+        const protectedApproval = await decide("approve", protectedPreview.json?.result?.id);
+        const protectedCapture = (await serviceRequest(port, `/api/store.captures.list?id=${protectedApproval.json?.result?.result?.captureId}`, { token })).json?.result?.items?.[0];
+        if (
+          !check(
+            protectedPreview.status === 200 &&
+              protectedApproval.json?.result?.state === "executed" &&
+              protectedCapture?.status === "unsupported" &&
+              protectedCapture.textLength === null &&
+              (await realTab(protectedArchiveTab.id)) === null,
+            `a protected page was not archived as a non-ok capture and closed: ${JSON.stringify({ protectedPreview: protectedPreview.json, protectedApproval: protectedApproval.json, protectedCapture })}`,
+          )
+        ) {
+          return;
+        }
+        const capturesAfterProtected = await captureTotal();
+
+        // --- A tab navigated away after the preview: stale, before any capture. ---
+        const movedPreview = await preview(a3.id);
+        const movedUrl = ARCHIVE_FIXTURE("moved-elsewhere");
+        await evaluate(swCdp, `chrome.tabs.update(${JSON.stringify(a3.id)}, { url: ${JSON.stringify(movedUrl)} })`);
+        for (let waited = 0; waited < 8000; waited += 100) {
+          const current = await evaluate(swCdp, `chrome.tabs.get(${JSON.stringify(a3.id)}).then((t) => ({ url: t.url, status: t.status }))`);
+          if (current.url === movedUrl && current.status === "complete") break;
+          await delay(100);
+        }
+        const movedApproval = await decide("approve", movedPreview.json?.result?.id);
+        if (
+          !check(
+            movedPreview.status === 200 &&
+              movedApproval.json?.result?.state === "stale" &&
+              movedApproval.json.result.result?.code === "state_mismatch" &&
+              movedApproval.json.result.result?.mutation === "none" &&
+              movedApproval.json.result.result?.captureId === null &&
+              (await captureTotal()) === capturesAfterProtected &&
+              (await realTab(a3.id)) !== null,
+            `a tab navigated after the preview was not refused as stale before any capture: ${JSON.stringify(movedApproval.json)}`,
+          )
+        ) {
+          return;
+        }
+
+        // --- A protected page (whose read carries no address) pinned after the preview:
+        //     the final check catches it, so no capture is saved and the tab stays open. ---
+        const protectedChangedTab = await createAndWaitForTab(swCdp, PROTECTED_URL);
+        toCleanUp.push(protectedChangedTab.id);
+        const protectedChangedPreview = await preview(protectedChangedTab.id);
+        await evaluate(swCdp, `chrome.tabs.update(${JSON.stringify(protectedChangedTab.id)}, { pinned: true })`);
+        const protectedChangedApproval = await decide("approve", protectedChangedPreview.json?.result?.id);
+        if (
+          !check(
+            protectedChangedPreview.status === 200 &&
+              protectedChangedApproval.json?.result?.state === "stale" &&
+              protectedChangedApproval.json.result.result?.code === "state_mismatch" &&
+              protectedChangedApproval.json.result.result?.mutation === "none" &&
+              protectedChangedApproval.json.result.result?.captureId === null &&
+              (await captureTotal()) === capturesAfterProtected &&
+              (await realTab(protectedChangedTab.id)) !== null,
+            `a protected tab pinned after the preview was not refused before any capture: ${JSON.stringify(protectedChangedApproval.json)}`,
+          )
+        ) {
+          return;
+        }
+
+        // --- A tab that changes between the capture and the close: capture kept, tab left open. ---
+        const changesPreview = await preview(a4.id);
+        // An approval reads the tab three times in the worker: the capture's read, the
+        // final check before the capture is saved, and the close's own re-check. The
+        // third read is wrapped (once) to pin the tab first, so the change lands after
+        // the capture was saved and only the close can notice it.
+        const hooked = await evaluate(
+          swCdp,
+          `(() => {
+            const target = chrome.tabs;
+            const original = target.get.bind(target);
+            let calls = 0;
+            const wrapper = async (...args) => {
+              calls += 1;
+              if (calls === 3) {
+                target.get = original;
+                await chrome.tabs.update(${JSON.stringify(a4.id)}, { pinned: true });
+              }
+              return original(...args);
+            };
+            target.get = wrapper;
+            return target.get === wrapper;
+          })()`,
+        );
+        if (!check(hooked === true, "could not wrap the worker's tabs.get for the between-capture-and-close check")) return;
+        const changesApproval = await decide("approve", changesPreview.json?.result?.id);
+        const a4Real = await realTab(a4.id);
+        if (
+          !check(
+            changesPreview.status === 200 &&
+              changesApproval.json?.result?.state === "partial" &&
+              changesApproval.json.result.result?.mutation === "none" &&
+              changesApproval.json.result.result?.code === "state_mismatch" &&
+              Number.isInteger(changesApproval.json.result.result?.captureId) &&
+              (await captureTotal()) === capturesAfterProtected + 1 &&
+              a4Real?.pinned === true,
+            `a tab that changed between the capture and the close did not keep the capture and stay open: ${JSON.stringify({ changesApproval: changesApproval.json, a4Real })}`,
+          )
+        ) {
+          return;
+        }
+
+        // --- tabs.remove rejecting after the tab really closed: failed, mutation unknown, capture id. ---
+        const rejectsPreview = await preview(a5.id);
+        const wrappedRemove = await wrapOnce(
+          ["tabs", "remove"],
+          `await original(...args); throw new Error("smoke: rejected after closing");`,
+        );
+        if (!check(wrappedRemove, "could not wrap the worker's tabs.remove for the unknown-effect check")) return;
+        const rejectsApproval = await decide("approve", rejectsPreview.json?.result?.id);
+        if (
+          !check(
+            rejectsPreview.status === 200 &&
+              rejectsApproval.json?.result?.state === "failed" &&
+              rejectsApproval.json.result.result?.mutation === "unknown" &&
+              rejectsApproval.json.result.result?.code === "close_failed" &&
+              Number.isInteger(rejectsApproval.json.result.result?.captureId) &&
+              (await captureTotal()) === capturesAfterProtected + 2 &&
+              (await realTab(a5.id)) === null,
+            `a tabs.remove that rejected after closing the tab was not recorded as failed/unknown with the capture id: ${JSON.stringify(rejectsApproval.json)}`,
+          )
+        ) {
+          return;
+        }
+
+        // --- Audit: append-only record, no title, URL, handle, or capture id. ---
+        // The refusal matrix above intentionally makes a short burst of owner API
+        // calls. Let the one-second service rate-limit window roll before these
+        // final proof reads rather than mistaking a deliberate 429 for no events.
+        await delay(1100);
+        // Query each action directly: earlier phases plus the archive refusal cases
+        // can exceed one unfiltered audit page, which must not make this proof depend
+        // on the action's relative position in that page.
+        const approvedAudit = await serviceRequest(port, `/api/store.actions.audit.list?actionId=${approvable.id}`, { token });
+        const rejectedAudit = await serviceRequest(port, `/api/store.actions.audit.list?actionId=${rejectId}`, { token });
+        const events = (response) => (response.json?.result?.items ?? []).map((entry) => entry.event);
+        if (!check(JSON.stringify(events(approvedAudit)) === JSON.stringify(["result", "approve", "preview"]), `the archived action's audit events are wrong: ${JSON.stringify(events(approvedAudit))}`)) return;
+        if (!check(JSON.stringify(events(rejectedAudit)) === JSON.stringify(["reject", "preview"]), `the rejected archive's audit events are wrong: ${JSON.stringify(events(rejectedAudit))}`)) return;
+        if (!check(!/smoke-archive|127\.0\.0\.1|smoke: rejected/.test(JSON.stringify([approvedAudit.json, rejectedAudit.json])), "the audit log contains a title, URL, or error text")) return;
+
+        // Left pending on purpose: approved after the browser restart below.
+        const pendingPreview = await preview(a6.id);
+        if (!check(pendingPreview.status === 200 && pendingPreview.json?.result?.browserSessionId === sessionId, `could not preview the stale-session archive: ${JSON.stringify(pendingPreview.json)}`)) return;
+        staleArchiveActionId = pendingPreview.json.result.id;
+        staleArchiveCaptureTotal = await captureTotal();
+
+        console.log("Phase 2 Action 4 proof passed: previews saved and closed nothing; Archive saved exactly one capture then closed exactly that tab; Reject did neither; a navigated tab was refused before any capture; a tab changed after the capture was kept open; an unknown remove was recorded as unknown; audit recorded.");
+      } finally {
+        // Best-effort: tabs the proof already closed simply fail to be removed again.
+        for (const tabId of toCleanUp) await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(tabId)})`).catch(() => {});
+      }
+    }
+
     // Detach from the service worker's own CDP target *before* the idle
     // wait, and do not reattach until a later step genuinely needs it
     // (Step 5's browser restart). A live DevTools Protocol session to a
@@ -2295,6 +2604,30 @@ async function main() {
     // Step 2.9 is bound to the pre-restart browser session, so the extension
     // must refuse it as stale before reading or changing anything — and the
     // real browser must have no group for it.
+    // Phase 2 Action 4, stale approval: the archive preview left pending in Step
+    // 2.11 is bound to the pre-restart browser session, so the fresh read of
+    // the tab is refused as stale *before* any capture is saved, and nothing is
+    // closed.
+    if (staleArchiveActionId !== null) {
+      const staleArchiveApproval = await serviceRequest(port, `/api/action.archive_tab.approve?id=${staleArchiveActionId}`, { method: "POST", token });
+      const staleArchiveOutcome = staleArchiveApproval.json?.result;
+      if (
+        staleArchiveApproval.status !== 200 ||
+        staleArchiveOutcome?.state !== "stale" ||
+        staleArchiveOutcome.result?.mutation !== "none" ||
+        staleArchiveOutcome.result?.code !== "stale_session" ||
+        staleArchiveOutcome.result?.captureId !== null
+      ) {
+        fail(`[Phase 2 archive_tab] approving a pre-restart preview was not refused as stale before any capture: ${staleArchiveApproval.status} ${JSON.stringify(staleArchiveApproval.json)}`);
+        return;
+      }
+      const capturesAfterStale = (await serviceRequest(port, "/api/store.captures.list?limit=1", { token })).json?.result?.total;
+      if (capturesAfterStale !== staleArchiveCaptureTotal) {
+        fail(`[Phase 2 archive_tab] a stale approval saved a capture (${staleArchiveCaptureTotal} -> ${capturesAfterStale})`);
+        return;
+      }
+    }
+
     // Phase 2 Action 3, stale approval: the move preview left pending in Step
     // 2.10 is bound to the pre-restart browser session, so the extension must
     // refuse it as stale before reading or changing anything.

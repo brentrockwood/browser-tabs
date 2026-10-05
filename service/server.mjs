@@ -6,6 +6,7 @@ import {
   ERROR_CODES,
   HEARTBEAT_GRACE_MS,
   HEARTBEAT_INTERVAL_MS,
+  MAX_ARCHIVE_URL_LENGTH,
   MAX_RESPONSE_BYTES,
   MAX_WS_MESSAGE_BYTES,
   PROTOCOL_VERSION,
@@ -26,6 +27,7 @@ import {
   MAX_OBSERVED_URL_LENGTH,
   MAX_REQUEST_BODY_BYTES,
   clipText,
+  validateArchivePreviewRequest,
   validateGroupPreviewRequest,
   validateMovePreviewRequest,
 } from "./validation.mjs";
@@ -143,6 +145,11 @@ const ACTION_ROUTES = new Map([
   ["action.move_tabs.preview", { kind: "move_tabs", operation: "preview" }],
   ["action.move_tabs.approve", { kind: "move_tabs", operation: "approve" }],
   ["action.move_tabs.reject", { kind: "move_tabs", operation: "reject" }],
+  // Phase 2 Action 4: archive one tab — save a capture of it, then close exactly
+  // that tab — with the same three owner-only routes.
+  ["action.archive_tab.preview", { kind: "archive_tab", operation: "preview" }],
+  ["action.archive_tab.approve", { kind: "archive_tab", operation: "approve" }],
+  ["action.archive_tab.reject", { kind: "archive_tab", operation: "reject" }],
 ]);
 // A preview body is one short URL (see MAX_OPEN_URL_LENGTH) or a handle and a
 // short title; anything near the store routes' 8 MiB request bound is refused
@@ -1233,6 +1240,223 @@ export function createService({
     };
   }
 
+  // Phase 2 Action 4, step one: records an archive preview and changes nothing —
+  // no capture is saved and nothing is closed. The body is exactly `{ "tabId":
+  // <id> }`; the session and every piece of current state come from the
+  // browser. The extension is asked (read-only) about that one tab: the answer's
+  // envelope supplies the session the preview is bound to, and the tab's window,
+  // address, group, and pinned state are what the preview binds and the
+  // extension re-checks immediately before closing it (with the title kept, as
+  // clipped text, only so the preview can be recognized). A tab with no address
+  // yet, or one too long to bind exactly, is refused up front: the close is
+  // bound to the exact address, so an address that cannot be stored whole (or
+  // does not exist) cannot protect against closing a changed or reused target.
+  async function previewArchiveTab(req) {
+    const request = validateArchivePreviewRequest(parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES)));
+    const inspected = await sendExtensionRequest("browser.inspect_archive_target", { tabId: request.tabId });
+    let validation;
+    try {
+      validation = validateMethodResult("browser.inspect_archive_target", inspected);
+    } catch (error) {
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!validation.valid) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
+    if (inspected.status === "unsupported") throw codedError(ERROR_CODES.UNSUPPORTED_FEATURE, "this browser cannot close tabs; nothing was changed");
+    if (inspected.status !== "ok") {
+      if (inspected.code === ERROR_CODES.STALE_HANDLE) throw codedError(ERROR_CODES.STALE_HANDLE, "the tab no longer exists");
+      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tab");
+    }
+    const { tab } = inspected;
+    if (tab.tabId !== request.tabId) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported a different tab than the one requested");
+    if (typeof tab.url !== "string" || tab.url.length === 0) {
+      throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tab has no address yet, so a close cannot be bound to it; try again once it has loaded");
+    }
+    if (tab.url.length > MAX_ARCHIVE_URL_LENGTH) {
+      throw new StoreError(STORE_ERROR_CODES.CONFLICT, `the tab's address is longer than ${MAX_ARCHIVE_URL_LENGTH} characters, so it cannot be bound exactly`);
+    }
+    return store.createAction({
+      kind: "archive_tab",
+      browserSessionId: inspected.browserSessionId,
+      binding: {
+        tabId: tab.tabId,
+        windowId: tab.windowId,
+        url: tab.url,
+        groupId: tab.groupId,
+        pinned: tab.pinned,
+        title: clipText(tab.title, MAX_OBSERVED_TITLE_LENGTH),
+      },
+    });
+  }
+
+  // Phase 2 Action 4: carries out one approved archive — two steps, in this
+  // order, with the outcome saying exactly how far it got. Never throws.
+  //
+  // 1. A fresh `browser.read_tab` (never a stale preview-time one) must come
+  //    back for the bound session, tab, and window — and, for a readable page,
+  //    the bound address. A non-"ok" read (a protected page, a tab still
+  //    loading, an error with the tab's handles) is a valid capture of exactly
+  //    that outcome and is saved like any other, with no invented content.
+  //    Anything that is not that — a stale session or handle, a moved window or
+  //    changed address, an unusable answer, a failure to save — ends the action
+  //    here with nothing saved and nothing closed (`stale` or `failed`, mutation
+  //    "none", no capture).
+  //    Before saving, a fresh `browser.inspect_archive_target` must show the
+  //    tab still exactly as previewed (session, tab, window, address, group,
+  //    pinned) — for a non-"ok" read, which has no address, this is the only
+  //    check of that state before the capture.
+  // 2. Only after that capture is durably saved, one `browser.close_tab`, built
+  //    from the stored binding. It is never sent without a saved capture, and a
+  //    capture saved is never discarded: if the extension then refuses (the tab
+  //    changed since the preview) or the request was never sent, the capture
+  //    is kept and the tab deliberately stays open (`partial`, mutation "none");
+  //    if the close's effect is unknown (`changed: null`, or the reply was lost
+  //    or unusable) the action is `failed` with mutation "unknown" and the
+  //    capture id; and only a resolved close is `executed` with mutation
+  //    "closed".
+  async function executeArchiveTab(action) {
+    const bound = action.binding;
+    const outcome = (state, mutation, code, detail, extra = {}) => ({
+      state,
+      mutation,
+      code,
+      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
+      captureId: null,
+      tabId: null,
+      windowId: null,
+      observed: null,
+      ...extra,
+    });
+    const validate = (method, answer) => {
+      try {
+        return validateMethodResult(method, answer);
+      } catch (error) {
+        return { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    };
+    const sendCode = (error) => (Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR);
+
+    // --- Step 1: a fresh read, then the capture. ---
+    let read;
+    try {
+      read = await sendExtensionRequest("browser.read_tab", { tabId: bound.tabId, browserSessionId: action.browserSessionId });
+    } catch (error) {
+      return outcome(
+        "failed",
+        "none",
+        sendCode(error),
+        error?.requestSent === false
+          ? "the request was never sent to the extension; nothing was saved and the tab was not closed"
+          : "no answer arrived to the read of the tab; nothing was saved and the tab was not closed",
+      );
+    }
+    const readValidation = validate("browser.read_tab", read);
+    if (!readValidation.valid) return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, readValidation.reason);
+    const readDetail = typeof read.detail === "string" ? read.detail : "nothing was saved and the tab was not closed";
+    if (read.status === "error" && (read.code === ERROR_CODES.STALE_SESSION || read.code === ERROR_CODES.STALE_HANDLE)) {
+      return outcome("stale", "none", clipText(read.code, MAX_CODE_LENGTH), readDetail);
+    }
+    if (read.browserSessionId !== action.browserSessionId) {
+      return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer is for a different session; nothing was saved");
+    }
+    if (read.tabId !== bound.tabId) {
+      // An error that names no tab (e.g. invalid parameters) is just a failed
+      // read; any other answer for another tab is unusable.
+      return read.status === "error"
+        ? outcome("failed", "none", clipText(read.code, MAX_CODE_LENGTH), readDetail)
+        : outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer is for a different tab; nothing was saved");
+    }
+    if (read.windowId !== bound.windowId) {
+      return outcome("stale", "none", ERROR_CODES.STATE_MISMATCH, "the tab is no longer in the previewed window; nothing was saved and the tab was not closed");
+    }
+    if (read.status === "ok" && read.url !== bound.url) {
+      return outcome("stale", "none", ERROR_CODES.STATE_MISMATCH, "the tab's address changed since the preview; nothing was saved and the tab was not closed");
+    }
+
+    // The last check before anything is saved: a fresh, read-only look at the
+    // tab, compared EXACTLY with everything the preview bound — session, tab,
+    // window, address, group, and pinned state. A non-"ok" read carries no
+    // address (and none of this state beyond its handles), so this inspection —
+    // not the read — is what protects those captures from being saved for a tab
+    // that changed since the preview. Any stale, mismatched, unsupported, or
+    // unusable answer ends the action here: nothing saved, nothing closed. A
+    // change after this point is caught by the close (capture kept, tab left
+    // open); the cross-process gap between the two is unavoidable.
+    let inspected;
+    try {
+      inspected = await sendExtensionRequest("browser.inspect_archive_target", { tabId: bound.tabId });
+    } catch (error) {
+      return outcome(
+        "failed",
+        "none",
+        sendCode(error),
+        error?.requestSent === false
+          ? "the request was never sent to the extension; nothing was saved and the tab was not closed"
+          : "no answer arrived to the final check of the tab; nothing was saved and the tab was not closed",
+      );
+    }
+    const inspectValidation = validate("browser.inspect_archive_target", inspected);
+    if (!inspectValidation.valid) return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, inspectValidation.reason);
+    if (inspected.status === "unsupported") {
+      return outcome("failed", "none", ERROR_CODES.UNSUPPORTED_FEATURE, "this browser cannot close tabs; nothing was saved and the tab was not closed");
+    }
+    if (inspected.status !== "ok") {
+      return inspected.code === ERROR_CODES.STALE_HANDLE
+        ? outcome("stale", "none", ERROR_CODES.STALE_HANDLE, "the tab no longer exists; nothing was saved")
+        : outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tab; nothing was saved and the tab was not closed");
+    }
+    if (inspected.browserSessionId !== action.browserSessionId) {
+      return outcome("stale", "none", ERROR_CODES.STALE_SESSION, "the browser session changed since the preview; nothing was saved and the tab was not closed");
+    }
+    const now = inspected.tab;
+    if (now.tabId !== bound.tabId) {
+      return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer is for a different tab; nothing was saved");
+    }
+    if (now.windowId !== bound.windowId || now.url !== bound.url || now.groupId !== bound.groupId || now.pinned !== bound.pinned) {
+      return outcome("stale", "none", ERROR_CODES.STATE_MISMATCH, "the tab's window, address, group, or pinned state changed since the preview; nothing was saved and the tab was not closed");
+    }
+
+    let captureId;
+    try {
+      captureId = store.createCapture(read).id;
+    } catch (error) {
+      const code = error instanceof StoreError ? error.code : ERROR_CODES.INTERNAL_ERROR;
+      return outcome("failed", "none", code, "the capture could not be saved, so the tab was not closed");
+    }
+
+    // --- Step 2: the close, only now that the capture is durable. ---
+    let closed;
+    try {
+      closed = await sendExtensionRequest("browser.close_tab", {
+        browserSessionId: action.browserSessionId,
+        tabId: bound.tabId,
+        windowId: bound.windowId,
+        url: bound.url,
+        groupId: bound.groupId,
+        pinned: bound.pinned,
+      });
+    } catch (error) {
+      return error?.requestSent === false
+        ? outcome("partial", "none", sendCode(error), "the capture was saved but the close request was never sent; the tab was left open", { captureId })
+        : outcome("failed", "unknown", sendCode(error), "the capture was saved; the close request was sent but no answer arrived, so the tab may or may not have been closed", { captureId });
+    }
+    const closeValidation = validate("browser.close_tab", closed);
+    if (!closeValidation.valid) return outcome("failed", "unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, closeValidation.reason, { captureId });
+    const closeDetail = typeof closed.detail === "string" ? closed.detail : null;
+
+    if (closed.changed === false) {
+      // Refused before the one tabs.remove call: the capture stands and the tab
+      // deliberately stays open.
+      return outcome("partial", "none", clipText(closed.code, MAX_CODE_LENGTH), closeDetail ?? "the capture was saved; the tab was left open", { captureId });
+    }
+    const mismatch = () => outcome("failed", "unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview; the capture was saved", { captureId });
+    if (closed.browserSessionId !== action.browserSessionId) return mismatch();
+    if (closed.changed === null) {
+      return outcome("failed", "unknown", clipText(closed.code, MAX_CODE_LENGTH), closeDetail ?? "the capture was saved; the tab may or may not have been closed", { captureId });
+    }
+    if (closed.tabId !== bound.tabId || closed.windowId !== bound.windowId) return mismatch();
+    return outcome("executed", "closed", null, null, { captureId, tabId: bound.tabId, windowId: bound.windowId });
+  }
+
   // Phase 2 Action 1, step two (and Action 2's and 3's, by kind): the one terminal
   // decision on a stored preview, by id alone — no body and no other query
   // parameter, so the caller cannot restate or alter what is being decided.
@@ -1264,8 +1488,8 @@ export function createService({
       throw error;
     }
     const action = store.decideAction(id, "approve");
-    const execute = kind === "open_tab" ? executeOpenTab : kind === "configure_group" ? executeConfigureGroup : executeMoveTabs;
-    const outcome = await execute(action);
+    const executors = { open_tab: executeOpenTab, configure_group: executeConfigureGroup, move_tabs: executeMoveTabs, archive_tab: executeArchiveTab };
+    const outcome = await executors[kind](action);
     try {
       return store.recordActionResult(id, outcome);
     } catch (error) {
@@ -1321,7 +1545,8 @@ export function createService({
       if (route.operation !== "preview") result = await decideBrowserAction(route.kind, route.operation, req, url);
       else if (route.kind === "open_tab") result = await previewOpenTab(req);
       else if (route.kind === "configure_group") result = await previewConfigureGroup(req);
-      else result = await previewMoveTabs(req);
+      else if (route.kind === "move_tabs") result = await previewMoveTabs(req);
+      else result = await previewArchiveTab(req);
       respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result });
     } catch (error) {
       const known =

@@ -13,6 +13,7 @@ import {
   isValidGroupTitle,
   isValidHandle,
   isValidTimestamp,
+  normalizeArchiveConfig,
   normalizeGroupConfig,
   normalizeMoveConfig,
   normalizeOpenUrl,
@@ -504,7 +505,7 @@ export function validateRetentionUpdateInput(input = {}) {
 
 // ---- Phase 2 Action 1: open a URL in a new tab ----
 
-export const ACTION_KINDS = Object.freeze(["open_tab", "configure_group", "move_tabs"]);
+export const ACTION_KINDS = Object.freeze(["open_tab", "configure_group", "move_tabs", "archive_tab"]);
 // previewed -> approved | rejected; approved -> one of the four result
 // states. Every state after "previewed" other than "approved" is terminal.
 export const ACTION_STATES = Object.freeze(["previewed", "approved", "rejected", "executed", "partial", "stale", "failed"]);
@@ -513,7 +514,7 @@ export const ACTION_RESULT_STATES = Object.freeze(["executed", "partial", "stale
 // group action, one new group), one existing group updated, or unknown (the
 // request was sent but its outcome never came back intact), or — for a
 // move_tabs action — the selected tabs moved into a group.
-export const ACTION_MUTATIONS = Object.freeze(["none", "created", "updated", "moved", "unknown"]);
+export const ACTION_MUTATIONS = Object.freeze(["none", "created", "updated", "moved", "closed", "unknown"]);
 // Each kind's own subset: opening a tab never "updates" anything.
 const OPEN_TAB_MUTATIONS = Object.freeze(["none", "created", "unknown"]);
 export const ACTION_AUDIT_EVENTS = Object.freeze(["preview", "approve", "reject", "result"]);
@@ -550,6 +551,10 @@ export function validateActionPreviewInput(input = {}) {
   if (input.kind === "move_tabs") {
     const browserSessionId = requireNonEmptyString(input.browserSessionId, "browserSessionId", { maxLength: MAX_SESSION_ID_LENGTH });
     return { kind: "move_tabs", url: null, binding: validateMoveBinding(input.binding), browserSessionId };
+  }
+  if (input.kind === "archive_tab") {
+    const browserSessionId = requireNonEmptyString(input.browserSessionId, "browserSessionId", { maxLength: MAX_SESSION_ID_LENGTH });
+    return { kind: "archive_tab", url: null, binding: validateArchiveBinding(input.binding), browserSessionId };
   }
   if (input.kind !== undefined && input.kind !== "open_tab") fail("kind", `must be one of: ${ACTION_KINDS.join(", ")}`);
   const checked = normalizeOpenUrl(input.url);
@@ -609,6 +614,29 @@ function validateMoveBinding(value) {
   return checked.config;
 }
 
+// Phase 2 Action 4: what a stored archive preview binds — the exact tab, window,
+// address, group, and pinned state the close is bound to (see
+// normalizeArchiveConfig in extension/protocol.js, shared with the extension)
+// plus the tab's title so the preview can be recognized later. The title is
+// untrusted browser text, clipped, shown but never matched against; the address
+// is stored whole (it is compared for exact equality) or the preview is refused.
+function validateArchiveBinding(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) fail("binding", "must be a plain object");
+  const checked = normalizeArchiveConfig(value);
+  if (!checked.valid) fail("binding", checked.reason);
+  return { ...checked.config, title: optionalNullableString(value.title, "binding.title", { maxLength: MAX_OBSERVED_TITLE_LENGTH }) };
+}
+
+// The HTTP body of an archive preview: exactly the tab id. The session, window,
+// address, and every other piece of current state are learned from the browser.
+export function validateArchivePreviewRequest(body) {
+  for (const key of Object.keys(body)) {
+    if (key !== "tabId") fail(key, 'is not accepted: the body is exactly {"tabId": <id>}');
+  }
+  if (!isValidHandle(body.tabId)) fail("tabId", "must be a non-negative safe integer");
+  return { tabId: body.tabId };
+}
+
 // The HTTP body of a move preview: the exact tab ids and a destination, and
 // nothing else — never a session, a window, or any current state (those are
 // learned from the browser). `destination: "existing"` names one group;
@@ -657,6 +685,7 @@ function validateObservedTab(value) {
 export function validateActionResultInput(input = {}, kind = "open_tab") {
   if (kind === "configure_group") return validateGroupResultInput(input);
   if (kind === "move_tabs") return validateMoveResultInput(input);
+  if (kind === "archive_tab") return validateArchiveResultInput(input);
   const state = requireEnum(input.state, ACTION_RESULT_STATES, "state");
   const mutation = requireEnum(input.mutation, OPEN_TAB_MUTATIONS, "mutation");
   if ((state === "executed" || state === "partial") && mutation !== "created") {
@@ -763,4 +792,40 @@ function validateMoveResultInput(input) {
     fail("tabIds/groupId/windowId", `must be omitted when state is "${state}"`);
   }
   return { state, mutation, code, detail, tabIds, groupId, windowId, observed };
+}
+
+// The archive-tab counterpart. An archive is two steps — a durable capture,
+// then the close — and the outcome says exactly how far it got:
+// - "executed": the capture was saved (`captureId`) and the tab was closed
+//   (`mutation` "closed", with the closed tab's handles);
+// - "partial": the capture was saved (`captureId`) but the tab was deliberately
+//   left open — it changed after the capture, or the close was never sent —
+//   so `mutation` is "none";
+// - "stale": refused before any capture; nothing saved, nothing closed;
+// - "failed": no capture was saved and nothing closed (`mutation` "none", no
+//   `captureId`), or the close's effect is unknown (`mutation` "unknown": the
+//   `tabs.remove` call may have closed the tab; `captureId` is set when the
+//   capture had been saved — it always had been once the close was sent — and
+//   null when even that is unknown, e.g. after a crash).
+// There is no observed state: a closed tab can no longer be read.
+function validateArchiveResultInput(input) {
+  const state = requireEnum(input.state, ACTION_RESULT_STATES, "state");
+  const mutation = requireEnum(input.mutation, ["none", "closed", "unknown"], "mutation");
+  if (state === "executed" && mutation !== "closed") fail("mutation", 'must be "closed" when state is "executed"');
+  if (state !== "executed" && mutation === "closed") fail("mutation", `must not be "closed" when state is "${state}"`);
+  if (state === "partial" && mutation !== "none") fail("mutation", 'must be "none" when state is "partial"');
+  if (state === "stale" && mutation !== "none") fail("mutation", 'must be "none" when state is "stale"');
+  const code = state === "executed" ? null : requireNonEmptyString(input.code, "code", { maxLength: MAX_CODE_LENGTH });
+  const detail = optionalNullableString(input.detail, "detail", { maxLength: MAX_ACTION_DETAIL_LENGTH });
+  const captureId = input.captureId === undefined || input.captureId === null ? null : requirePositiveInteger(input.captureId, "captureId");
+  const tabId = optionalNullableHandle(input.tabId, "tabId");
+  const windowId = optionalNullableHandle(input.windowId, "windowId");
+  if (input.observed !== undefined && input.observed !== null) fail("observed", "an archive records no observed state");
+  if ((state === "executed" || state === "partial") && captureId === null) fail("captureId", `is required when state is "${state}"`);
+  if ((state === "stale" || (state === "failed" && mutation === "none")) && captureId !== null) {
+    fail("captureId", `must be omitted when no capture was saved (state "${state}", mutation "${mutation}")`);
+  }
+  if (state === "executed" && (tabId === null || windowId === null)) fail("tabId", 'and windowId are required when state is "executed"');
+  if (state !== "executed" && (tabId !== null || windowId !== null)) fail("tabId/windowId", `must be omitted when state is "${state}"`);
+  return { state, mutation, code, detail, captureId, tabId, windowId, observed: null };
 }

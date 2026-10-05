@@ -125,10 +125,10 @@ reporting it at face value.
 ### Calling the API
 
 ```sh
-curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 5" http://127.0.0.1:8743/api/browser.list_windows
+curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 6" http://127.0.0.1:8743/api/browser.list_windows
 ```
 
-Returns `{"protocolVersion": 5, "requestId": "...", "result": {...}}`, where
+Returns `{"protocolVersion": 6, "requestId": "...", "result": {...}}`, where
 `result` is the same capture-provenance-wrapped object the extension's
 `runtime.onMessage` listener produces (see "Stage 2: the read API" below).
 `requestId` echoes an `X-Request-Id` header you send, or is generated if you
@@ -1256,7 +1256,7 @@ listing, and this script never logs the token itself:
 | `BROWSER_TABS_URL` | `http://127.0.0.1:8743` |
 | `BROWSER_TABS_AGENT_TOKEN` | _(unset; takes precedence over the file below)_ |
 | `BROWSER_TABS_AGENT_CREDENTIAL_FILE` | `~/.browser-tabs/agent-token` |
-| `BROWSER_TABS_PROTOCOL_VERSION` | `5` |
+| `BROWSER_TABS_PROTOCOL_VERSION` | `6` |
 
 Note this is the **agent** credential, read via a bounded `open`/`stat`/
 `read` sequence capped well below the file's expected size — never
@@ -2804,11 +2804,11 @@ move actions exactly as to the other kinds.
 
 ### Protocol: version 5
 
-`PROTOCOL_VERSION` is `5`. A version-4 extension would answer
-`browser.move_tabs` with a bare `unknown_method` and no `changed` flag, so the
-handshake refuses the mismatch (`unsupported_protocol_version`) rather than the
-service ever sending it a third mutating request. The review UI, the reference
-agent client, and every test client send version `5`.
+`PROTOCOL_VERSION` became `5` here (it is now `6`, see Action 4 below). A
+version-4 extension would answer `browser.move_tabs` with a bare `unknown_method`
+and no `changed` flag, so the handshake refuses the mismatch
+(`unsupported_protocol_version`) rather than the service ever sending it a third
+mutating request.
 
 ### Storage and audit
 
@@ -2921,6 +2921,266 @@ renamed, after the preview is refused as `state_mismatch` with no change; audit
 has no content; and a preview left pending is refused as `stale_session` after
 the browser restart. The complete smoke passed against the fixed revision. The
 100-tab bound is covered by deterministic tests only.
+
+## Phase 2, Action 4: archive a tab
+
+The fourth and last action project.md lists: archiving a tab by **saving a
+capture of it and then closing it**. It reuses Actions 1–3's contract unchanged
+— owner-only; a stored preview, then one terminal decision by id alone; execute
+exactly once; a recorded, audited result — and adds a fourth action kind,
+`archive_tab`, to the same store, state machine, and audit log. **Status:
+complete.** Terra's reviews found three blockers, all fixed with regression
+coverage: a
+non-ok capture (which carries no address) could be saved for a tab that had
+changed since the preview — now a final fresh inspection must match all
+preview-bound state before anything is saved; and the review UI showed "none
+saved" for an archive reconciled after a crash, which may have saved a capture —
+now "unknown"; and Chrome's `pendingUrl` was not checked, so an in-progress
+navigation could retain the old committed URL — now the effective address
+prefers a non-empty pending URL in both inspection and close checks. The final
+gate passed 786/786 automated tests, a clean dependency audit,
+version/build/lifecycle checks, the full real Chrome for Testing bridge smoke,
+real Firefox and Brave regression smokes, and Terra re-review with no remaining
+blocker. No arbitrary navigation, page evaluation, cookie export, or debugger
+access is added: the only new browser calls are `tabs.get` (read) and one
+`tabs.remove`.
+
+### The two steps
+
+1. **Preview** — `POST /api/action.archive_tab.preview` with the body **exactly**
+   `{"tabId": <id>}` (any other field — a session, window, address, group — is a
+   `400`). The service asks the extension (a **read-only**
+   `browser.inspect_archive_target`, never reachable over HTTP) about that one
+   tab. The answer's envelope supplies the **`browserSessionId` the preview is
+   bound to** (a caller can never supply one) and the state the close will be
+   bound to: the tab's **window, current address, group (`-1` for none), and
+   pinned state** — the "current address" being the *effective* one: while a
+   navigation is under way Chrome keeps the committed address in `url` and the
+   address being loaded in `pendingUrl`, so a non-empty `pendingUrl` is
+   preferred, else `url` — plus its **title**, kept only so the preview can be
+   recognized (untrusted browser text, clipped to 500 characters, never matched
+   against). Nothing is saved and nothing is closed. A tab with **no address
+   yet**, or one **longer than 2,048 characters**, is refused (`409 conflict`):
+   the close compares the address for exact equality, so an address that does
+   not exist or cannot be stored whole cannot protect against closing a changed
+   or reused tab. A missing tab is `409 stale_handle`; a browser without
+   `tabs.remove` is `501 unsupported_feature`. Chrome and Firefox both provide
+   `tabs.remove`, so neither is marked unsupported for that reason.
+2. **Decide** — `POST /api/action.archive_tab.approve?id=<n>` or
+   `.../reject?id=<n>`: the id alone, no body and no other query parameter (a
+   `400`), and only on an action of this kind (another kind's id is a `404` that
+   decides nothing). Reject records the decision and does nothing else — no
+   read, no capture, no close. Approve requires a connected extension (the
+   preview is not consumed otherwise) and commits the decision with the same
+   race-safe conditional `UPDATE`; only the winner executes.
+
+The three action routes are owner-only (`403 forbidden_scope` for the
+external-agent credential). `browser.close_tab` and
+`browser.inspect_archive_target` have no HTTP route (`404` for either
+credential), and the extension's `runtime.onMessage` listener answers both as
+`unknown_method` — they are dispatched only from the authenticated service
+connection.
+
+### Execution: capture first, then close — never the other way round
+
+1. **A fresh `browser.read_tab`** (never the preview-time state) for the bound
+   session and tab. It must come back for the same session, tab, and window and,
+   for a readable page, the same address. A **non-ok read is a valid capture of
+   exactly that outcome** — a protected page (`unsupported`), a tab still
+   loading (`not_ready`), or an error that names the tab's handles — and is
+   saved like any other, with **no invented page content** (a non-ok capture
+   carries only its code/detail; the store refuses one that carries page
+   fields). Anything else ends the action *here*, with **nothing saved and
+   nothing closed** (mutation `none`, no `captureId`): a stale session or handle
+   or a moved window or changed address is `stale`; a failed, lost, or unusable
+   read or an answer for a different tab or session is `failed`.
+2. **A final, fresh `browser.inspect_archive_target`** — the last check before
+   anything is saved. Its answer must be valid, for the bound session and tab,
+   and **every piece of preview-bound state must still match exactly: window,
+   address, group, and pinned state**. This matters most for a non-ok read (a
+   protected or still-loading page), which carries no address and none of this
+   state, so the read alone could not notice that the tab was navigated, moved,
+   grouped, or pinned since the preview. Any stale (`state_mismatch`,
+   `stale_handle`, `stale_session`), unsupported (`failed`), lost, or malformed
+   answer ends the action here too: **no capture, no close**.
+3. **The capture is persisted** through the existing capture validator
+   (`store.createCapture`, as `workflow.capture_tab` does); a capture the store
+   refuses is `failed` with nothing saved. Captures carry no creator field; the
+   owner-only action record is the provenance. Only after this durably succeeds
+   does the service send anything that can close a tab.
+4. **One `browser.close_tab`**, built from the stored binding (session, tab,
+   window, address, group, pinned — not the title). The extension re-validates
+   the session and request, **re-reads the tab, and requires the same tab in the
+   same window at the same (effective) address in the same group with the same
+   pinned state**, then calls `tabs.remove` **exactly once with no `await` between that final
+   check and the call**, and never retries. A resolved call means the tab is
+   closed (nothing is read afterwards: it is gone). A **rejected** call is
+   `changed: null` — effect unknown, because a rejection can follow the browser
+   having closed the tab — never "nothing changed".
+
+What is recorded (HTTP `200` once the decision committed; a decided action is
+never retried):
+
+| Action `state` | Meaning | `result.mutation` | `result.captureId` |
+| --- | --- | --- | --- |
+| `executed` | the capture was saved and `tabs.remove` resolved: the tab is closed (`tabId`, `windowId` of the closed tab) | `closed` | the saved capture |
+| `partial` | the capture was saved but the tab was **deliberately left open**: the extension refused the close because the tab changed after the capture (`state_mismatch`, `stale_handle`, `stale_session`), or the close request was never sent | `none` | the saved capture |
+| `stale` | refused before any capture — by the read or by the final check: stale session or handle, a moved window, a changed address, group, or pinned state | `none` | — |
+| `failed` | no capture was saved and nothing closed: a failed, lost, or unusable read or final check (including a browser that cannot close tabs); a capture the store refused | `none` | — |
+| `failed` | the capture was saved, but the close's effect is unknown: `tabs.remove` rejected (`close_failed`, `changed: null`), or the reply was lost or unusable (`request_timeout`, `disconnected`, `invalid_extension_response`, an answer for a different tab/window/session) | `unknown` | the saved capture |
+| `rejected` | you rejected the preview; nothing saved, nothing closed (no result) | — | — |
+
+A saved capture is **never discarded**: whatever happens to the tab afterwards,
+`captureId` points at it. The service validates the extension's answer like
+every other (`validateMethodResult`) and compares its session, tab, and window
+with the stored binding; a mismatch is recorded `failed`/`unknown` (after the
+capture) or `failed`/`none` (before it), never as success.
+
+**Crash/restart.** If the service dies between committing an approval and
+recording its result, the next start reconciles the action to `failed` with
+mutation `unknown` and code `interrupted_by_restart`, exactly as for the other
+kinds. For an archive that means **the capture may have been saved and the tab
+may or may not have closed**: the record cannot say which (`captureId` is null
+there), and the captures list is where a saved one would be found. `store.clear`
+is refused (`409`) while an archive is approved and awaiting its result, and
+afterwards removes the action record and the capture like any other retained
+browser content — but never the audit log. The one-service-per-data-directory
+lock is unchanged.
+
+### Protocol: version 6
+
+`PROTOCOL_VERSION` is `6`. A version-5 extension would answer `browser.close_tab`
+with a bare `unknown_method` and no `changed` flag, so the handshake refuses the
+mismatch (`unsupported_protocol_version`) rather than the service ever sending a
+close to a peer that does not implement it. The review UI, the reference agent
+client, and every test client send version `6`.
+
+### Storage and audit
+
+Migration v6 (non-breaking, in its own transaction) rebuilds `actions` once more
+to allow the new kind — the same rebuild as v4 and v5, copying every column
+(`binding` included), carrying the AUTOINCREMENT counter over, recreating the
+index and immutability triggers, and leaving `action_audit` untouched; every
+earlier row, binding, id, and audit event is preserved. An archive's binding
+(`tabId`, `windowId`, the whole `url`, `groupId`, `pinned`, and the clipped
+`title`) and result (`mutation`, `code`, `detail`, `captureId`, `tabId`,
+`windowId`) are the existing JSON columns. The audit log is unchanged in shape
+and content: `kind` may now be `archive_tab`, a result's `mutation` may be
+`closed`, and nothing else — **no title, URL, handle, session id, capture id, or
+extension-supplied code/detail** — ever enters it.
+
+### In the review UI
+
+Every loaded tab row has an **Archive…** button. It only fills the "Archive a
+tab" form's target line (the tab's id, title, and address as text) and moves
+focus to **Preview archive**; nothing is sent until Preview, which sends exactly
+`{ tabId }`. The stored preview appears in the same actions list with
+**Archive** / **Reject** (only while `previewed`), decided by id alone and reread
+from the service afterwards, with the same double-submit and stale-list guards.
+It shows the bound tab id, window, group, and pinned state, the exact title and
+address as untrusted text (never a link), and a note that approving first saves a
+capture and then closes exactly that tab if it is still unchanged. A result shows
+the outcome in plain words — **"Saved capture: capture #N"** when the id is
+known, "none saved" only where nothing was saved for certain (stale, failed
+before the capture), and **"unknown — a capture may have been saved"** for a
+failed/unknown outcome with no id (a crash reconciled on restart) — apart from
+**"Browser changed"**: "yes — the tab was closed", "no — the tab was
+not closed", or "unknown — the tab may or may not have been closed; any capture
+shown below was saved first". The chosen target is dropped on Disconnect, on a
+stale or *replaced* browser session, and on every fresh "Load windows" or "Load
+tabs" (whose rows are replaced; "Load groups" replaces no tab row and leaves it),
+so an id cannot cross sessions or lists.
+
+### Limitations and assumptions
+
+- **A non-ok capture carries no address**, so the read cannot prove one; the
+  final fresh inspection (step 2) is what compares the bound address, group, and
+  pinned state exactly before such a capture is saved. A readable page's capture
+  is additionally compared with the bound address by the read itself.
+- **An in-progress navigation is part of the address.** Inspection and the close
+  both use the same effective address (a non-empty `pendingUrl`, else `url`;
+  null if the browser reports neither, which the preview refuses). So a tab
+  previewed at A that has since begun navigating to B — `url` still A, `pendingUrl`
+  B — is refused by the final check before any capture (readable, protected, and
+  loading reads alike), and by the close if it begins after the capture; and a
+  preview taken while B is pending binds B and proceeds only while the tab is
+  still going to B. General tab listings and captures are unchanged and keep
+  reporting the committed `url`.
+- **The check-then-save gap is cross-process and unavoidable.** The final check
+  and the capture are separate steps in separate processes, so a change landing
+  between them cannot be seen by that check: the capture is then saved and the
+  close — which re-checks everything immediately before `tabs.remove` — refuses,
+  keeping the capture and leaving the tab open (`partial`, mutation `none`).
+- The browser offers no atomic check-and-close: a user action between the
+  extension's re-read and `tabs.remove` is not detectable. The window is a few
+  microtasks, not zero.
+- A resolved `tabs.remove` is taken to mean the tab closed; the extension does
+  not read the tab again (it is gone).
+- Some browsers keep a pinned or last tab in a window from closing, or ask the
+  user before closing; such behavior surfaces as a rejected call
+  (`changed: null`, recorded `failed`/`unknown`), not as a guess.
+- A tab whose address exceeds 2,048 characters, or has none yet, cannot be
+  archived (refused at preview); try again once it has loaded.
+- Previews have no wall-clock expiry; the only staleness boundary is the session
+  and the bound-state re-check.
+
+### Tests
+
+`test/archive-tab-extension.test.mjs`: `normalizeArchiveConfig` (address
+required and bounded, group/pinned shapes) and the two methods' result validation
+(every non-`ok` `changed` shape, including `changed: null` only as a plain
+error); the worker against a recorded mock browser — inspection (group
+membership, a browser reporting no group at all, pinned, unsupported); `closeTab`
+(one `tabs.remove` for exactly the bound tab after a re-read; stale session
+before any read; invalid parameters with no browser call; a changed window,
+address, fragment, group, or pinned state each leaving the tab open; stale
+handles; a rejected `tabs.remove` as `changed: null` even when the browser closed
+the tab; `unsupported`); a static check that no `await` sits between the final
+state check and the call; the effective address (a non-empty `pendingUrl` over
+`url`, an empty one ignored, null when neither) in inspection and in the close,
+including a navigation to B pending since a preview of A leaving the tab open;
+and routing (`runtime.onMessage` and `routeMessage`
+cannot reach either method). `test/archive-tab.test.mjs` also models
+`pendingUrl` end to end (a navigation pending since the preview is refused before
+any capture on readable, protected, and loading reads; a preview taken while B is
+pending binds B; a navigation pending between the capture and the close keeps the
+capture and the tab). `test/archive-tab.test.mjs`: the store (binding,
+result shapes with `captureId`, append-only audit content, constraints against raw
+SQL, clear removing action and capture but not audit, reconciliation, pending
+bound, migration v6 over a real v5 database with a gapped id counter) and the HTTP
+routes (exactly `{tabId}`, preview binding, every refusal, owner-only/agent/
+no-route, id-only decisions, kind-bound routes; the **ordering** — the capture is
+durable when the close arrives; protected/loading/error captures archived without
+page text; stale/failed outcomes that save no capture and send no close; **the final
+fresh inspection — a pin, group, address, or window change after the preview
+saves no capture and sends no close on a readable, a protected, and a loading
+read alike, and a stale, unsupported, lost, disconnected, or malformed final
+check does the same**; a capture the database refuses; refused or `changed: null` closes keeping the capture;
+lost, malformed, and mismatched close replies as `failed`/`unknown` with the
+capture id; exactly-once under concurrency; hostile-extension audit content;
+`store.clear` during an in-flight approval; no logging of content) plus
+end-to-end tests through the **real** worker, service client, and service over a
+mock browser (capture then close, protected and loading pages, pinned/grouped
+tabs, reject, an earlier session, every kind of change before the capture and
+between the capture and the close, a `tabs.remove` that rejects after closing,
+unsupported, agent). `test/ui.test.mjs` adds static checks of the form, the
+wording, and the target-clearing rules; existing tests were adjusted only for
+protocol 6 / schema 6 and the extra clearing call.
+
+`npm run test:smoke:bridge` gained Step 2.11 (real Chrome for Testing, checked
+against `chrome.tabs` and the capture table): agent refusal and no extension-level
+route; a preview saves no capture and closes nothing; Apply saves exactly one
+capture of exactly that tab and then closes exactly that tab and no other; a
+protected page is archived as a non-ok capture with no text; Reject does neither;
+a tab navigated away after the preview, and a protected page (whose read has no
+address) pinned after the preview, are each refused as stale before any capture
+and stay open; a tab pinned just before the close's own re-check (the worker's
+third tab read is wrapped once) keeps the capture and stays open; a `tabs.remove` that
+rejects after really closing the tab (wrapped once) is recorded `failed`/`unknown`
+with the capture id; audit has no title, URL, or error text; and a preview left
+pending is refused as `stale_session` after the browser restart with no capture
+saved. **Not yet run.** The Firefox smoke is unchanged and is relied on only to
+show the build and the existing workflows still pass.
 
 ## Local development
 

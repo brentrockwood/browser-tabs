@@ -245,6 +245,24 @@
   </form>
   <p id="move-form-status" role="status" aria-live="polite"></p>
 
+  <h3 id="archive-heading">Archive a tab</h3>
+  <p>
+    The same two steps for archiving one tab: <strong>save a capture of it, then close it</strong>. Under "Windows,
+    tabs, and groups" above, choose <strong>Archive…</strong> on a loaded tab. <strong>Preview</strong> records the
+    exact tab, its window, its address, its group, and whether it is pinned, in the current browser session; nothing
+    is saved and the tab stays open. Then <strong>Archive</strong> on that preview first reads the tab afresh and
+    saves a capture of it (a protected or still-loading page is saved as exactly that outcome, with no page text),
+    and only after the capture is safely stored closes that one tab — and only if it is still the same tab at the
+    same address in the same place. If the tab changed after the capture, the capture is kept and the tab stays
+    open; if the browser reports a failure to close, whether the tab closed is shown as unknown. <strong>Reject</strong>
+    discards the preview. Nothing is ever retried.
+  </p>
+  <form id="archive-form">
+    <p id="archive-target" role="status" aria-live="polite">No tab chosen yet.</p>
+    <button type="submit" id="archive-preview-button" disabled>Preview archive</button>
+  </form>
+  <p id="archive-form-status" role="status" aria-live="polite"></p>
+
   <p id="action-decision-status" role="status" aria-live="polite"></p>
   <button type="button" id="refresh-actions-button" disabled>Refresh actions</button>
   <p id="actions-status" role="status" aria-live="polite"></p>

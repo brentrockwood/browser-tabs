@@ -17,7 +17,7 @@ import { createDecisionTracker, createGenerationCounter, createListVersionGuard,
 // Must match extension/protocol.js's PROTOCOL_VERSION. Duplicated here
 // (not imported) because this is a standalone static page with no build
 // step and no access to that module's path.
-const PROTOCOL_VERSION = 5;
+const PROTOCOL_VERSION = 6;
 
 // Mirrors extension/protocol.js's ERROR_CODES.STALE_SESSION — the one
 // code this page must react to specially (see handleStaleBrowserSession
@@ -107,6 +107,8 @@ let groupTarget = null;
 // whenever the browser session or the loaded lists they came from go away.
 let moveSelection = new Map();
 let moveDestination = null;
+// The tab chosen for the archive form (`{ tabId }`), or null.
+let archiveTarget = null;
 const MAX_MOVE_TABS = 100;
 
 function qs(id) {
@@ -233,6 +235,7 @@ function rememberSessionFromWindowsResult(result) {
     if (isReplacedSession(state.sessionId, result.browserSessionId)) {
       clearGroupTarget();
       clearMoveSelection();
+      clearArchiveTarget();
     }
     state.sessionId = result.browserSessionId;
   }
@@ -258,6 +261,7 @@ function handleStaleBrowserSession() {
   state.sessionId = null;
   clearGroupTarget();
   clearMoveSelection();
+  clearArchiveTarget();
   clearChildren(qs("windows-list"));
   setStatus(
     qs("inspector-status"),
@@ -297,6 +301,7 @@ const AUTH_GATED_BUTTON_IDS = [
   "move-preview-button",
   "move-new-button",
   "move-clear-button",
+  "archive-preview-button",
   "refresh-actions-button",
   "refresh-audit-button",
   "refresh-tags-button",
@@ -319,9 +324,12 @@ function resetDisplayedData() {
   clearChildren(qs("proposals-list"));
   clearChildren(qs("actions-list"));
   clearChildren(qs("audit-list"));
-  for (const id of ["action-form-status", "group-form-status", "move-form-status", "action-decision-status", "actions-status", "audit-status"]) qs(id).textContent = "";
+  for (const id of ["action-form-status", "group-form-status", "move-form-status", "archive-form-status", "action-decision-status", "actions-status", "audit-status"]) {
+    qs(id).textContent = "";
+  }
   clearGroupTarget();
   clearMoveSelection();
+  clearArchiveTarget();
   clearChildren(qs("tags-list"));
   clearChildren(qs("collections-list"));
   clearChildren(qs("queue-list"));
@@ -461,7 +469,23 @@ function renderTabRow(t) {
   selectBox.addEventListener("change", () => toggleMoveTab(t, selectBox));
   const selectLabel = el("label", {}, [selectBox, document.createTextNode(t.pinned ? ` Tab ${t.tabId} is pinned and cannot be moved` : ` Select tab ${t.tabId} for moving`)]);
 
-  return el("li", {}, [infoLine, titleLine, urlLine, captureButton, el("span", { text: " " }), groupButton, el("span", { text: " " }), captureStatus, el("div", {}, [selectLabel])]);
+  // "Archive…" likewise only fills the archive form's target line.
+  const archiveButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Archive…")]);
+  archiveButton.addEventListener("click", () => chooseArchiveTarget(t.tabId, `Tab ${t.tabId} — ${t.title ?? "(none)"} — ${t.url ?? "(none)"}`));
+
+  return el("li", {}, [
+    infoLine,
+    titleLine,
+    urlLine,
+    captureButton,
+    el("span", { text: " " }),
+    groupButton,
+    el("span", { text: " " }),
+    archiveButton,
+    el("span", { text: " " }),
+    captureStatus,
+    el("div", {}, [selectLabel]),
+  ]);
 }
 
 function renderGroupRow(g) {
@@ -485,6 +509,7 @@ function renderWindowRow(w) {
     // destination chosen alongside them) are dropped rather than left pointing
     // at rows that no longer exist.
     clearMoveSelection();
+    clearArchiveTarget();
     const bgen = state.browserGeneration.snapshot();
     loadTabsButton.disabled = true;
     setStatus(tabsStatus, "Loading…");
@@ -563,6 +588,7 @@ qs("load-windows-button").addEventListener("click", async () => {
     // Every row below is rebuilt, so the ticked tabs and chosen destination from
     // the previous list are dropped rather than carried over to new rows.
     clearMoveSelection();
+    clearArchiveTarget();
     const list = qs("windows-list");
     clearChildren(list);
     for (const w of result.windows) list.appendChild(renderWindowRow(w));
@@ -1096,9 +1122,47 @@ const MOVE_MUTATION_LABELS = {
   unknown: "unknown — the move may or may not have been applied, and no usable answer says which",
 };
 
+// Phase 2 Action 4 (archiving a tab: save a capture, then close it). The
+// wording keeps "a capture was saved" apart from "the tab was closed".
+const ARCHIVE_STATE_LABELS = {
+  previewed: "awaiting your decision — nothing has been saved and the tab is still open",
+  approved: "approved — no result recorded yet",
+  rejected: "rejected — nothing was saved and the tab was not closed",
+  executed: "archived — a capture was saved and the tab was closed",
+  partial: "partly done — a capture was saved but the tab was deliberately left open",
+  stale: "refused as stale — what was previewed no longer holds; nothing was saved and the tab was not closed",
+  failed: "failed",
+};
+
+const ARCHIVE_MUTATION_LABELS = {
+  closed: "yes — the tab was closed",
+  none: "no — the tab was not closed",
+  unknown: "unknown — the tab may or may not have been closed; any capture shown below was saved first",
+};
+
 function actionStateLabel(a) {
-  const labels = a.kind === "configure_group" ? GROUP_STATE_LABELS : a.kind === "move_tabs" ? MOVE_STATE_LABELS : ACTION_STATE_LABELS;
+  const labels =
+    a.kind === "configure_group" ? GROUP_STATE_LABELS : a.kind === "move_tabs" ? MOVE_STATE_LABELS : a.kind === "archive_tab" ? ARCHIVE_STATE_LABELS : ACTION_STATE_LABELS;
   return labels[a.state] ?? a.state;
+}
+
+// Whether an archive saved a capture, as far as the record can say. A known id
+// is shown exactly. "None saved" is claimed only where nothing was saved for
+// certain (stale, failed before the capture, rejected). A failed outcome with an
+// unknown mutation and no id — the service stopped mid-approval, so the record
+// was reconciled without knowing — says the capture MAY have been saved.
+function archiveCaptureLabel(r, state) {
+  if (r.captureId) return `capture #${r.captureId}`;
+  if (state === "failed" && r.mutation === "unknown") return "unknown — a capture may have been saved (check the captures list)";
+  return "none saved";
+}
+
+// The exact tab (and the address and state it is bound to) a stored archive
+// preview names. The title and address are untrusted browser text; only ever
+// rendered with textContent, and never turned into a link.
+function describeArchiveBinding(b) {
+  const group = b.groupId === -1 ? "ungrouped" : `in group ${b.groupId}`;
+  return `Archive tab ${b.tabId} in window ${b.windowId} (${group}${b.pinned ? ", pinned" : ""}).`;
 }
 
 // The exact tabs (each with the group it is in now), window, and destination
@@ -1147,9 +1211,18 @@ function renderActionItem(a) {
   const urlId = `action-${a.id}-url`;
   const isGroup = a.kind === "configure_group";
   const isMove = a.kind === "move_tabs";
+  const isArchive = a.kind === "archive_tab";
   const li = el("li", { attrs: { id: `action-${a.id}`, tabindex: "-1" } });
-  li.appendChild(el("p", { text: `Action #${a.id} — ${isGroup ? "tab group" : isMove ? "move tabs" : "open in a new tab"} — ${actionStateLabel(a)}` }));
+  li.appendChild(
+    el("p", { text: `Action #${a.id} — ${isGroup ? "tab group" : isMove ? "move tabs" : isArchive ? "archive tab" : "open in a new tab"} — ${actionStateLabel(a)}` }),
+  );
   if (isGroup) li.appendChild(el("p", { text: describeGroupBinding(a.binding), attrs: { id: urlId } }));
+  else if (isArchive) {
+    li.appendChild(el("p", { text: describeArchiveBinding(a.binding), attrs: { id: urlId } }));
+    li.appendChild(el("p", { text: `Title (untrusted browser text): ${a.binding.title ?? "(none)"}` }));
+    li.appendChild(el("p", { text: `Address (untrusted browser text): ${a.binding.url}` }));
+    li.appendChild(el("p", { text: "Approving first saves a capture of this tab, then closes exactly this tab if it is still unchanged." }));
+  }
   else if (isMove) {
     li.appendChild(el("p", { text: describeMoveBinding(a.binding), attrs: { id: urlId } }));
     const tabLines = el("ul", { className: "plain-list" });
@@ -1165,10 +1238,19 @@ function renderActionItem(a) {
   if (a.completedAt !== null) dlEntry(dl, "Completed at", formatTimestamp(a.completedAt));
   if (a.result) {
     const r = a.result;
-    dlEntry(dl, "Browser changed", (isGroup ? GROUP_MUTATION_LABELS : isMove ? MOVE_MUTATION_LABELS : ACTION_MUTATION_LABELS)[r.mutation] ?? r.mutation);
+    dlEntry(
+      dl,
+      "Browser changed",
+      (isGroup ? GROUP_MUTATION_LABELS : isMove ? MOVE_MUTATION_LABELS : isArchive ? ARCHIVE_MUTATION_LABELS : ACTION_MUTATION_LABELS)[r.mutation] ?? r.mutation,
+    );
     if (r.code) dlEntry(dl, "Outcome code", r.code);
     if (r.detail) dlEntry(dl, "Detail", r.detail);
-    if (isMove) {
+    if (isArchive) {
+      // The capture is saved before the close is attempted, and kept whatever
+      // happens to the tab afterwards — so it is reported separately.
+      dlEntry(dl, "Saved capture", archiveCaptureLabel(r, a.state));
+      if (r.tabId !== null && r.tabId !== undefined) dlEntry(dl, "Closed tab", `tab ${r.tabId} in window ${r.windowId ?? "—"}`);
+    } else if (isMove) {
       if (r.groupId !== null) dlEntry(dl, "Group / window", `group ${r.groupId} in window ${r.windowId ?? "—"}`);
       // Only the tabs actually seen in the group afterwards; a known move does
       // not mean every selected tab was observed there.
@@ -1191,7 +1273,7 @@ function renderActionItem(a) {
     } else if (r.tabId !== null) {
       dlEntry(dl, "Tab / window", `tab ${r.tabId} in window ${r.windowId ?? "—"}`);
     }
-    if (!isGroup && !isMove && r.observed) {
+    if (!isGroup && !isMove && !isArchive && r.observed) {
       dlEntry(dl, "Observed status", r.observed.status);
       dlEntry(dl, "Observed title (untrusted browser text)", r.observed.title ?? "—");
       dlEntry(dl, "Observed address (untrusted browser text)", r.observed.url ?? "—");
@@ -1201,7 +1283,7 @@ function renderActionItem(a) {
   li.appendChild(dl);
 
   if (a.state === "previewed") {
-    const openButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode(isGroup || isMove ? "Apply" : "Open")]);
+    const openButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode(isArchive ? "Archive" : isGroup || isMove ? "Apply" : "Open")]);
     const rejectButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode("Reject")]);
     li.appendChild(el("div", { className: "decision-buttons" }, [openButton, rejectButton]));
     // A row rebuilt while its own decision is still in flight (any refresh
@@ -1226,12 +1308,13 @@ async function decideAction(id, operation, buttons, kind) {
   for (const button of buttons) button.disabled = true;
   actionDecisionsInFlight += 1;
   setActionsRefreshDisabled(true);
-  const verb = operation === "approve" ? (kind === "configure_group" || kind === "move_tabs" ? "Apply" : "Open") : "Reject";
+  const verb = operation === "approve" ? (kind === "archive_tab" ? "Archive" : kind === "configure_group" || kind === "move_tabs" ? "Apply" : "Open") : "Reject";
   setStatus(qs("action-decision-status"), `${verb} for action #${id}: submitting…`);
   try {
     let request;
     if (kind === "configure_group") request = apiRequest(`/api/action.configure_group.${operation}?id=${id}`, { method: "POST" });
     else if (kind === "move_tabs") request = apiRequest(`/api/action.move_tabs.${operation}?id=${id}`, { method: "POST" });
+    else if (kind === "archive_tab") request = apiRequest(`/api/action.archive_tab.${operation}?id=${id}`, { method: "POST" });
     else request = apiRequest(`/api/action.open_tab.${operation}?id=${id}`, { method: "POST" });
     const { result } = await request;
     if (!state.generation.isStale(gen)) {
@@ -1466,6 +1549,52 @@ async function refreshTags() {
   }
 }
 qs("refresh-tags-button").addEventListener("click", refreshTags);
+
+// ---- archiving a tab (Phase 2 Action 4) ----
+
+// Choosing "Archive…" on a loaded tab only fills in this form's target line;
+// the request that stores a preview sends exactly `{ tabId }` — no browser
+// session, no window, no address, no current state (the service learns all of
+// that from the browser itself). Nothing is saved and nothing is closed until
+// the preview's own Archive, decided by its id alone like any other action.
+// The target is dropped whenever the browser session or the loaded lists it
+// came from go away, so an id can never be carried into another session.
+function clearArchiveTarget() {
+  archiveTarget = null;
+  qs("archive-target").textContent = "No tab chosen yet.";
+}
+
+function chooseArchiveTarget(tabId, description) {
+  archiveTarget = { tabId };
+  qs("archive-target").textContent = `Archive: ${description}`;
+  qs("archive-preview-button").focus();
+}
+
+qs("archive-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = qs("archive-form-status");
+  if (archiveTarget === null) {
+    setStatus(status, 'Choose a tab ("Archive…") above first.', true);
+    return;
+  }
+  const button = qs("archive-preview-button");
+  const gen = state.generation.snapshot();
+  button.disabled = true;
+  setStatus(status, "Creating preview…");
+  try {
+    const { result } = await apiRequest("/api/action.archive_tab.preview", { method: "POST", body: { tabId: archiveTarget.tabId } });
+    if (state.generation.isStale(gen)) return;
+    setStatus(status, `Preview #${result.id} created. Nothing has been saved and the tab is still open: review it below, then choose Archive or Reject.`);
+    await refreshActions();
+    if (state.generation.isStale(gen)) return;
+    qs(`action-${result.id}`)?.focus();
+  } catch (error) {
+    if (state.generation.isStale(gen)) return;
+    setStatus(status, `Could not create a preview: ${describeError(error)}`, true);
+  } finally {
+    if (!state.generation.isStale(gen)) button.disabled = false;
+  }
+});
 
 // ---- moving tabs into a group (Phase 2 Action 3) ----
 

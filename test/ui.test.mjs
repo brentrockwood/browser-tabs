@@ -338,6 +338,80 @@ test("ui/app.js renders a move preview's tab text as text only, with each tab's 
   assert.doesNotMatch(describeTab, /title|url/i);
 });
 
+// ---- Phase 2 Action 4: the archive-tab form ----
+
+test("ui/index.html's archive form has a live target line, a Preview button disabled until connected, and live status text, with no static Archive/Reject buttons", () => {
+  assert.match(indexHtmlSource, /<form id="archive-form">/);
+  assert.match(indexHtmlSource, /id="archive-target" role="status" aria-live="polite"/);
+  assert.match(indexHtmlSource, /<button type="submit" id="archive-preview-button" disabled>Preview archive<\/button>/);
+  assert.match(indexHtmlSource, /id="archive-form-status" role="status" aria-live="polite"/);
+  assert.doesNotMatch(indexHtmlSource, /id="archive-button"|id="archive-approve-button"|id="archive-reject-button"/);
+  assert.match(appJsSource, /"archive-preview-button"/);
+  // The page explains the order: capture first, then close; and what a partial/unknown outcome means.
+  assert.match(indexHtmlSource, /save a capture of it, then close it/);
+  assert.match(indexHtmlSource, /the capture is kept and the tab stays\s+open/);
+});
+
+test("ui/app.js sends an archive preview with exactly {tabId}, from the chosen tab's row, and decides by id alone", () => {
+  assert.match(appJsSource, /apiRequest\("\/api\/action\.archive_tab\.preview", \{ method: "POST", body: \{ tabId: archiveTarget\.tabId \} \}\)/);
+  const decisions = [...appJsSource.matchAll(/apiRequest\(`\/api\/action\.archive_tab\.\$\{operation\}\?id=\$\{id\}`[^)]*\)/g)];
+  assert.equal(decisions.length, 1, "exactly one call site decides an archive action");
+  assert.doesNotMatch(decisions[0][0], /body/);
+  assert.equal([...appJsSource.matchAll(/action\.archive_tab\./g)].length, 2, "only the preview and the id-only decision route are referenced");
+  assert.doesNotMatch(appJsSource, /browser\.close_tab|browser\.inspect_archive_target/, "the page never names the extension-level methods");
+  assert.match(appJsSource, /chooseArchiveTarget\(t\.tabId, /);
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- archiving a tab"), appJsSource.indexOf("// ---- moving tabs into a group"));
+  assert.ok(section.length > 500, "expected to locate the archive section of app.js");
+  assert.doesNotMatch(section, /sessionId|browserSessionId|windowId|\.url|\.title/, "the form supplies no session, window, address, or title");
+});
+
+test("ui/app.js shows the bound title and address as text only, the saved capture apart from the close, and unknown/none/closed wording", () => {
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- browser actions"), appJsSource.indexOf("// ---- tags ----"));
+  assert.match(section, /text: `Title \(untrusted browser text\): \$\{a\.binding\.title \?\? "\(none\)"\}`/);
+  assert.match(section, /text: `Address \(untrusted browser text\): \$\{a\.binding\.url\}`/);
+  assert.match(section, /dlEntry\(dl, "Saved capture", archiveCaptureLabel\(r, a\.state\)\)/);
+  assert.match(section, /closed: "yes — the tab was closed"/);
+  assert.match(section, /none: "no — the tab was not closed"/);
+  assert.match(section, /unknown — the tab may or may not have been closed; any capture shown below was saved first/);
+  assert.match(section, /partly done — a capture was saved but the tab was deliberately left open/);
+  assert.doesNotMatch(section, /\bhref\b|\bsrc\b|window\.open|\.innerHTML/, "the address is never turned into a link");
+});
+
+test("an archive result never claims 'none saved' where a capture may have been saved (restart reconciliation), and shows a known id exactly", () => {
+  const source = /function archiveCaptureLabel\(r, state\) \{[\s\S]*?\n\}/.exec(appJsSource)[0];
+  const archiveCaptureLabel = new Function(`${source}\nreturn archiveCaptureLabel;`)();
+  // Known: the exact id, whatever the outcome.
+  for (const [state, mutation] of [["executed", "closed"], ["partial", "none"], ["failed", "unknown"]]) {
+    assert.equal(archiveCaptureLabel({ captureId: 42, mutation }, state), "capture #42");
+  }
+  // Failed with an unknown mutation and no id (a crash reconciled on restart): unknown, not "none saved".
+  assert.match(archiveCaptureLabel({ captureId: null, mutation: "unknown" }, "failed"), /^unknown — a capture may have been saved/);
+  assert.doesNotMatch(archiveCaptureLabel({ captureId: null, mutation: "unknown" }, "failed"), /none saved/);
+  // Certainly nothing saved: stale, failed before the capture, and a missing/undefined id.
+  assert.equal(archiveCaptureLabel({ captureId: null, mutation: "none" }, "stale"), "none saved");
+  assert.equal(archiveCaptureLabel({ captureId: null, mutation: "none" }, "failed"), "none saved");
+  assert.equal(archiveCaptureLabel({ mutation: "none" }, "failed"), "none saved");
+  assert.equal(archiveCaptureLabel({ captureId: null, mutation: "none" }, "rejected"), "none saved");
+  // The archive result display goes through it, with no other literal claim.
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- browser actions"), appJsSource.indexOf("// ---- tags ----"));
+  assert.equal([...section.matchAll(/"none saved"/g)].length, 1, "'none saved' appears only inside archiveCaptureLabel");
+});
+
+test("ui/app.js drops the chosen archive target on disconnect, a stale or replaced session, and a fresh Load windows or Load tabs", () => {
+  const reset = appJsSource.slice(appJsSource.indexOf("function resetDisplayedData"), appJsSource.indexOf('qs("auth-form")'));
+  assert.match(reset, /clearArchiveTarget\(\)/);
+  const stale = appJsSource.slice(appJsSource.indexOf("function handleStaleBrowserSession"), appJsSource.indexOf("// ---- connection status"));
+  assert.match(stale, /clearArchiveTarget\(\)/);
+  const remember = appJsSource.slice(appJsSource.indexOf("function rememberSessionFromWindowsResult"), appJsSource.indexOf("// True if `result` is the server's explicit"));
+  assert.match(remember, /clearArchiveTarget\(\)/);
+  const load = appJsSource.slice(appJsSource.indexOf('qs("load-windows-button").addEventListener'));
+  assert.ok(load.indexOf("clearArchiveTarget()") > 0 && load.indexOf("clearArchiveTarget()") < load.indexOf("renderWindowRow(w)"), "cleared before the new rows render");
+  const tabsHandler = appJsSource.slice(appJsSource.indexOf("loadTabsButton.addEventListener"), appJsSource.indexOf("const loadGroupsButton"));
+  assert.ok(tabsHandler.indexOf("clearArchiveTarget()") > 0 && tabsHandler.indexOf("clearArchiveTarget()") < tabsHandler.indexOf("apiRequest("), "and before a tab list is replaced");
+  const groupsHandler = appJsSource.slice(appJsSource.indexOf("loadGroupsButton.addEventListener"), appJsSource.indexOf("return el(\"li\", {}, [renderWindowInfo(w)"));
+  assert.doesNotMatch(groupsHandler, /clearArchiveTarget/, "loading groups replaces no tab row");
+});
+
 test("ui/app.js distinguishes a known move from which tabs were observed, and an unknown effect from none", () => {
   const section = appJsSource.slice(appJsSource.indexOf("// ---- browser actions"), appJsSource.indexOf("// ---- tags ----"));
   assert.match(section, /Observed in the group/);
@@ -350,7 +424,7 @@ test("ui/app.js distinguishes a known move from which tabs were observed, and an
 
 test("a fresh Load tabs drops the whole move selection and destination; a fresh Load groups drops only the destination", () => {
   const tabsHandler = appJsSource.slice(appJsSource.indexOf("loadTabsButton.addEventListener"), appJsSource.indexOf("const loadGroupsButton"));
-  assert.match(tabsHandler, /clearMoveSelection\(\);\n\s+const bgen = /, "cleared before the request starts");
+  assert.match(tabsHandler, /clearMoveSelection\(\);\n\s+clearArchiveTarget\(\);\n\s+const bgen = /, "cleared before the request starts");
   assert.ok(tabsHandler.indexOf("clearMoveSelection()") < tabsHandler.indexOf("apiRequest("), "and before the tab rows are replaced");
   assert.doesNotMatch(tabsHandler, /clearMoveDestination/);
   const groupsHandler = appJsSource.slice(appJsSource.indexOf("loadGroupsButton.addEventListener"), appJsSource.indexOf("return el(\"li\", {}, [renderWindowInfo(w)"));
@@ -371,7 +445,7 @@ test("ui/app.js drops the chosen group target when a fresh session replaces the 
   const remember = appJsSource.slice(appJsSource.indexOf("function rememberSessionFromWindowsResult"), appJsSource.indexOf("// True if `result` is the server's explicit"));
   assert.match(
     remember,
-    /if \(isReplacedSession\(state\.sessionId, result\.browserSessionId\)\) \{\n\s+clearGroupTarget\(\);\n\s+clearMoveSelection\(\);\n\s+\}\n\s+state\.sessionId = result\.browserSessionId;/,
+    /if \(isReplacedSession\(state\.sessionId, result\.browserSessionId\)\) \{\n\s+clearGroupTarget\(\);\n\s+clearMoveSelection\(\);\n\s+clearArchiveTarget\(\);\n\s+\}\n\s+state\.sessionId = result\.browserSessionId;/,
     "checked against the previous id, before it is overwritten",
   );
   assert.equal([...appJsSource.matchAll(/isReplacedSession\(/g)].length, 1, "one call site: no unconditional clearing on load");

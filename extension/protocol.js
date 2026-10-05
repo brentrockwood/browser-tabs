@@ -75,7 +75,18 @@ export const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 // `browser.inspect_move_target` its preview uses): a third mutating request. A
 // version-4 extension would answer it `unknown_method` with no `changed`
 // field, so the handshake refuses the mismatch outright.
-export const PROTOCOL_VERSION = 5;
+//
+// Bumped to 6 for Phase 2 Action 4 (`browser.close_tab`, plus the read-only
+// `browser.inspect_archive_target` its preview uses): a fourth mutating
+// request, and the first that closes something. A version-5 extension would
+// answer it `unknown_method` with no `changed` field, so the handshake refuses
+// the mismatch outright.
+export const PROTOCOL_VERSION = 6;
+
+// Phase 2 Action 4: the longest address an archive preview binds. The close
+// re-checks the tab's address for exact equality, so it must be stored whole,
+// never clipped; a tab with a longer (or no) address is refused at preview.
+export const MAX_ARCHIVE_URL_LENGTH = 2_048;
 
 // Phase 2 Action 3: the most tabs one move may name. Bounds the preview body,
 // the stored binding, the extension requests, and the single `tabs.group` call.
@@ -199,6 +210,9 @@ export const ERROR_CODES = Object.freeze({
   // (window, ungrouped tab, group title/color) no longer matching at
   // execution time, so nothing was changed.
   GROUP_FAILED: "group_failed",
+  // Phase 2 Action 4: `tabs.remove` rejected. A rejection can follow the
+  // browser having closed the tab, so this always travels with `changed: null`.
+  CLOSE_FAILED: "close_failed",
   GROUP_UPDATE_FAILED: "group_update_failed",
   STATE_MISMATCH: "state_mismatch",
   RATE_LIMITED: "rate_limited",
@@ -412,6 +426,26 @@ export function normalizeMoveConfig(value) {
     };
   }
   return invalid('destination must be "existing" or "new"');
+}
+
+// Phase 2 Action 4: the one place an archive request is validated, shared by
+// the service (when a preview is stored) and the extension (re-checked before
+// the tab is closed). It states the exact state the close is bound to: the tab
+// and its window, its current address (non-empty, bounded, compared for exact
+// equality — so a reused or navigated tab is never closed), the group it is in
+// (-1 for none), and whether it is pinned. Extra fields (e.g. a stored
+// preview's title, kept only so the preview can be recognized) are ignored.
+export function normalizeArchiveConfig(value) {
+  const invalid = (reason) => ({ valid: false, reason });
+  if (value === null || typeof value !== "object") return invalid("must be an object");
+  if (!isValidHandle(value.tabId)) return invalid("tabId must be a non-negative safe integer");
+  if (!isValidHandle(value.windowId)) return invalid("windowId must be a non-negative safe integer");
+  if (typeof value.url !== "string" || value.url.length === 0 || value.url.length > MAX_ARCHIVE_URL_LENGTH) {
+    return invalid(`url must be the tab's current address, 1 to ${MAX_ARCHIVE_URL_LENGTH} characters`);
+  }
+  if (value.groupId !== TAB_GROUP_ID_NONE && !isValidHandle(value.groupId)) return invalid("groupId must be the tab's group (-1 when it is in none)");
+  if (typeof value.pinned !== "boolean") return invalid("pinned must be a boolean");
+  return { valid: true, config: { tabId: value.tabId, windowId: value.windowId, url: value.url, groupId: value.groupId, pinned: value.pinned } };
 }
 
 // Every status a `browser.*` result's envelope may carry. "incomplete" is
@@ -657,6 +691,16 @@ const OK_SHAPE_VALIDATORS = {
     isValidTabGroupRecord(result.group) &&
     isValidMoveList(result.tabs, isValidObservedMoveTab),
 
+  // Phase 2 Action 4, read-only: the one tab an archive preview is about — its
+  // window, group membership (-1 for none), pinned state, title, and address
+  // (both untrusted, and either may be null).
+  "browser.inspect_archive_target": (result) => isValidInspectedMoveTab(result.tab),
+
+  // Phase 2 Action 4: the tab was closed (`tabs.remove` resolved). Nothing is
+  // observed afterwards — a closed tab can no longer be read — so this carries
+  // only the handles of the tab that was asked to close.
+  "browser.close_tab": (result) => result.changed === true && isValidHandle(result.tabId) && isValidHandle(result.windowId),
+
   "browser.get_capabilities": (result) =>
     result.protocolVersion === PROTOCOL_VERSION &&
     typeof result.tabGroups === "boolean" &&
@@ -722,7 +766,20 @@ export function validateMethodResult(method, result) {
   if (method === "browser.move_tabs" && !isValidMoveTabsNonOkShape(result)) {
     return { valid: false, reason: `a "${result.status}" result for "${method}" must state whether the browser was changed, consistently` };
   }
+  if (method === "browser.close_tab" && !isValidCloseTabNonOkShape(result)) {
+    return { valid: false, reason: `a "${result.status}" result for "${method}" must state whether the tab was closed, consistently` };
+  }
   return { valid: true };
+}
+
+// A non-"ok" `browser.close_tab` result is either `changed: false` (refused or
+// failed before the one `tabs.remove` call: the tab is still open) or
+// `changed: null` (the call was attempted and rejected, which can follow the
+// browser having closed the tab: the effect is unknown — a plain `error`).
+// There is no partial outcome: a resolved call is a closed tab.
+function isValidCloseTabNonOkShape(result) {
+  if (result.changed === false) return result.status !== "incomplete";
+  return result.changed === null && result.status === "error";
 }
 
 // A non-"ok" `browser.move_tabs` result states whether the browser changed in

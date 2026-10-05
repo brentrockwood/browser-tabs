@@ -16,6 +16,7 @@ import {
   isValidSessionId,
   isValidTabRecord,
   isValidTimestamp,
+  normalizeArchiveConfig,
   normalizeGroupConfig,
   normalizeMoveConfig,
   normalizeHistoryEntry,
@@ -863,6 +864,111 @@ export async function moveTabs(params) {
   return { ...envelope(op, "ok"), changed: true, destination: config.destination, group, tabs };
 }
 
+// Phase 2 Action 4: the address a tab is at *right now* for the purposes of an
+// archive. During a navigation Chrome keeps the committed address in `url`
+// while `pendingUrl` already holds the address being loaded, so a tab that is
+// mid-navigation to B still reports `url` A. The effective address prefers a
+// non-empty `pendingUrl` and falls back to `url`; it is null when the browser
+// reports neither (the service then refuses to bind a preview to it). Used by
+// inspection and by the close's re-check alike, so the two can never disagree;
+// the general tab records (normalizeTab, listings) are deliberately unchanged.
+function effectiveAddress(tab) {
+  if (typeof tab.pendingUrl === "string" && tab.pendingUrl.length > 0) return tab.pendingUrl;
+  return typeof tab.url === "string" ? tab.url : null;
+}
+
+// A tab's group membership as the protocol states it: its group's handle, or
+// -1 for none. A browser that reports no group at all (no tab groups) is
+// consistently "none", in inspection and in the close's re-check alike.
+function groupMembership(tab) {
+  return Number.isInteger(tab.groupId) && tab.groupId >= 0 ? tab.groupId : TAB_GROUP_ID_NONE;
+}
+
+// Phase 2 Action 4, read-only: reports the one tab (`tabId`) an archive
+// preview is about — window, group membership, pinned state, title, and address
+// — so the service can bind the preview to that state and to this browser
+// session (the envelope's `browserSessionId`; never supplied by a caller).
+// Mutates nothing. `tabs.remove` is a standard WebExtension API; a browser
+// without it answers `unsupported` rather than binding a preview it could not
+// carry out.
+export async function inspectArchiveTarget(tabId) {
+  await sessionReady;
+  const op = "browser.inspect_archive_target";
+  if (!isValidHandle(tabId)) return errorResult(op, ERROR_CODES.INVALID_PARAMS, "tabId must be a non-negative safe integer");
+  if (typeof browserApi.tabs?.remove !== "function") {
+    return { ...envelope(op, "unsupported"), code: ERROR_CODES.UNSUPPORTED_FEATURE, detail: "tabs cannot be closed in this browser" };
+  }
+  let tab;
+  try {
+    tab = await browserApi.tabs.get(tabId);
+  } catch (error) {
+    return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
+  }
+  if (tab?.id !== tabId || !isValidHandle(tab.windowId)) {
+    return errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return the requested tab");
+  }
+  const { title } = normalizeTab(tab);
+  // `url` is the effective address (a pending navigation's target when there is one).
+  return { ...envelope(op, "ok"), tab: { tabId, windowId: tab.windowId, groupId: groupMembership(tab), pinned: Boolean(tab.pinned), title, url: effectiveAddress(tab) } };
+}
+
+// Phase 2 Action 4: closes exactly one tab — the extension's fourth browser
+// mutation and the only one that removes anything. The service sends it only
+// after the owner approved a stored preview *and* a capture of the tab was
+// durably saved; this function still trusts nothing it was sent:
+//
+// - the browser session must be current (`stale_session`) and the whole request
+//   is re-validated with the same rules the preview used (normalizeArchiveConfig);
+// - the tab is re-read and must still be the same tab in the same window, at the
+//   (effective) address — a pending navigation's target when there is one —
+//   in the same group, with the same pinned state — otherwise
+//   `stale_handle` / `state_mismatch` and the tab is left open. `tabs.remove`
+//   follows that check with no `await` in between;
+// - `tabs.remove` is called exactly once and never retried. If it resolves the
+//   tab is closed (nothing is read afterwards: it is gone). If it rejects,
+//   whether the tab closed is unknown (`changed: null`) — a rejection can
+//   follow the browser having closed it.
+//
+// The browser offers no atomic check-and-close, so a user action between the
+// re-read and the call is not detectable.
+export async function closeTab(params) {
+  await sessionReady;
+  const op = "browser.close_tab";
+  const refuse = (result) => ({ ...result, changed: false });
+
+  const sessionError = checkSession(op, params?.browserSessionId);
+  if (sessionError) return refuse(sessionError);
+  const checked = normalizeArchiveConfig(params);
+  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
+  if (typeof browserApi.tabs?.remove !== "function") {
+    return refuse({ ...envelope(op, "unsupported"), code: ERROR_CODES.UNSUPPORTED_FEATURE, detail: "tabs cannot be closed in this browser" });
+  }
+  const { config } = checked;
+
+  let tab;
+  try {
+    tab = await browserApi.tabs.get(config.tabId);
+  } catch (error) {
+    return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error)));
+  }
+  if (tab?.id !== config.tabId) return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return the requested tab"));
+  if (
+    tab.windowId !== config.windowId ||
+    effectiveAddress(tab) !== config.url ||
+    groupMembership(tab) !== config.groupId ||
+    Boolean(tab.pinned) !== config.pinned
+  ) {
+    return refuse(errorResult(op, ERROR_CODES.STATE_MISMATCH, "the tab's window, address, group, or pinned state changed since the preview"));
+  }
+
+  try {
+    await browserApi.tabs.remove(config.tabId);
+  } catch (error) {
+    return { ...errorResult(op, ERROR_CODES.CLOSE_FAILED, errMsg(error)), changed: null };
+  }
+  return { ...envelope(op, "ok"), changed: true, tabId: config.tabId, windowId: config.windowId };
+}
+
 // Shared by the extension's own runtime.onMessage listener and by requests
 // forwarded over the service WebSocket, so both entry points dispatch
 // identically — for read-only methods. Browser mutations are deliberately not
@@ -896,18 +1002,21 @@ export async function routeMessage(message) {
 }
 
 // The service WebSocket's dispatcher: everything routeMessage handles, plus
-// the mutating `browser.open_tab`, `browser.configure_group`, and
-// `browser.move_tabs` and the preview-only `browser.inspect_group_target` and
-// `browser.inspect_move_target`. Only requests from the authenticated service
-// reach it; `runtime.onMessage` below uses the read-only routeMessage, so
-// extension pages and other message senders cannot open tabs, change tab
-// groups, or move tabs.
+// the mutating `browser.open_tab`, `browser.configure_group`,
+// `browser.move_tabs`, and `browser.close_tab` and the preview-only
+// `browser.inspect_group_target`, `browser.inspect_move_target`, and
+// `browser.inspect_archive_target`. Only requests from the authenticated
+// service reach it; `runtime.onMessage` below uses the read-only routeMessage,
+// so extension pages and other message senders cannot open tabs, change tab
+// groups, move tabs, or close a tab.
 export async function routeServiceMessage(message) {
   if (message?.method === "browser.open_tab") return openTab(message.url, message.browserSessionId);
   if (message?.method === "browser.configure_group") return configureGroup(message);
   if (message?.method === "browser.inspect_group_target") return inspectGroupTarget(message.tabId, message.groupId);
   if (message?.method === "browser.move_tabs") return moveTabs(message);
   if (message?.method === "browser.inspect_move_target") return inspectMoveTarget(message.tabIds, message.groupId);
+  if (message?.method === "browser.close_tab") return closeTab(message);
+  if (message?.method === "browser.inspect_archive_target") return inspectArchiveTarget(message.tabId);
   return routeMessage(message);
 }
 

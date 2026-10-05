@@ -405,7 +405,7 @@ test("migration v3 creates the action tables and is recorded as a non-breaking m
     const { MIGRATIONS } = await import("../service/store.mjs");
     const v3 = MIGRATIONS.find((migration) => migration.version === 3);
     assert.equal(v3.breaking, false);
-    assert.equal(MIGRATIONS.at(-1).version, 5);
+    assert.equal(MIGRATIONS.at(-1).version, 6);
     assert.equal(MIGRATIONS.at(-1).breaking, false);
   });
 });

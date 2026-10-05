@@ -403,7 +403,7 @@ test("move previews share the pending bound with the other kinds", async () => {
 // Store: migration v5 (rebuilds `actions` again, keeping rows, ids, and audit)
 // ---------------------------------------------------------------------------
 
-test("migration v5 keeps tab and group actions (with their bindings), continues the id counter, and leaves the audit log untouched", async () => {
+test("the migration chain through v6 keeps tab and group actions (with their bindings), continues the id counter, and leaves the audit log untouched", async () => {
   await withTempDir(async (dataDir) => {
     const dbPath = join(dataDir, DATABASE_FILE_NAME);
     const raw = new DatabaseSync(dbPath);
@@ -438,7 +438,7 @@ test("migration v5 keeps tab and group actions (with their bindings), continues 
     }
     const after = new DatabaseSync(dbPath);
     try {
-      assert.equal(after.prepare("SELECT MAX(version) AS v FROM schema_migrations").get().v, 5);
+      assert.equal(after.prepare("SELECT MAX(version) AS v FROM schema_migrations").get().v, 6);
       assert.throws(() => after.exec("UPDATE actions SET url = 'https://evil.example/' WHERE id = 1"), /immutable/, "the triggers were recreated");
       assert.throws(() => after.exec("UPDATE actions SET state = 'approved' WHERE id = 2"), /terminal/);
       assert.throws(() => after.exec("DELETE FROM action_audit"), /append-only/, "the audit triggers are untouched");

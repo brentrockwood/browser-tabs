@@ -580,6 +580,75 @@ Firefox smoke (tab groups cleanly unsupported), and Terra re-review with no
 remaining blocker. See README.md's "Phase 2, Action 3: move selected tabs into
 a group" for the contract, UI, assumptions, and limitations.
 
+### Action 4 (archive a tab): complete
+
+Action 4 again reuses the earlier actions' decisions: the same owner-only
+preview → decide-by-id-alone → execute-once → recorded, audited result, in the
+same action store, state machine, and append-only audit log (`kind` is now also
+`archive_tab`; the audit still holds only fixed server enums, with `closed`
+added to the result `mutation` values — never a URL, title, handle, session,
+capture id, or error text). The owner archives exactly one current tab by
+**first persisting a capture of it, then closing only that exact, still-matching
+tab**. What is specific to it:
+
+- **The preview binds the browser's own state for that one tab.** The body is
+  exactly `{tabId}`; the session and everything else come from a read-only
+  `browser.inspect_archive_target` (no HTTP route): the tab's window, its
+  current address (a tab with none, or one too long to store whole, is refused —
+  the close compares it for exact equality), its group, and its pinned state,
+  plus its title for recognition only.
+- **Capture first.** Approve first obtains a *fresh* `browser.read_tab` and
+  requires the bound session, tab, and window (and, for a readable page, the
+  bound address). A valid non-ok read — a protected page, a tab still loading,
+  an error naming the tab's handles — is a capture of exactly that outcome and
+  is saved through the existing capture validator, with no invented content.
+  Because a non-ok read carries no address or state, a **final fresh
+  `browser.inspect_archive_target`** — made after the read and immediately
+  before the capture is saved — must show the tab still exactly as previewed
+  (session, tab, window, address, group, pinned). Anything else (stale, moved,
+  changed, failed, unusable, unsaveable, or a stale/unsupported/lost/malformed
+  final check) ends the action with nothing saved and nothing closed. A change
+  landing after that final check is an unavoidable cross-process gap: it is
+  caught by the close, which keeps the capture and leaves the tab open.
+- **Then one close, only after the capture is durable.** `browser.close_tab`
+  carries the bound session, tab, window, address, group, and pinned state; the
+  extension re-reads the tab and requires all of it to match — the address being
+  the *effective* one, a non-empty `pendingUrl` (a navigation under way: Chrome
+  keeps the committed address in `url`) in preference to `url`, used identically
+  by inspection and by the close — then calls
+  `tabs.remove` exactly once with no `await` between that check and the call.
+  A rejected call is `changed: null` — effect unknown, because a rejection can
+  follow the browser having closed the tab — recorded `failed` with mutation
+  `unknown`; a resolved call is a closed tab (`executed`, mutation `closed`).
+  Nothing is retried.
+- **A saved capture is never discarded.** If the tab changed between the
+  capture and the close (or the close was never sent), the result is `partial`
+  with mutation `none` and the capture id, and the tab deliberately stays open;
+  a lost or malformed reply after the close was sent is `failed`/`unknown` with
+  the capture id. After a crash, reconciliation records `failed`/`unknown` with
+  no capture id: the capture may have been saved and the tab may or may not have
+  closed, and the review UI says exactly that ("a capture may have been saved")
+  rather than "none saved".
+- **Protocol bumped to 6** (a version-5 peer lacks the method), database schema
+  to 6 (migration v6 widens `actions` again, keeping rows, bindings, ids, and the
+  audit log). `tabs.remove` is a standard WebExtension API, so Firefox is not
+  marked unsupported for it.
+
+Status: complete. It is covered by deterministic extension, store, HTTP,
+end-to-end, and UI tests and the extended real-Chrome bridge smoke (Step 2.11).
+Terra's reviews found three blockers, all fixed with regression coverage: a
+non-ok capture (no address) could be saved for a tab that changed since the
+preview (now guarded by the final fresh inspection); the UI said "none saved"
+for a crash-reconciled archive that may have saved a capture (now "unknown");
+and Chrome's in-progress `pendingUrl` was ignored in favor of its old committed
+URL (the effective address now prefers a non-empty pending URL in both
+inspection and close checks). The final gate passed 786/786 automated tests, a
+clean dependency audit, version/build/lifecycle checks, the complete real
+Chrome for Testing bridge smoke, real Firefox and Brave regression smokes, and
+Terra re-review with no remaining blocker. See README.md's "Phase 2, Action 4:
+archive a tab" for the contract, UI, assumptions, and limitations. This is the
+last action planned for Phase 2.
+
 ## Later work
 
 These are intentionally outside the first two phases:
@@ -597,15 +666,15 @@ review.
 
 ## Current repository state
 
-Phase 2 Actions 1–3 are complete on top of the completed Phase 1 described
-below. Action 3's final gate passed 690/690 automated tests, a clean dependency
-audit, version/build/lifecycle checks, real Chrome and Firefox smokes, and
-independent Terra re-review after all three findings were fixed; see "Action 3"
-above.
-These are the only three browser mutations in the repository; the Phase 1
+Phase 2 Actions 1–4 are complete on top of the completed Phase 1 described
+below. Action 4's final gate passed 786/786 automated tests, a clean dependency
+audit, version/build/lifecycle checks, the complete real Chrome bridge smoke,
+real Firefox and Brave regression smokes, and independent Terra re-review after
+all three findings were fixed; see "Action 4" above.
+These are the only four browser mutations in the repository; the Phase 1
 statements below that no mutation exists describe Phase 1 as it was completed
-and are otherwise unchanged. `PROTOCOL_VERSION` is now `5` and the database
-schema version `5`.
+and are otherwise unchanged. `PROTOCOL_VERSION` is now `6` and the database
+schema version `6`.
 
 The repository contains a stabilized Manifest V3 inspector (Stage 0, below)
 and an implemented Stage 1 local bridge: a Node.js service (`service/`)
