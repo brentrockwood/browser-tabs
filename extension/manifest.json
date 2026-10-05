@@ -3,7 +3,7 @@
   "name": "Browser Tabs (Deterministic Prototype)",
   "version": "0.1.0",
   "description": "Enumerates browser windows and tabs and reads explicit page-text snapshots.",
-  "permissions": ["tabs", "scripting"],
+  "permissions": ["tabs", "scripting", "storage", "alarms"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "service-worker.js",
@@ -11,5 +11,9 @@
   },
   "action": {
     "default_title": "Browser Tabs"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }

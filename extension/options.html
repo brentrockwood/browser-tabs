@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Tabs pairing</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 32rem;
+        margin: 2rem auto;
+        color: #1a1a1a;
+      }
+      label {
+        display: block;
+        margin-top: 1rem;
+        font-weight: 600;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.4rem;
+        margin-top: 0.25rem;
+      }
+      button {
+        margin-top: 1rem;
+        padding: 0.5rem 1rem;
+      }
+      #status {
+        margin-top: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Tabs pairing</h1>
+    <p>
+      Start the local service (<code>npm run service -- start</code>), copy the pairing token it prints on
+      first run (or re-print it later with <code>npm run service -- show-token</code>), and paste it below.
+    </p>
+    <p>
+      Service address: <code id="serviceAddress"></code> (fixed to loopback; not configurable here).
+    </p>
+    <label for="serviceToken">Pairing token</label>
+    <input id="serviceToken" type="password" autocomplete="off" />
+    <button id="save" type="button">Save</button>
+    <p id="status"></p>
+    <script src="options.js" type="module"></script>
+  </body>
+</html>

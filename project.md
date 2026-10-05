@@ -79,10 +79,12 @@ a security sandbox.
 The extension protocol and the public service API may use different
 transports, but they share the same rules:
 
-- Every request has a protocol version, request ID, named method, and validated
-  parameters.
-- Every response repeats the request ID and contains either a typed result or
-  a stable error code with optional diagnostic detail.
+- Every request carries a protocol version. Named-method requests also carry
+  a request ID and validated parameters; health, control, auth, and
+  heartbeat envelopes do not require a request ID.
+- Every response to a named-method request repeats that request ID and
+  contains either a typed result or a stable error code with optional
+  diagnostic detail.
 - Browser records include a browser-session identifier, capture time, source
   operation, and capture status.
 - Window, tab, and group IDs are browser-session handles, not durable database
@@ -123,7 +125,10 @@ Implementation:
 
 Exit criteria:
 
-- [x] `npm test` passes from a clean checkout. (29/29 passing.)
+- [x] `npm test` passes from a clean checkout. (29/29 passing for Stage 0's
+  own test files, last verified before Stage 1 work began; `npm test` now
+  also runs Stage 1's test files, so this count is no longer the total —
+  see "Current repository state" below.)
 - [x] The smoke test proves all three README operations in Chromium. (Passed
   against a real Chrome for Testing browser, via the extension's actual
   `runtime.onMessage` listener.)
@@ -140,21 +145,21 @@ local client asks the service to list windows.
 
 Implementation:
 
-- [ ] Add a service entry point with explicit `start`, `status`, and `stop`
+- [x] Add a service entry point with explicit `start`, `status`, and `stop`
   behavior suitable for development.
-- [ ] Bind HTTP and WebSocket listeners to loopback only.
-- [ ] Generate a local service credential and store it with user-only
+- [x] Bind HTTP and WebSocket listeners to loopback only.
+- [x] Generate a local service credential and store it with user-only
   permissions.
-- [ ] Pair the extension with the service without embedding a credential in
+- [x] Pair the extension with the service without embedding a credential in
   source control or the extension package.
-- [ ] Authenticate the extension WebSocket and local API requests.
-- [ ] Implement connection state, request correlation, timeouts, and bounded
+- [x] Authenticate the extension WebSocket and local API requests.
+- [x] Implement connection state, request correlation, timeouts, and bounded
   reconnect backoff.
-- [ ] Route `browser.list_windows` from an HTTP client through the service and
+- [x] Route `browser.list_windows` from an HTTP client through the service and
   extension, then return the typed result.
-- [ ] Expose a health endpoint that reports service and extension connectivity
+- [x] Expose a health endpoint that reports service and extension connectivity
   without exposing browser content.
-- [ ] Document local setup and recovery when the extension or service is
+- [x] Document local setup and recovery when the extension or service is
   unavailable.
 
 Checkpoint:
@@ -165,14 +170,53 @@ the service API and protocol but replace the extension bridge with the
 smallest reliable platform-supported transport. Do not build both transports
 in advance.
 
+Chosen resolution: keep the WebSocket transport, and send an authenticated
+`ping`/`pong` heartbeat no more than 20 seconds apart once connected —
+Chrome's own documented keepalive pattern for a long-lived service-worker
+WebSocket. See `extension/service-client.js`, `service/server.mjs`, and
+`HEARTBEAT_INTERVAL_MS` in `extension/protocol.js`. This rationale has been
+exercised repeatedly against a real Chrome for Testing browser via
+`test/smoke/stage1-bridge-smoke.mjs` — including the addendum below, found
+via that real-browser testing — and that smoke test passes on the current
+revision; see README.md's "Verification status" for the full evidence.
+
+Addendum, found via real-browser testing: the heartbeat alone only keeps
+the worker alive while a connection exists to reset its idle timer against.
+While the *service* itself is unavailable (e.g. mid-restart) there is no
+connection, and the `setTimeout`-based retry used in that gap cannot wake a
+worker Chrome has already terminated — a `setTimeout` scheduled before
+termination simply never fires. Added a `chrome.alarms`-based backstop
+(`alarms` permission; `RECONNECT_ALARM_NAME`/`RECONNECT_ALARM_DELAY_MINUTES`
+in `extension/protocol.js`): a persistent top-level `chrome.alarms.onAlarm`
+listener is one of the mechanisms Chrome guarantees will wake a terminated
+worker — but only if the alarm was actually armed before termination, and a
+WebSocket `close` event is not a reliable place to arm it (Chrome need not
+run `close` before terminating). The alarm is therefore armed as soon as a
+pairing token is read (startup and token changes) and kept armed for as
+long as a token exists, including while connected (`onAlarm` already
+no-ops when a connection is in progress or established, so this is never a
+duplicate connection); it is cleared only when the token is removed or the
+client is explicitly stopped — not on successful auth. Chrome's current
+documented minimum alarm frequency is 0.5 minutes, and
+`RECONNECT_ALARM_DELAY_MINUTES` requests that floor directly — but this is
+Chrome's floor, not a worst-case guarantee (Chrome may delay delivery
+further), so it bounds typical service-restart recovery time to roughly
+that order of magnitude without being a hard product SLA; the existing
+`setTimeout` fast path (seconds) still applies whenever the worker was
+never actually terminated. `test/smoke/stage1-bridge-smoke.mjs` proves this
+by deliberately leaving the service down past the worker idle window
+before restarting it, so the fast path cannot mask the alarm path. See
+README.md's "Fixed loopback target and keepalive" section for the full
+explanation.
+
 Exit criteria:
 
-- [ ] A fresh local client can discover whether the service and extension are
+- [x] A fresh local client can discover whether the service and extension are
   ready.
-- [ ] An authenticated request completes across the full path.
-- [ ] Missing credentials, bad origins, timeouts, and disconnects fail
+- [x] An authenticated request completes across the full path.
+- [x] Missing credentials, bad origins, timeouts, and disconnects fail
   explicitly.
-- [ ] Service restart and extension restart recover without reinstalling or
+- [x] Service restart and extension restart recover without reinstalling or
   losing the pairing.
 
 ### Stage 2 — Complete the read API
@@ -378,26 +422,38 @@ review.
 
 ## Current repository state
 
-The repository contains a small, stabilized Manifest V3 inspector. It
-normalizes extension-visible windows and tabs and reads bounded rendered text
-from a tab when script injection is permitted. It has no network service,
-derived store, review UI, browser-history query, tab-group support, or browser
-mutations.
+The repository contains a stabilized Manifest V3 inspector (Stage 0, below)
+and an implemented Stage 1 local bridge: a Node.js service (`service/`)
+bound to loopback, an extension-owned WebSocket connection authenticated
+with a locally-generated credential, an authenticated ping/pong heartbeat
+plus a `chrome.alarms` backstop for waking a terminated worker, and one
+authenticated HTTP route (`browser.list_windows`). There is still no
+derived store, review UI, browser-history query, tab-group support, or
+browser mutation (Stage 2+). Stage 1 has been exercised repeatedly against
+a real Chrome for Testing browser via `test/smoke/stage1-bridge-smoke.mjs`,
+with real defects found and fixed as a direct result (see git history), and
+that smoke test passes on the current revision — see "Verification status"
+in the Stage 1 section of README.md for the full evidence.
 
 The injected snapshot function no longer depends on module lexical scope: the
 text limit is passed into it as an argument, so it runs correctly once the
-browser serializes it into the target tab. Unit tests (29/29 passing) cover
-record normalization, page-text extraction (successful snapshots, missing
-bodies, CRLF normalization, character counts, truncation), the service
-worker's `readTab`/`listTabs`/`listWindows` functions, and the registered
-`runtime.onMessage` listener's routing and error responses. A real-browser
-smoke test additionally loads the unpacked extension in Chrome for Testing
-and, through the extension's actual `runtime.onMessage` entry point, confirms
-window listing, tab listing, and reading an ordinary page, plus that a
-protected page returns an explicit `unsupported`/`injection_rejected` result
-rather than empty content.
+browser serializes it into the target tab. `npm test` passes 84/84, covering
+Stage 0's record normalization, page-text extraction (successful snapshots,
+missing bodies, CRLF normalization, character counts, truncation), the
+service worker's `readTab`/`listTabs`/`listWindows` functions, and the
+registered `runtime.onMessage` listener's routing and error responses, plus
+Stage 1's own test files (`test/credential.test.mjs`,
+`test/service-client.test.mjs`, `test/bridge.test.mjs`,
+`test/cli.test.mjs`). A real-browser smoke test (`npm run test:smoke`)
+additionally loads the unpacked extension in Chrome for Testing and, through
+the extension's actual `runtime.onMessage` entry point, confirms window
+listing, tab listing, and reading an ordinary page, plus that a protected
+page returns an explicit `unsupported`/`injection_rejected` result rather
+than empty content. `npm run test:smoke:bridge` separately proves the
+Stage 1 bridge end to end against a real Chrome for Testing browser and a
+real service process. `npm audit` reports no vulnerabilities.
 
-Completed foundation:
+Completed foundation (Stage 0):
 
 - [x] Manifest V3 extension skeleton.
 - [x] Window and tab normalization helpers.
@@ -408,7 +464,10 @@ Completed foundation:
 - [x] Unit test coverage for page extraction, the service worker, and the
   registered message listener.
 - [x] Repeatable Chromium smoke test, verified against Chrome for Testing.
-- [x] Dependency-free Node.js unit-test command.
+- [x] Dependency-free Node.js unit-test command for Stage 0's own test
+  files. (Stage 1 added the `ws` runtime dependency — see its README
+  section — so the *overall* `npm test` now requires `npm install` first;
+  Stage 0's own files still need nothing beyond `node:test`.)
 
 ## Definition of done for any stage
 

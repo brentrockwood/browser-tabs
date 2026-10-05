@@ -29,197 +29,35 @@
 //      running at all (missing browser, timeouts, CDP errors, wrong Node
 //      version) — this is not a claim that the extension failed
 
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import http from "node:http";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-import { connectCdp } from "./cdp-socket.mjs";
+import {
+  closeFixtureServer,
+  connectCdp,
+  createAndWaitForTab,
+  evaluate,
+  findExtensionServiceWorker,
+  findPageTarget,
+  findChromeExecutable,
+  launchChrome,
+  startFixtureServer,
+  stageExtension,
+  terminateChrome,
+  waitForChromeReady,
+} from "./chrome-harness.mjs";
 
 const EXTENSION_SOURCE_PATH = fileURLToPath(new URL("../../extension/", import.meta.url));
 const HARNESS_FIXTURE_PATH = fileURLToPath(new URL("./fixtures/smoke-harness.html", import.meta.url));
 const PROTECTED_URL = "chrome://version/";
 
-// Only auto-detects open-source Chromium: a locally installed, branded
-// Google Chrome (and, by the same restriction, branded Edge/Brave) is known
-// to silently ignore --load-extension and is not supported by this
-// automated path (see README). Chrome for Testing reliably supports it but
-// has no fixed install path, so point CHROME_PATH at one instead of guessing.
-function findChromeExecutable() {
-  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
-
-  const candidates =
-    {
-      darwin: ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
-      linux: ["/usr/bin/chromium", "/usr/bin/chromium-browser"],
-      win32: [],
-    }[process.platform] ?? [];
-
-  return candidates.find((candidate) => existsSync(candidate)) ?? null;
-}
-
-function startFixtureServer() {
-  return new Promise((resolve) => {
-    const server = http.createServer((_request, response) => {
-      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      response.end("<html><body>Browser Tabs smoke test fixture content.</body></html>");
-    });
-    server.listen(0, "127.0.0.1", () => resolve(server));
-  });
-}
-
-function fetchJson(path, port) {
-  return new Promise((resolve, reject) => {
-    http
-      .get({ host: "127.0.0.1", port, path }, (response) => {
-        let body = "";
-        response.on("data", (chunk) => (body += chunk));
-        response.on("end", () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch (error) {
-            reject(error);
-          }
-        });
-      })
-      .on("error", reject);
-  });
-}
-
-async function waitForDevToolsPort(userDataDir, timeoutMs = 15_000) {
-  const portFile = join(userDataDir, "DevToolsActivePort");
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const content = await readFile(portFile, "utf8");
-      const port = Number(content.split("\n")[0]);
-      if (Number.isInteger(port) && port > 0) return port;
-    } catch {
-      // File not written yet.
-    }
-    await delay(150);
-  }
-  throw new Error("Timed out waiting for Chrome's DevToolsActivePort file");
-}
-
-async function stageExtension(stagingRoot) {
-  const stagingDir = join(stagingRoot, "extension");
-  await cp(EXTENSION_SOURCE_PATH, stagingDir, { recursive: true });
+async function stageExtensionWithHarness(stagingRoot) {
+  const stagingDir = await stageExtension(EXTENSION_SOURCE_PATH, stagingRoot);
   const harnessHtml = await readFile(HARNESS_FIXTURE_PATH, "utf8");
   await writeFile(join(stagingDir, "smoke-harness.html"), harnessHtml, "utf8");
   return stagingDir;
-}
-
-// Identifies this extension by its manifest name rather than assuming the
-// first chrome-extension:// service worker found is ours — Chrome may also
-// expose component/built-in extension service workers over CDP.
-async function findExtensionServiceWorker(port, expectedName, timeoutMs = 15_000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const targets = await fetchJson("/json/list", port);
-    const candidates = targets.filter(
-      (target) => target.type === "service_worker" && target.url.startsWith("chrome-extension://"),
-    );
-    for (const candidate of candidates) {
-      let candidateCdp;
-      try {
-        candidateCdp = await connectCdp(candidate.webSocketDebuggerUrl);
-        await candidateCdp.send("Runtime.enable");
-        const manifestName = await evaluate(candidateCdp, "chrome.runtime.getManifest().name");
-        if (manifestName === expectedName) {
-          return { target: candidate, cdp: candidateCdp };
-        }
-      } catch {
-        // Not a match, or not ready yet; try the next candidate.
-      }
-      if (candidateCdp) candidateCdp.close();
-    }
-    await delay(150);
-  }
-  throw new Error(
-    `Timed out locating a service worker whose manifest name is "${expectedName}" ` +
-      "(never found a matching chrome-extension:// service worker target).",
-  );
-}
-
-async function findPageTarget(port, url, timeoutMs = 15_000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const targets = await fetchJson("/json/list", port);
-    const target = targets.find((candidate) => candidate.type === "page" && candidate.url === url);
-    if (target) return target;
-    await delay(150);
-  }
-  throw new Error(`Timed out locating the page target for ${url}`);
-}
-
-async function evaluate(cdp, expression) {
-  const result = await cdp.send("Runtime.evaluate", {
-    expression,
-    awaitPromise: true,
-    returnByValue: true,
-  });
-  if (result.exceptionDetails) {
-    const text = result.exceptionDetails.exception?.description ?? JSON.stringify(result.exceptionDetails);
-    throw new Error(`Runtime.evaluate threw: ${text}`);
-  }
-  return result.result.value;
-}
-
-// Creates one tab and waits (polling with a deadline, not a fixed sleep)
-// for it to finish loading, as a single bounded CDP command. Kept as its
-// own command — rather than one command awaiting three tabs sequentially —
-// so no single Runtime.evaluate call can run longer than the CDP client's
-// per-command timeout (10s default; see cdp-socket.mjs): this wait's own
-// deadline (8s) stays safely under that.
-async function createAndWaitForTab(cdp, url) {
-  return evaluate(
-    cdp,
-    `
-    (async () => {
-      const tab = await chrome.tabs.create({ url: ${JSON.stringify(url)}, active: false });
-      const deadline = Date.now() + 8000;
-      while (Date.now() < deadline) {
-        const current = await chrome.tabs.get(tab.id);
-        if (current.status === "complete") return current;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      throw new Error("tab " + tab.id + " did not reach complete status before the deadline");
-    })()
-    `,
-  );
-}
-
-// Ensures the browser has actually exited (not just been asked to) before
-// returning, with bounded deadlines throughout, so npm/CI cannot hang
-// waiting on a lingering process after a result has already been printed.
-async function terminateChrome(child, exitPromise, { gracefulTimeoutMs = 5000, forceTimeoutMs = 2000 } = {}) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-
-  child.kill(); // SIGTERM: ask nicely first.
-  const exitedGracefully = await Promise.race([
-    exitPromise.then(() => true),
-    delay(gracefulTimeoutMs).then(() => false),
-  ]);
-  if (exitedGracefully) return;
-
-  child.kill("SIGKILL"); // Force kill if it didn't exit in time.
-  await Promise.race([exitPromise, delay(forceTimeoutMs)]);
-}
-
-// Awaited (not fire-and-forget) so the fixture server's listening socket is
-// confirmed closed before we move on; closeAllConnections forces any idle
-// keep-alive sockets shut immediately so they cannot otherwise keep the
-// close() callback (and so the process) pending indefinitely.
-async function closeFixtureServer(server) {
-  await new Promise((resolve) => {
-    server.close(() => resolve());
-    server.closeAllConnections();
-  });
 }
 
 function fail(message) {
@@ -254,7 +92,7 @@ async function main() {
 
   const workDir = await mkdtemp(join(tmpdir(), "browser-tabs-smoke-"));
   const userDataDir = join(workDir, "profile");
-  const stagingDir = await stageExtension(workDir);
+  const stagingDir = await stageExtensionWithHarness(workDir);
   const manifest = JSON.parse(await readFile(join(stagingDir, "manifest.json"), "utf8"));
   const expectedExtensionName = manifest.name;
 
@@ -263,36 +101,13 @@ async function main() {
   const fixtureUrl = `http://127.0.0.1:${fixturePort}/`;
 
   const headless = process.env.SMOKE_HEADLESS !== "false";
-  const args = [
-    `--user-data-dir=${userDataDir}`,
-    `--load-extension=${stagingDir}`,
-    `--disable-extensions-except=${stagingDir}`,
-    "--remote-debugging-port=0",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "about:blank",
-  ];
-  if (headless) args.unshift("--headless=new", "--disable-gpu");
-
-  const chrome = spawn(chromePath, args, { stdio: ["ignore", "ignore", "pipe"] });
-  let chromeStderr = "";
-  chrome.stderr?.on("data", (chunk) => {
-    chromeStderr += chunk.toString();
-  });
-  const chromeExitedEarly = new Promise((resolve) => chrome.once("exit", (code) => resolve(code)));
-  // Without this listener, an invalid CHROME_PATH (spawn ENOENT) would throw
-  // an uncaught "error" event and crash the whole script instead of
-  // producing a clean SMOKE_BLOCKED result.
-  const chromeSpawnError = new Promise((resolve) => chrome.once("error", (error) => resolve(error)));
+  const launched = launchChrome(chromePath, { userDataDir, stagingDir, headless });
+  const { chrome, exitedEarly: chromeExitedEarly } = launched;
 
   let swCdp;
   let pageCdp;
   try {
-    const portOrExitOrError = await Promise.race([
-      waitForDevToolsPort(userDataDir).then((port) => ({ port })),
-      chromeExitedEarly.then((code) => ({ exitCode: code })),
-      chromeSpawnError.then((error) => ({ spawnError: error })),
-    ]);
+    const portOrExitOrError = await waitForChromeReady(launched, userDataDir);
     if ("spawnError" in portOrExitOrError) {
       blocked(`Failed to launch "${chromePath}": ${portOrExitOrError.spawnError.message}`);
       return;
@@ -300,7 +115,7 @@ async function main() {
     if ("exitCode" in portOrExitOrError) {
       blocked(
         `Chrome exited before opening a DevTools port (exit code ${portOrExitOrError.exitCode}). ` +
-          `Stderr: ${chromeStderr.trim().slice(0, 2000)}`,
+          `Stderr: ${launched.getStderr().trim().slice(0, 2000)}`,
       );
       return;
     }
@@ -341,8 +156,7 @@ async function main() {
     const harnessTab = await createAndWaitForTab(swCdp, harnessUrl);
 
     const pageTarget = await findPageTarget(port, harnessUrl);
-    pageCdp = await connectCdp(pageTarget.webSocketDebuggerUrl);
-    await pageCdp.send("Runtime.enable");
+    pageCdp = await connectCdpForPage(pageTarget.webSocketDebuggerUrl);
 
     // The actual behavior under test: call chrome.runtime.sendMessage from
     // a genuine separate extension page, exercising the real
@@ -449,6 +263,16 @@ async function main() {
     await closeFixtureServer(fixtureServer);
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+// Thin wrapper kept local (rather than exported from chrome-harness.mjs)
+// since it also enables Runtime so callers get evaluate() working
+// immediately — the one bit of per-call-site setup every page connection
+// in this file needs.
+async function connectCdpForPage(webSocketDebuggerUrl) {
+  const cdp = await connectCdp(webSocketDebuggerUrl);
+  await cdp.send("Runtime.enable");
+  return cdp;
 }
 
 main();

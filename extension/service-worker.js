@@ -9,6 +9,7 @@ import {
   requestError,
   unsupportedSnapshot,
 } from "./protocol.js";
+import { createServiceClient } from "./service-client.js";
 
 const browserApi = globalThis.browser ?? globalThis.chrome;
 
@@ -70,7 +71,10 @@ export async function readTab(tabId) {
   return { ...result, schemaVersion: SNAPSHOT_SCHEMA_VERSION, tabId };
 }
 
-browserApi.runtime.onMessage.addListener((message) => {
+// Shared by the extension's own runtime.onMessage listener and by requests
+// forwarded over the service WebSocket, so both entry points dispatch
+// identically.
+export async function routeMessage(message) {
   switch (message?.method) {
     case "browser.list_windows":
       return listWindows();
@@ -79,6 +83,48 @@ browserApi.runtime.onMessage.addListener((message) => {
     case "browser.read_tab":
       return readTab(message.tabId);
     default:
-      return Promise.resolve(requestError(ERROR_CODES.UNKNOWN_METHOD, message?.method));
+      return requestError(ERROR_CODES.UNKNOWN_METHOD, message?.method);
   }
-});
+}
+
+browserApi.runtime.onMessage.addListener((message) => routeMessage(message));
+
+// Only wired up when the real `storage` permission/API is present (absent
+// from the lightweight mocks the unit tests install), so this never opens a
+// network connection during `npm test`.
+if (browserApi.storage?.local) {
+  const serviceClient = createServiceClient({
+    storage: browserApi.storage.local,
+    routeMessage,
+    alarms: browserApi.alarms,
+  });
+  serviceClient.start();
+  browserApi.storage.onChanged?.addListener((changes, areaName) =>
+    serviceClient.onStorageChanged(changes, areaName),
+  );
+  // Must be registered at the top level (not inside an async callback or
+  // conditional reached only after some other event): Chrome only wakes a
+  // terminated Manifest V3 service worker to deliver an alarm if a
+  // `chrome.alarms.onAlarm` listener was added unconditionally while the
+  // worker's script last ran. A `setTimeout`-based retry cannot survive
+  // worker termination at all; this alarm is the platform-native backstop
+  // for that case (see RECONNECT_ALARM_NAME in protocol.js).
+  browserApi.alarms?.onAlarm.addListener((alarm) => serviceClient.onAlarm(alarm.name));
+  // Registers browser startup as a wake event too: the extension is
+  // already installed in an existing profile across a browser restart, so
+  // `onInstalled` will not fire again, and nothing else would otherwise
+  // start this worker until some other event happens to occur. The
+  // listener body is intentionally a no-op — reconnecting is simply what
+  // this whole module already does unconditionally (via the single
+  // `serviceClient` constructed and started once above) whenever the
+  // worker's script runs for any reason, so this must never itself call
+  // `serviceClient.start()` or construct another client, which would
+  // create a second, duplicate connection.
+  browserApi.runtime.onStartup?.addListener(() => {});
+  // Diagnostic-only: lets a CDP-attached test (test/smoke/stage1-bridge-
+  // smoke.mjs) read the client's current connection state (e.g.
+  // "not_paired", "connecting", "reconnecting", "connected") when a wait
+  // times out, so a failure can be classified instead of only showing a
+  // final boolean. Not read by any product code path.
+  globalThis.__browserTabsServiceClientState = () => serviceClient.getState();
+}

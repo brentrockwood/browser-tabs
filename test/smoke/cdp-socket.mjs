@@ -3,8 +3,11 @@
 // is a smoke-test-only requirement, not a project-wide one; see README).
 // No hand-written RFC 6455 framing:
 // Node's WebSocket implementation owns the wire protocol; this module only
-// adds CDP's request/response correlation, per-command timeouts, and
-// rejection of in-flight commands if the socket errors or closes.
+// adds CDP's request/response correlation, per-command timeouts, rejection
+// of in-flight commands if the socket errors or closes, and dispatch of
+// unsolicited CDP events (messages with no `id`, e.g. `Runtime.
+// consoleAPICalled`) to subscribers — needed for test diagnostics such as
+// capturing a service worker's console output.
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 
@@ -14,6 +17,7 @@ export function connectCdp(webSocketDebuggerUrl, { commandTimeoutMs = DEFAULT_CO
     let nextId = 1;
     let settled = false;
     const pending = new Map();
+    const eventListeners = new Map(); // CDP method name -> Set<handler>
 
     function rejectPending(error) {
       for (const { reject: rejectCommand, timer } of pending.values()) {
@@ -35,7 +39,15 @@ export function connectCdp(webSocketDebuggerUrl, { commandTimeoutMs = DEFAULT_CO
       } catch {
         return;
       }
-      if (message.id === undefined || !pending.has(message.id)) return;
+
+      if (message.id === undefined) {
+        // An unsolicited CDP event, e.g. {method, params} with no id.
+        const handlers = eventListeners.get(message.method);
+        if (handlers) for (const handler of handlers) handler(message.params);
+        return;
+      }
+
+      if (!pending.has(message.id)) return;
       const { resolve: resolveCommand, reject: rejectCommand, timer } = pending.get(message.id);
       clearTimeout(timer);
       pending.delete(message.id);
@@ -75,6 +87,15 @@ export function connectCdp(webSocketDebuggerUrl, { commandTimeoutMs = DEFAULT_CO
           pending.set(id, { resolve: resolveCommand, reject: rejectCommand, timer });
           socket.send(JSON.stringify({ id, method, params }));
         });
+      },
+      // Subscribes to an unsolicited CDP event (e.g. "Runtime.
+      // consoleAPICalled"). Returns an unsubscribe function. The relevant
+      // domain must already be enabled (e.g. `send("Runtime.enable")`) for
+      // Chrome to emit the event at all.
+      on(method, handler) {
+        if (!eventListeners.has(method)) eventListeners.set(method, new Set());
+        eventListeners.get(method).add(handler);
+        return () => eventListeners.get(method)?.delete(handler);
       },
       close() {
         socket.close();

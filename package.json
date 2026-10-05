@@ -5,6 +5,11 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "test:smoke": "node test/smoke/chromium-smoke.mjs"
+    "test:smoke": "node test/smoke/chromium-smoke.mjs",
+    "test:smoke:bridge": "node test/smoke/stage1-bridge-smoke.mjs",
+    "service": "node service/cli.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
   }
 }
