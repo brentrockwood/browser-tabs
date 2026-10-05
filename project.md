@@ -274,26 +274,26 @@ Initial records:
 
 Implementation:
 
-- [ ] Create the SQLite database on first service start.
-- [ ] Add migration tracking and back up the database before incompatible
+- [x] Create the SQLite database on first service start.
+- [x] Add migration tracking and back up the database before incompatible
   migrations.
-- [ ] Store source records before accepting derived records that reference
+- [x] Store source records before accepting derived records that reference
   them.
-- [ ] Enforce foreign keys and reject references to missing sources.
-- [ ] Record whether each derived value came from the user, a named local
+- [x] Enforce foreign keys and reject references to missing sources.
+- [x] Record whether each derived value came from the user, a named local
   client, or an external agent.
-- [ ] Add explicit create, list, update, and delete operations only for the
+- [x] Add explicit create, list, update, and delete operations only for the
   records required by the review workflow.
-- [ ] Add retention settings and a single operation to clear captured and
+- [x] Add retention settings and a single operation to clear captured and
   derived data.
-- [ ] Keep credentials and browser content out of logs by default.
+- [x] Keep credentials and browser content out of logs by default.
 
 Exit criteria:
 
-- [ ] Restarting the service preserves records and provenance.
-- [ ] Deleting a source has documented, tested behavior for derived records.
-- [ ] A user can inspect and clear all locally retained browser content.
-- [ ] Database failures do not corrupt or silently discard existing records.
+- [x] Restarting the service preserves records and provenance.
+- [x] Deleting a source has documented, tested behavior for derived records.
+- [x] A user can inspect and clear all locally retained browser content.
+- [x] Database failures do not corrupt or silently discard existing records.
 
 ### Stage 4 — External-agent workflow
 
@@ -433,12 +433,104 @@ plus a `chrome.alarms` backstop for waking a terminated worker, and one
 authenticated HTTP route (`browser.list_windows`), since extended by Stage 2
 (below) into a complete bounded read API covering windows, tabs, tab
 groups, page-text snapshots, browsing history, and capabilities. There is
-still no derived store, review UI, or browser mutation (Stage 3+). Stage 1
+still no review UI or browser mutation (Stage 4+); a derived store has
+since been added by Stage 3, documented just below. Stage 1
 has been exercised repeatedly against
 a real Chrome for Testing browser via `test/smoke/stage1-bridge-smoke.mjs`,
 with real defects found and fixed as a direct result (see git history), and
 that smoke test passes on the current revision — see "Verification status"
 in the Stage 1 section of README.md for the full evidence.
+
+Stage 3 (the derived store) has been implemented against this revision:
+`service/store.mjs` adds a service-owned SQLite database (Node's built-in
+`node:sqlite`, no ORM) created on first start and migrated forward via a
+tracked `schema_migrations` table, with `foreign_keys`, `journal_mode`, and
+`secure_delete` all explicitly set *and verified by reading them back* on
+every connection. `service/validation.mjs` deeply validates every
+trust-boundary input before it reaches a SQL statement — captures
+specifically reuse `extension/protocol.js`'s own `validateMethodResult`, so
+a capture is a validated Stage 2 `browser.read_tab` result, never a
+caller-invented shape. `service/store-errors.mjs` normalizes database-layer
+failures into a small set of stable codes, always after an explicit
+transaction rollback. `service/store-routes.mjs` and routing in
+`service/server.mjs` expose explicit, authenticated, protocol-versioned,
+response-size-bounded `store.*` CRUD routes (captures, summaries, tags,
+collections with ordered membership, queue items, proposals, retention
+settings/cleanup, and a single clear-everything operation that also removes
+backup files and uses `secure_delete` plus `VACUUM` to remove cleared
+content from its managed live database file) — see README.md's "Stage 3: the derived
+store" section for the full route table, deletion-semantics documentation,
+and decision-provenance documentation. `service/cli.mjs` opens the store on
+`start` and runs retention cleanup once automatically, as two independently
+try/caught steps (a cleanup failure is never misreported as "store
+unavailable"); opening the store is deliberately best-effort — a Node.js
+runtime without `node:sqlite` still runs the unaffected Stage 1/2 bridge.
+No extension/protocol.js, service-worker.js, or service-client.js changes
+were needed; the extension remains a browser adapter only, unaware this
+store exists.
+
+An independent review of the first Stage 3 implementation found eight
+concrete issues (captures accepting caller-invented shapes; cascade/
+retention deletion ordering failing on a capture→summary→proposal chain;
+`store.clear` not performing a secure delete or removing backups; WAL
+risking an incomplete backup; two NULL-distinct-prone uniqueness indexes;
+a reorder temporary-position collision risk; a silently-coerced `cascade`
+boolean; an unbounded queue-state filter; proposal decisions recording no
+decider; and store responses not being size-bounded) — all addressed in
+this revision, each with a regression test; see README.md's "Known-fixed
+issues" subsection for the itemized list and `test/store.test.mjs`/
+`test/store-routes.test.mjs` for the tests, which also now cover the real
+breaking-migration backup path (against the production migration list, via
+a narrow test-only parameter on the exported `runMigrations`), a
+WAL-origin backup-completeness regression, nested/overlapping cascade
+deletion, a log-leakage check, and a real separate-process restart
+persistence test (`service/cli.mjs` start/stop), not only an in-process
+close/reopen. `package.json` now declares `engines.node: ">=24.0.0"` and
+no script passes `--experimental-sqlite`, removing the previous
+inconsistency between `npm test` and `npm run test:store`.
+
+A second, independent review found seven more concrete issues (`store.clear`
+not running `VACUUM`, so content deleted under an earlier secure_delete-OFF
+connection could still be physically present in the live file; migration
+v2 only ever remediating today's already-corrected v1 schema in its own
+test rather than the actual pre-remediation legacy one; `store.captures.create`
+returning a capture's full, unbounded `text`, risking a commit-then-
+response_too_large outcome on a pathological maximum-length input; a
+non-"ok" capture accepting and persisting invented "ok"-only fields; no
+route to inspect a capture's full text after its one-time create response;
+and tag-assignment listing accepting a partial recordType/recordId filter)
+— all addressed in this revision, each with a regression test; see
+README.md's "Known-fixed issues" subsection for the itemized list. This
+pass also corrected the erasure claim itself: `store.clear` (and this
+project's documentation of it) is now explicit that it erases content only
+from this application's own managed database and backup files, not a
+guarantee against physical-machine forensic recovery. `package-lock.json`'s
+root `engines` field was updated by hand to match `package.json`'s
+`>=24.0.0`; the orchestrator regenerated it with `npm install
+--package-lock-only`.
+
+A third, independent review found three more concrete issues
+(`store.captures.delete`/`store.summaries.delete` with `cascade=true` and
+`store.clear` returning unbounded cascaded-id/removed-backup-filename
+arrays rather than bounded counts, risking a commit-then-
+`response_too_large` outcome on a capture or summary with many real
+dependents; a non-"ok" capture's "ok"-only-field rejection checking the
+normalized value rather than the original request body, so an explicit
+`null` on a forbidden field passed unnoticed; and the cascade/retention
+dependency computation building an unbounded SQL `IN (...)` placeholder
+list sized to however many capture or summary ids were involved) — all
+addressed in this revision, each with a regression test, including an
+HTTP adversarial regression (many real dependents against a deliberately
+tiny `maxResponseBytes`, proving both a `200` response and that the
+delete actually committed) and a real, physically reproduced WAL-mode
+backup-incompleteness regression; see README.md's "Known-fixed issues"
+subsection for the itemized list.
+
+**Stage 3 verification:** the orchestrator ran `npm test` (252/252 passing),
+`npm run test:store` (73/73 passing), `npm audit --omit=dev` (no
+vulnerabilities), syntax and diff checks, and both real Chrome for Testing
+smoke suites against this revision. Independent Terra review passed after
+the remediation rounds. The Stage 3 checklist above is complete.
 
 Stage 2 (the read API) has been implemented, remediated against a round of
 review findings, and verified against this revision:
@@ -553,13 +645,13 @@ Stage 1's own test files (`test/credential.test.mjs`,
 also passed against a real Chrome for Testing browser, and `npm audit`
 reported no vulnerabilities. The Stage 2 changes above grew and changed the
 shape of every one of those test files' assertions (the envelope fields are
-additive but change exact `deepEqual` shapes); `npm test` has since been
-re-run against this revision and passes 179/179 (see "Current verification
-status" below for the full Stage 2 evidence).
+additive but change exact `deepEqual` shapes); `npm test` was
+re-run at the Stage 2 publication checkpoint and passed 179/179 (see
+"Stage 2 checkpoint verification" below for the full evidence).
 
-### Current verification status (Stage 2)
+### Stage 2 checkpoint verification
 
-Verified against this revision:
+Verified at the Stage 2 publication checkpoint:
 
 - `npm test`: 179/179 passing, covering Stage 0 and Stage 1's existing
   coverage plus Stage 2's envelope validation, session handling, history

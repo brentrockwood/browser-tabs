@@ -530,8 +530,8 @@ malformed read_tab result, rather than being logged as non-fatal —
 two-entry paginated history, and session rotation/rejection across a full
 browser restart).
 
-**All of the above has been run against this revision:** `npm test` passes
-179/179; `npm audit` reports no vulnerabilities; `npm run test:smoke` (Stage
+**At the Stage 2 publication checkpoint, all of the above was run:** `npm
+test` passed 179/179; `npm audit` reported no vulnerabilities; `npm run test:smoke` (Stage
 0) passes against a real Chrome for Testing browser; and the expanded
 `npm run test:smoke:bridge` passes against a real Chrome for Testing browser
 and a real service process, proving `browser.get_capabilities`,
@@ -553,6 +553,483 @@ per-page scan ceiling yields an explicit `incomplete` outcome rather than a
 silently wrong page; and the discarded-tab smoke outcome depends on the
 browser's own discard/wake behavior, so a passing run may observe either the
 discarded outcome or `status: "ok"`.
+
+## Stage 3: the derived store
+
+Stage 3 adds a service-owned SQLite database for captures and derived
+records. The extension and the Stage 1/2 read API are unchanged; nothing
+here is reachable from the extension WebSocket, and nothing here causes the
+extension to capture anything automatically — a caller persists evidence it
+already fetched through the Stage 2 read API by explicitly calling
+`store.captures.create`. (A browser-to-store end-to-end test is
+deliberately not part of this: storing is an explicit, separate,
+authenticated caller operation on already-fetched Stage 2 data, not
+something the read path does on a caller's behalf, so there is no
+browser-to-store path to prove beyond Stage 2's own read-path tests plus
+this stage's own store tests.)
+
+### Storage
+
+The database lives at `~/.browser-tabs/browser-tabs.db` (or
+`$BROWSER_TABS_DATA_DIR/browser-tabs.db`), created on first service start
+and migrated forward on every start (`service/store.mjs`). It uses Node's
+built-in `node:sqlite` (`DatabaseSync`) — no ORM, per project.md's
+implementation defaults. Every connection explicitly sets, and verifies by
+reading back, three pragmas rather than relying on an assumed default:
+
+- `foreign_keys = ON` — see "Deletion semantics" below.
+- `journal_mode = DELETE`, not WAL — WAL defers recently committed data into
+  a separate `-wal` file until a checkpoint, which could make a plain
+  file-copy backup (see "Migrations and backups" below) miss recent
+  commits; DELETE mode keeps the main file itself consistent at every
+  commit boundary. This service is single-process/single-writer
+  (project.md's trust model), so WAL's main benefit — concurrent readers
+  during a writer — is not needed. `test/store.test.mjs` asserts no `-wal`/
+  `-shm` sidecar file exists after a commit, and that a backup taken
+  immediately afterward already contains that commit's data.
+- `secure_delete = ON` — without it, SQLite's default behavior leaves a
+  deleted row's bytes sitting in now-unused pages of the file until some
+  future write reuses that page, so a delete (including `store.clear`)
+  would make content unreachable through SQL but not actually erased from
+  the live database file. With it, SQLite overwrites that content with
+  zeros as part of the same delete. `test/store.test.mjs` reads the raw
+  file bytes after `store.clear` and asserts a unique marker is gone.
+
+secure_delete only changes how *that connection's own future deletes*
+behave — it cannot retroactively scrub a page that was already freed
+before the connection turned it on, so content deleted under an earlier
+connection that ran with secure_delete OFF (e.g. a pre-remediation run of
+this store) could still be sitting unzeroed in the file. `store.clear`
+therefore also runs `VACUUM` once its delete transaction has committed
+(`clearAll` in `service/store.mjs`): VACUUM rebuilds the entire database
+file from only its currently live data, so stale bytes from any point in
+the file's history — not only this clear's own deletes — are not carried
+into the rebuilt file. `test/store.test.mjs` has a dedicated regression:
+it seeds and deletes a marker on a raw connection with secure_delete
+explicitly OFF, reopens through the real store, confirms the marker is
+still physically present, then calls `store.clear` and confirms it is
+gone from the raw file bytes.
+
+If any of the three pragmas above fails to take effect, `openStore` throws
+rather than silently running less safely than documented.
+
+**What this does and does not erase:** `store.clear` (with its VACUUM and
+backup-file removal — see "Retention and clearing data" below) is scoped
+to this application's own managed files: the SQLite database file at
+`~/.browser-tabs/browser-tabs.db` and its own `<db>.bak-*` backup copies.
+It is not, and does not claim to be, a guarantee against disk-level
+forensic recovery of the underlying physical machine — SSD wear-leveling
+and garbage collection, filesystem journals, OS swap or hibernation files,
+and external backup systems (Time Machine, cloud sync, etc.) are all
+outside this application's control and are unaffected by anything
+described here.
+
+**Node.js version note:** this project requires Node.js 24+ everywhere
+(`engines.node` in `package.json` and `package-lock.json`, both
+`>=24.0.0`), where `node:sqlite` is available without a flag; `npm test`,
+`npm run test:store`, and `npm run service` all invoke `node` the same
+way, with no `--experimental-sqlite` flag, so there is nothing
+inconsistent between them, and no older-Node fallback path is supported.
+If `node:sqlite` is still unavailable despite that floor (an unusual
+runtime build), the service **still starts** — Stage 1/2 (the bridge and
+read API) have no dependency on the store — but every `store.*` route
+responds `503 store_unavailable`, and the startup log explains why
+(`[store] unavailable, continuing without the derived store: ...`).
+Opening the store and running its startup retention cleanup are logged as
+two independent failure points, not one: a cleanup failure never gets
+misreported as "store unavailable," and vice versa.
+
+### Records
+
+| Record | Fields | Notes |
+| --- | --- | --- |
+| Capture | `browserSessionId`, `sourceOperation` (always exactly `"browser.read_tab"`), `schemaVersion`, `windowId`, `tabId`, `url`, `title`, `documentReadyState`, `capturedAt`, `status`, `characterCount`, `returnedCharacterCount`, `truncated`, `text`, `code`, `detail` | Validated against the *same* `validateMethodResult("browser.read_tab", ...)` that `service/server.mjs` already uses to decide whether the extension's own response is trustworthy (`extension/protocol.js`) — a capture is a validated Stage 2 result, never a caller-invented "evidence" object with an arbitrary shape. A non-`"ok"` status only ever persists the envelope's `code`/`detail`; the "ok"-only fields (`url`/`title`/`documentReadyState`/`characterCount`/`returnedCharacterCount`/`truncated`/`text`) are rejected outright if present, since a real non-`"ok"` `browser.read_tab` result never carries them. Immutable once created (no update route) — editing captured evidence in place would corrupt provenance. |
+| Summary | `text`, `creatorType`, `creatorName`, `sourceCaptureIds` (≥1), `modelMetadata` | `text`/`modelMetadata` are the only editable fields. |
+| Tag | `name` (unique), `creatorType`, `creatorName` | Assigned to a capture or summary via a separate tag-assignment record; a given tag can be assigned to a given capture/summary at most once (enforced by a partial unique index — see "Known-fixed issues" below). |
+| Collection | `name` (unique), `description`, `creatorType`, `creatorName` | Ordered membership via collection items (`position`, unique per collection). |
+| Queue item | `recordType` (`capture`\|`summary`\|`proposal`), `recordId`, `state` (any caller-defined string, ≤100 characters), `creatorType`, `creatorName` | `state` is intentionally free-form (project.md: "a user-defined workflow state"), but still bounded and type-checked, including as a list filter. |
+| Proposal | `kind` (`tag`\|`collection`\|`queue`\|`browser_action`), `rationale`, `payload` (opaque JSON), `creatorType`, `creatorName`, `sourceCaptureIds`/`sourceSummaryIds` (≥1 total), `state` (`pending`→`accepted`\|`rejected`, one-way), `decidedByCreatorType`/`decidedByCreatorName` | Accepting/rejecting requires and persists the decider's identity (see "Decision provenance" below) but only ever records the decision — it never itself performs the proposed change. Browser Tabs does not choose or apply proposals (project.md Phase 1 scope). |
+
+Every derived record (summary, tag, collection, queue item, proposal, and
+the tag-assignment/collection-item link rows) records `creatorType`
+(`user`\|`client`\|`agent`) and `creatorName` — required and bounded for
+`client`/`agent`, and required to be absent for `user` (a single local user
+is in scope; project.md's trust model).
+
+A caller's list of captures (`store.captures.list`) omits the full `text`
+field in favor of `textLength`: a single capture can carry up to 500,000
+characters, and a page of many captures including full text could itself
+approach the service's response-size bound on an otherwise ordinary-sized
+page. `store.captures.create`'s own response uses this same bounded
+projection — a mutation's result is bounded by construction rather than
+ever risking a write that commits and only then fails to report success
+because its own response was too large (see "Routes" below). `detail`
+(bounded to 4,000 characters) is small enough to stay in both views.
+
+`store.captures.read` is the route for retrieving a capture's full text
+afterward: given `id` and an optional `offset`/`maxChars` (default 10,000,
+capped at 100,000 characters per call), it returns the same metadata plus
+one bounded slice (`chunk`) of the text and the text's total length
+(`textLength`) — so a caller can page through even the full 500,000-
+character maximum, in bounded pieces, without a list response ever growing
+with it.
+
+### Decision provenance
+
+Accepting or rejecting a proposal is itself a derived decision and must
+identify its decider — `store.proposals.update` requires
+`creatorType`/`creatorName` (the same fields every other derived record
+uses) and persists them as `decidedByCreatorType`/`decidedByCreatorName`.
+This is a **caller-asserted identity, not a cryptographically distinct
+one**: project.md's trust model gives the entire local API a single shared
+credential, so nothing here proves which human or process actually made a
+given call — it only records what the caller claimed, matching every other
+creator field in this store. That is enough to satisfy the provenance
+requirement (recording who/what claims responsibility for a decision); it
+is not, and is not claimed to be, authentication-level isolation between
+different local callers.
+
+### Deletion semantics
+
+A capture or summary that is still cited — directly, or (for a proposal)
+transitively through a summary that cites it — as a source by a summary or
+proposal cannot be deleted by default; the delete is refused with
+`409 has_dependents`. Passing `cascade=true` deletes every such dependent
+first, in the same transaction, before the source itself — **proposals
+before summaries**, since a proposal citing a summary blocks that
+summary's own deletion under the same rule. This is computed as the full
+transitive closure in one pass (not "one level at a time"), and dedupes
+across overlapping citations: a summary or proposal cited by more than one
+capture being deleted together (as happens during retention cleanup,
+below) is only ever targeted once. If a cascaded delete still somehow fails
+(e.g. a dependency this computation did not anticipate), the whole
+transaction rolls back explicitly rather than partially applying.
+
+That dependency computation itself never builds an unbounded SQL
+`IN (...)` placeholder list, on either the capture-id or the intermediate
+summary-id dimension: ids are processed in fixed, conservative chunks of
+500 (`CAPTURE_DEPENDENT_CHUNK_SIZE` in `service/store.mjs`) and the
+discovered summary/proposal id sets are accumulated across chunks, so the
+result is correct no matter how many ids are involved. The result itself
+reports only `cascadedSummaryCount`/`cascadedProposalCount` — bounded
+counts, never the id lists — for the response-size reason described in
+"Routes" above; `test/store.test.mjs` has a dedicated regression that
+forces real chunk boundaries (via a test-only `captureDependentChunkSize`
+override on `openStore`, never used by a real caller) with only a handful
+of rows, and `test/store-routes.test.mjs` has the many-real-dependents/
+tiny-`maxResponseBytes` HTTP regression described above.
+
+Tag assignments and collection memberships are link rows, not evidence:
+deleting a tag, collection, or the record it links to always removes the
+link automatically (`ON DELETE CASCADE`), with no cascade flag needed.
+
+The `cascade` query parameter itself is strictly validated: only an absent
+parameter or exactly `"true"`/`"false"` is accepted. A typo or an
+alternate spelling (`"TRUE"`, `"1"`) is rejected as `400 validation_error`,
+never silently treated as `false` — which would otherwise turn an intended
+cascading delete into a silently non-cascading one.
+
+### Migrations and backups
+
+Forward-only migrations are tracked in a `schema_migrations` table. A
+migration applied to an already-migrated (non-empty) database that is
+marked `breaking` copies the database file aside first
+(`<db>.bak-<timestamp>`, `backupDatabase` in `service/store.mjs`) —
+`test/store.test.mjs` exercises this end to end against the real migration
+list (not a fabricated stand-in), by applying only migration v1 through a
+narrow test-only parameter on the exported `runMigrations`, then opening
+the store for real so it applies the breaking v2 on top and must back up
+first. A brand-new database applying multiple migrations (including a
+breaking one) in its very first `openStore()` call never backs up anything
+— there is nothing to protect yet, since nothing could have been written
+between those migrations within the same call.
+
+Migration v2 adds the Stage 2-parity capture fields (`schemaVersion`,
+`documentReadyState`, `code`, `detail`) and proposal decision provenance
+(`decidedByCreatorType`/`decidedByCreatorName`) described above. Today's
+`v1` migration already creates the schema with the two partial unique
+indexes (tag-assignment and proposal-source uniqueness) rather than the
+old, NULL-distinct-prone whole-row ones — a brand-new database never had
+the old bug to begin with.
+
+`v2` must still remediate whatever the *actual* legacy pre-remediation
+schema looks like on an existing database, not merely re-apply today's
+already-corrected `v1` definition — those are different things, and a
+test that only exercised the latter would not actually prove the
+remediation. Since Stage 3 has never been published, there is no real
+deployed database whose captures/derived data must be preserved across
+this: rather than attempt to surgically repair an unknown legacy shape in
+place, `v2`'s policy for an existing (`startingVersion > 0`) database is a
+documented, breaking **reset** — every captured/derived table (captures,
+summaries, tags, collections, and their link/source tables) is dropped
+and recreated from the same schema a brand-new database gets, *after* the
+usual pre-breaking-migration backup — before the new columns above are
+added. This also removes any old whole-row unique index, since dropping a
+table drops the indexes built on it. `retention_settings` and
+`schema_migrations` are service configuration/bookkeeping, not captured/
+derived browser content, and are left alone by the reset. A brand-new
+database (`startingVersion === 0`, `v1` having just created empty tables
+moments ago in the same `openStore()` call) skips the reset and only adds
+the new columns, exactly as before — fresh-install behavior is unchanged.
+`test/store.test.mjs` has a dedicated test with a literal, hand-written
+reconstruction of the actual pre-remediation schema (missing columns, the
+old whole-row unique index, a caller-invented capture, a duplicate tag
+assignment, and a no-decider "accepted" proposal) proving the backup is
+taken, none of that legacy data survives, and the new schema's partial
+indexes are what is actually there afterward — not merely "today's `v1`,
+one migration behind," which is what the pre-existing backup-path test
+(above) exercises instead.
+
+### Retention and clearing data
+
+`store.retention.get`/`store.retention.update` manage a single setting,
+`captureRetentionDays` (default `null`: disabled — nothing is deleted
+automatically). `store.retention.cleanup` deletes every capture older than
+that window (by `capturedAt`), cascading to any summary/proposal that cites
+one of them (directly or transitively, deduped — the same logic as
+`cascade=true` above, including the same chunked, placeholder-list-safe
+dependency computation, computed once across the whole expired batch), and
+runs automatically once at every service start. `store.clear` empties
+every captured/derived table in one transaction, then runs `VACUUM` (see
+`secure_delete` above — this is what purges content deleted under an
+earlier connection that ran with secure_delete OFF, which plain deletes
+alone cannot reach), and finally deletes every application-managed backup
+file (`<db>.bak-*`) this store has ever created — so a user can make
+previously retained browser content unrecoverable from this store's own
+database file and its own backup files, not merely unreachable through the
+API. This is scoped to those application-managed files; see "What this
+does and does not erase" above for what it does not claim. The result
+reports only `removedBackupCount`, a bounded count, never the list of
+removed filenames — the same unbounded-database-discovered-list reasoning
+as cascaded deletes above, since nothing caps how many backup files a
+long-lived store may have accumulated. `VACUUM` and
+backup-file removal both run after the table-clearing transaction has
+already committed, not inside it: a SQL transaction cannot roll back a
+filesystem side effect (backup removal) or a statement SQLite itself
+refuses to run inside a transaction (`VACUUM`), so ordering them afterward
+means the primary guarantee (live table data is erased) holds even if one
+of those two later steps fails. Retention settings and migration history
+are service configuration, not retained browser content, and are left
+alone by `store.clear`.
+
+### Routes
+
+All `store.*` routes are under `/api/store.*`, authenticated and
+protocol-versioned exactly like the Stage 2 `browser.*` routes, using the
+HTTP verb shown (a mismatched verb is `405 method_not_allowed`). `GET`
+list routes take `limit`/`offset` plus the filters shown; `POST`/`PATCH`
+take a bounded (≤8 MiB), JSON-object request body. Every response —
+success or error — is itself bounded by the same `maxResponseBytes` the
+Stage 2 routes already enforce, reported as `502 response_too_large` if
+exceeded (list routes keep ordinary-sized pages well under this via the
+field-level bounding described above; this is the same final backstop,
+not the primary mitigation).
+
+A mutation's own result must never commit and only then fail to report
+success because its response was too large — by the time a response-size
+check could run, the write has already happened. Every mutation route in
+this table was reviewed against this, for two distinct kinds of unbounded
+field: a large *caller-supplied* value, and a large *database-discovered*
+list.
+
+Only `store.captures.create` can accept a caller-supplied field large
+enough to matter (a capture's `text`, up to 500,000 characters — around
+2.9 MB worst-case once JSON-escaped, which can exceed `maxResponseBytes`),
+and it returns the same bounded projection `store.captures.list` already
+uses (`textLength`, not `text`) rather than ever depending on the final
+size backstop. Every other mutation's caller-supplied fields are bounded
+small enough (summary text ≤50,000 characters, proposal payload ≤20,000
+bytes, names/descriptions/rationale all ≤5,000 characters, reorder
+responses capped at 200 items, and so on) that this can only ever be
+reached as the backstop it is meant to be, not the primary mitigation —
+see `test/store.test.mjs`'s and `test/store-routes.test.mjs`'s
+"worst-case-escaped text" regressions for `store.captures.create`
+specifically.
+
+The database-discovered case is `store.captures.delete`/
+`store.summaries.delete` with `cascade=true` and `store.clear`: nothing
+limits how many summaries/proposals may cite one capture, or how many
+`.bak-*` backup files a long-lived store may have accumulated, so a naive
+result reporting *which* dependents were cascaded (or *which* backup files
+were removed) as an id/filename array would be unbounded by construction —
+and, since the delete has already committed by the time that array is
+serialized, an oversized result here would mean a destructive mutation
+that succeeded but could only ever report `502 response_too_large`,
+leaving the caller unable to tell whether it actually happened. These
+three routes instead report only bounded counts
+(`cascadedSummaryCount`/`cascadedProposalCount`, `removedBackupCount`) —
+see "Deletion semantics" and "Retention and clearing data" below, and the
+adversarial regression in `test/store-routes.test.mjs` that exercises a
+cascading delete with many real dependents against a deliberately tiny
+`maxResponseBytes` and confirms both a `200` response and that the
+dependents are actually gone.
+
+| Route | Verb | Notes |
+| --- | --- | --- |
+| `store.captures.create` | POST | returns the bounded projection (`textLength`, not `text` — see "Records" above); bounded by construction, not merely by the final response-size backstop |
+| `store.captures.list` | GET | filters: `id`, `windowId`, `tabId`, `status`; omits full `text` (see "Records" above) |
+| `store.captures.read` | GET | query: `id` (required), `offset` (default 0), `maxChars` (default 10,000, max 100,000); returns metadata plus one bounded `chunk` of `text` and the text's total `textLength` |
+| `store.captures.delete` | DELETE | query: `id`, `cascade`; with `cascade=true` returns `cascadedSummaryCount`/`cascadedProposalCount` (bounded counts, never the id lists) |
+| `store.summaries.create` / `.list` / `.update` / `.delete` | POST/GET/PATCH/DELETE | `.update` accepts `text`/`modelMetadata` only; `.delete` with `cascade=true` returns `cascadedProposalCount` (a bounded count, never the id list) |
+| `store.tags.create` / `.list` / `.delete` | POST/GET/DELETE | |
+| `store.tags.assign` / `.unassign` | POST/DELETE | `{tagId, recordType, recordId}` |
+| `store.tags.assignments.list` | GET | filters: `tagId`, and `recordType`/`recordId` together (both or neither — a partial pair is `400 validation_error`) |
+| `store.collections.create` / `.list` / `.update` / `.delete` | POST/GET/PATCH/DELETE | |
+| `store.collections.items.add` / `.remove` / `.list` / `.reorder` | POST/DELETE/GET/PATCH | `.reorder` takes the collection's full current item-id set, reordered |
+| `store.queue.create` / `.list` / `.update` / `.delete` | POST/GET/PATCH/DELETE | |
+| `store.proposals.create` / `.list` / `.update` / `.delete` | POST/GET/PATCH/DELETE | `.update` only accepts `pending`→`accepted`\|`rejected`, and requires `creatorType`/`creatorName` (see "Decision provenance") |
+| `store.retention.get` / `.update` / `.cleanup` | GET/PATCH/POST | |
+| `store.clear` | POST | returns `removedBackupCount` (a bounded count, never the removed-filename list) |
+
+Failure modes beyond Stage 1/2's existing ones (missing/invalid credential,
+wrong protocol version, rate limit): `400 validation_error`/`malformed_body`
+(bad or unparsable input), `404 not_found`, `422 source_not_found` (a
+foreign-key reference does not exist), `409 has_dependents`/`conflict`,
+`413 payload_too_large`, `502 response_too_large`,
+`503 store_unavailable` (no store configured).
+
+### Known-fixed issues
+
+An independent review of the first Stage 3 implementation found several
+concrete issues, all addressed in this revision (with regression tests —
+see "Tests" below): captures accepted any caller-invented shape rather than
+a validated Stage 2 result; `deleteCapture`'s cascade and retention cleanup
+deleted summaries before the proposals that cite them, failing on a
+capture → summary → proposal chain; `store.clear` did not enable
+`secure_delete` or remove backup files; the database ran in WAL mode,
+risking an incomplete file-copy backup; tag-assignment and proposal-source
+uniqueness used a single `UNIQUE(a, b, c)` index, which — because SQL
+treats every `NULL` as distinct from every other `NULL` — never actually
+rejected a duplicate assignment (fixed with partial unique indexes);
+`reorderCollectionItems`' temporary-position bump used a fixed
+`+1,000,000` offset that was not guaranteed disjoint from a pre-existing,
+caller-supplied `position` at or beyond that value (fixed with a
+guaranteed-disjoint negative-vs-non-negative strategy); the `cascade` query
+parameter silently treated anything other than `"true"` as `false`; queue
+`state` list filtering was unbounded; proposal accept/reject recorded no
+decider identity; and store.* responses were not bounded by
+`maxResponseBytes` the way Stage 2 responses already were.
+
+A second, independent review found seven more concrete issues, all
+addressed in this revision (with regression tests — see "Tests" below):
+`store.clear` enabled `secure_delete` and removed backup files but never
+ran `VACUUM`, so content deleted under an earlier connection that ran with
+secure_delete OFF (as a pre-remediation installation would have) could
+still be physically present in the live file afterward — fixed by running
+`VACUUM` once the clearing transaction commits (see `secure_delete` and
+"Retention and clearing data" above), and the erasure claim itself was
+narrowed to this application's own managed files, not physical-machine
+forensics; migration v2 only ever re-applied today's already-corrected
+`v1` schema in its own test, never the actual pre-remediation legacy
+schema it exists to remediate — fixed with a documented, breaking
+pre-release reset of captured/derived data on an existing database (see
+"Migrations and backups" above) and a literal legacy-schema regression
+test; `store.captures.create` returned a capture's full `text`, so the
+pathological maximum-length, maximum-JSON-escape-expansion capture could
+commit and then still fail the final response-size check — fixed by
+returning the same bounded list projection every mutation route that can
+accept a large field was then reviewed for the same risk (see "Routes"
+above); a non-`"ok"` capture accepted and persisted caller-invented
+"ok"-only fields (`url`/`title`/`documentReadyState`/`characterCount`/
+`returnedCharacterCount`/`truncated`/`text`) that a real non-`"ok"`
+`browser.read_tab` result never carries — fixed by rejecting them
+outright; there was no route to inspect a capture's full text after its
+one-time create response — fixed by adding `store.captures.read`'s
+bounded offset/`maxChars` pagination; and tag-assignment listing accepted
+a partial `recordType`/`recordId` filter (one without the other), silently
+widening the query rather than rejecting it — fixed by requiring both or
+neither.
+
+A third, independent review found three more concrete issues, all
+addressed in this revision (with regression tests — see "Tests" below):
+`store.captures.delete`/`store.summaries.delete` with `cascade=true` and
+`store.clear` returned unbounded id/filename arrays
+(`cascadedSummaryIds`/`cascadedProposalIds`, `deletedBackupFiles`) rather
+than bounded counts, risking the exact "committed, then 502" outcome every
+other mutation here was already reviewed against — fixed by reporting
+only `cascadedSummaryCount`/`cascadedProposalCount`/`removedBackupCount`
+(see "Routes" above); a non-`"ok"` capture's "ok"-only-field rejection
+checked the *normalized* value (which collapses "absent" and "explicitly
+`null`" to the same `null`), so a caller sending e.g. `url: null` instead
+of omitting `url` entirely passed the check unnoticed — fixed by checking
+`Object.hasOwn` against the original request body, so presence alone,
+regardless of value, is rejected; and the cascade/retention dependency
+computation (`computeCaptureDependents`) built a single SQL `IN (...)`
+placeholder list sized to however many capture or summary ids were
+involved, with no upper bound — fixed by processing ids in fixed,
+conservative chunks of 500 and accumulating the discovered sets across
+chunks (see "Deletion semantics" above).
+
+### Tests
+
+```sh
+npm run test:store   # unit (service/store.mjs) + HTTP integration tests
+```
+
+`test/store.test.mjs` covers: database creation on first start; persistence
+across a close/reopen; capture validation against the real Stage 2 result
+shape (valid "ok" and non-"ok" cases, and each rejection above); foreign-key
+rejection of a missing source; transaction rollback leaving no partial row;
+deletion semantics (refuse-by-default and cascade, including the
+transitive capture→summary→proposal chain) for captures and summaries;
+tag-assignment duplicate rejection and the partial-unique-index schema
+directly; ordered collection membership, reordering, and the
+guaranteed-disjoint reorder regression (prior positions `0` and
+`1,000,000`); queue state list-filter bounds; proposal state transitions
+and required decider identity; creator-identity requirements;
+malformed/oversized input rejection; SQL-injection safety; uniqueness
+constraints; retention cleanup (disabled no-op, cascading deletion, and
+deduping a summary/proposal shared by two expiring captures); `store.clear`
+(every table, backup-file removal, the `VACUUM` regression described above
+seeded via a raw secure_delete-OFF connection, and a raw-file-bytes check
+that a unique marker is actually gone); the real breaking-migration backup
+path against the production migration list; the literal legacy
+pre-remediation schema regression (backup taken, legacy caller-invented/
+duplicate/no-decider rows do not survive the reset, and the rebuilt schema
+has the correct partial indexes); that a brand-new multi-migration
+database never backs up; rejection of a non-`"ok"` capture carrying
+invented "ok"-only fields, one at a time — both omitted-vs-present (the
+original finding) and the explicit-`null` variant of each (the `Object.hasOwn`
+fix's own regression); `store.captures.read`'s bounded offset/`maxChars`
+pagination, including past-the-end and out-of-range rejection; a
+maximum-length, worst-case-escaped capture both committing and returning a
+small bounded result; the tag-assignment partial-filter rejection; cascade
+delete and `store.clear` reporting bounded counts
+(`cascadedSummaryCount`/`cascadedProposalCount`/`removedBackupCount`)
+rather than the id/filename lists themselves; the real, physically
+reproduced WAL-origin backup-incompleteness bug (a raw connection with
+`PRAGMA journal_mode = WAL` committing a row that a plain file copy of
+only the main db file then misses, unlike this store's actual DELETE-mode
+configuration); and `computeCaptureDependents`'s chunk-boundary
+correctness across a tiny, test-only-overridden `captureDependentChunkSize`.
+`test/store-routes.test.mjs` exercises the same surface over real HTTP
+against a real service and a real SQLite file, including
+authentication/protocol-version/rate-limit enforcement, wrong-HTTP-verb
+rejection, a `store_unavailable` service without a store configured,
+malformed-JSON/oversized-body rejection, strict `cascade` boolean
+validation, `response_too_large` bounding, full CRUD coverage for queue
+items and summaries, nested/overlapping cascade deletion, `store.clear`
+across every table family, a log-leakage check (captured content and the
+credential never reach the `log` callback across a representative mix of
+operations, including failures), a real separate-process
+start/create/stop/restart/list cycle via `service/cli.mjs` proving on-disk
+persistence beyond an in-process close/reopen, rejection of an invented-
+field non-`"ok"` capture over HTTP (both omitted-vs-present and the
+explicit-`null` variant), the maximum-length worst-case-escaped capture
+succeeding with a bounded result over HTTP (and `store.captures.read`
+confirming it actually committed), the tag-assignment partial-filter
+rejection over HTTP, and the adversarial cascade-delete regression: many
+(150) real dependents, a deliberately tiny `maxResponseBytes`, and an
+assertion that the delete both reports `200` (never `502`) and actually
+committed.
+
+Both files are also included in plain `npm test` (`test/*.test.mjs`).
+
+**Verification status:** the orchestrator ran `npm test` (252/252 passing),
+`npm run test:store` (73/73 passing), `npm audit --omit=dev` (no
+vulnerabilities), syntax and diff checks, and both real Chrome for Testing
+smoke suites against this revision. Independent Terra review passed after
+the documented remediation rounds.
 
 ## Local development
 
@@ -578,10 +1055,12 @@ unknown method) with:
 npm run test:smoke
 ```
 
-This smoke command specifically requires Node.js 22 or later, for the
-built-in `WebSocket` client it uses to speak the Chrome DevTools Protocol;
-this is not a project-wide requirement — `npm test` (the unit tests) runs on
-any Node.js version supporting `node:test`.
+This smoke command relies on the built-in `WebSocket` client to speak the
+Chrome DevTools Protocol, which Node has shipped stable since Node.js 22 —
+well under this project's own Node.js 24+ floor (`engines.node` in
+`package.json`), so that requirement is satisfied by the same floor every
+other script in this project already requires; there is no separate,
+lower version requirement for `npm test` or any other script.
 
 It also needs a browser binary that reliably honors `--load-extension`: set
 `CHROME_PATH` to a Chrome for Testing binary (proven to work) or rely on

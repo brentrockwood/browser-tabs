@@ -14,6 +14,9 @@ import {
   WS_MESSAGE_TYPES,
   validateMethodResult,
 } from "../extension/protocol.js";
+import { STORE_ERROR_CODES, StoreError } from "./store-errors.mjs";
+import { STORE_ERROR_STATUS, STORE_ROUTES } from "./store-routes.mjs";
+import { MAX_REQUEST_BODY_BYTES } from "./validation.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
@@ -117,6 +120,12 @@ export function createService({
   authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS,
   heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
   heartbeatGraceMs = HEARTBEAT_GRACE_MS,
+  // Stage 3: the derived store (service/store.mjs). Optional so Stage 1/2
+  // tests that only exercise the browser-bridge routes can keep constructing
+  // a service without one; any store.* route then explicitly reports
+  // `store_unavailable` (503) rather than crashing.
+  store = null,
+  maxStoreRequestBodyBytes = MAX_REQUEST_BODY_BYTES,
   // Conservative request-rate and response-size bounds enforced at this
   // service boundary (project.md Stage 2), independent of whatever an
   // individual browser operation itself bounds. Overridable so tests can
@@ -301,12 +310,143 @@ export function createService({
     }
   }
 
+  // Reads a request body up to `maxBytes`, rejecting explicitly (never
+  // silently truncating) if it is exceeded — the bounded-request-body
+  // counterpart to the existing bounded-response enforcement above. Once
+  // exceeded, buffering stops (no further chunks are retained, bounding
+  // memory) but the connection itself is left alone: destroying/resetting
+  // the socket here would tear down the response path before the caller
+  // can ever read the stable 413 response this is meant to produce.
+  // Remaining inbound data is simply discarded as it arrives. `settled`
+  // guards against a double resolve/reject once 'end' eventually fires.
+  function readRequestBody(req, maxBytes) {
+    return new Promise((resolve, reject) => {
+      let total = 0;
+      let settled = false;
+      const chunks = [];
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+      req.on("data", (chunk) => {
+        if (settled) return;
+        total += chunk.length;
+        if (total > maxBytes) {
+          const error = new Error("request body exceeds the maximum allowed size");
+          error.code = STORE_ERROR_CODES.PAYLOAD_TOO_LARGE;
+          fail(error);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => {
+        if (settled) return;
+        settled = true;
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      });
+      req.on("error", fail);
+    });
+  }
+
+  function parseJsonBody(raw) {
+    if (raw.length === 0) return {};
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      const wrapped = new Error(`request body is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+      wrapped.code = STORE_ERROR_CODES.MALFORMED_BODY;
+      throw wrapped;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      const error = new Error("request body must be a JSON object");
+      error.code = STORE_ERROR_CODES.MALFORMED_BODY;
+      throw error;
+    }
+    return parsed;
+  }
+
+  // Dispatches one Stage 3 store.* route (service/store-routes.mjs):
+  // authenticates and rate-limits exactly like a browser.* route, reads and
+  // bounds the request body for POST/PATCH, runs the route against the
+  // store, and maps a StoreError's stable code to an HTTP status
+  // (STORE_ERROR_STATUS). Deliberately never passes request bodies, query
+  // values, or store error detail to `log()` — those can contain captured
+  // browser content (project.md Stage 3: "keep credentials and browser
+  // content out of logs by default").
+  async function handleStoreMethod(name, route, req, res, url) {
+    const requestId = requestIdFor(req);
+    const authFailure = checkAuth(req);
+    if (authFailure) {
+      respondJson(res, authFailure.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: authFailure.error });
+      return;
+    }
+    if (!checkRateLimit()) {
+      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
+      return;
+    }
+    if (!store) {
+      respondJson(res, 503, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: "store_unavailable" } });
+      return;
+    }
+    if (req.method !== route.httpMethod) {
+      respondJson(res, 405, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        error: { code: "method_not_allowed", detail: `"${name}" expects ${route.httpMethod}` },
+      });
+      return;
+    }
+
+    let body;
+    if (route.httpMethod === "POST" || route.httpMethod === "PATCH") {
+      try {
+        const raw = await readRequestBody(req, maxStoreRequestBodyBytes);
+        body = parseJsonBody(raw);
+      } catch (error) {
+        const status = error.code === STORE_ERROR_CODES.PAYLOAD_TOO_LARGE ? 413 : 400;
+        respondJson(res, status, {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId,
+          error: { code: error.code ?? STORE_ERROR_CODES.MALFORMED_BODY, detail: error.message },
+        });
+        return;
+      }
+    }
+
+    try {
+      const result = route.run({ store, url, body });
+      const responseBody = { protocolVersion: PROTOCOL_VERSION, requestId, result };
+      const payload = JSON.stringify(responseBody);
+      // Same bound and stable outcome as the browser.* routes above
+      // (maxResponseBytes, ERROR_CODES.RESPONSE_TOO_LARGE): a store.*
+      // route's own per-field bounds (e.g. list projections that omit
+      // large text — service/store.mjs's rowToCaptureListItem) keep this
+      // rare in practice, but it is still enforced here as the same
+      // explicit, final backstop, never an unbounded response written to
+      // the socket.
+      if (Buffer.byteLength(payload) > maxResponseBytes) {
+        respondJson(res, 502, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RESPONSE_TOO_LARGE } });
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) });
+      res.end(payload);
+    } catch (error) {
+      const storeError =
+        error instanceof StoreError ? error : new StoreError(STORE_ERROR_CODES.DB_ERROR, error instanceof Error ? error.message : String(error));
+      const status = STORE_ERROR_STATUS[storeError.code] ?? 500;
+      respondJson(res, status, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: storeError.code, detail: storeError.message } });
+    }
+  }
+
   function handleHealth(_req, res) {
     respondJson(res, 200, {
       protocolVersion: PROTOCOL_VERSION,
       ok: true,
       service: { startedAt },
       extension: { connected: extensionSocket !== null, connectedAt: extensionConnectedAt },
+      store: { available: store !== null },
     });
   }
 
@@ -356,10 +496,14 @@ export function createService({
       handleControlStop(req, res);
       return;
     }
-    if (req.method === "GET" && url.pathname.startsWith("/api/")) {
-      const method = url.pathname.slice("/api/".length);
-      if (API_ROUTES.has(method)) {
-        handleApiMethod(method, req, res, url);
+    if (url.pathname.startsWith("/api/")) {
+      const name = url.pathname.slice("/api/".length);
+      if (req.method === "GET" && API_ROUTES.has(name)) {
+        handleApiMethod(name, req, res, url);
+        return;
+      }
+      if (STORE_ROUTES.has(name)) {
+        handleStoreMethod(name, STORE_ROUTES.get(name), req, res, url);
         return;
       }
     }

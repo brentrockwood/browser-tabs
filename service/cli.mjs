@@ -18,6 +18,7 @@ import { join } from "node:path";
 
 import { createService } from "./server.mjs";
 import { getDataDir, loadOrCreateCredential } from "./credential.mjs";
+import { openStore } from "./store.mjs";
 import { DEFAULT_SERVICE_PORT, PROTOCOL_VERSION } from "../extension/protocol.js";
 
 // Shared with the extension's fixed WebSocket target (see
@@ -143,17 +144,60 @@ async function cmdStart() {
 
   const { token, created } = await loadOrCreateCredential(dataDir);
 
+  // Stage 3: created on first start, migrated forward on every start (see
+  // service/store.mjs). Logging here deliberately never includes
+  // credentials or browser content — only operational messages (db path,
+  // migration version numbers) — project.md Stage 3's logging requirement.
+  // Opening the store is best-effort at this layer: a Node.js runtime
+  // without `node:sqlite` (see store.mjs's own error message) must not take
+  // down the Stage 1/2 bridge, which has no dependency on it — the service
+  // still starts, and every store.* route explicitly reports
+  // `store_unavailable` (service/server.mjs) rather than the whole process
+  // failing to start.
+  let store = null;
+  try {
+    store = await openStore({ dataDir, log: (message) => console.log(`[store] ${message}`) });
+  } catch (error) {
+    console.log(`[store] unavailable, continuing without the derived store: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Deliberately a separate try/catch from the one above: opening the
+  // store succeeding or failing is a different fact from retention
+  // cleanup succeeding or failing once it is open. Folding both into one
+  // catch would misreport a cleanup failure as "store unavailable" (the
+  // store did open — `store` is non-null, store.* routes remain
+  // available) and could equally hide a real store-open failure behind a
+  // "retention cleanup failed" message that never applies when there is no
+  // store to clean up. Cleanup failing never prevents the service from
+  // starting with an otherwise-working store.
+  if (store) {
+    try {
+      const cleanupResult = store.runRetentionCleanup();
+      if (cleanupResult.enabled) {
+        console.log(
+          `[store] retention cleanup removed ${cleanupResult.deletedCaptures} capture(s), ` +
+            `${cleanupResult.deletedSummaries} summary(ies), and ${cleanupResult.deletedProposals} proposal(s).`,
+        );
+      }
+    } catch (error) {
+      console.log(
+        `[store] retention cleanup failed (the store itself remains open and available): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log("Shutting down...");
     await service.close();
+    store?.close();
     await cleanupStateFiles();
     process.exit(0);
   };
 
-  const service = createService({ credentialToken: token, port, host: "127.0.0.1", onControlStop: shutdown });
+  const service = createService({ credentialToken: token, port, host: "127.0.0.1", store, onControlStop: shutdown });
   const address = await service.listen();
 
   await writeFile(portPath, String(address.port), "utf8");
