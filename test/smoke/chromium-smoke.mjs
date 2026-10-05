@@ -172,17 +172,25 @@ async function main() {
         `
         (async () => {
           const windows = await chrome.runtime.sendMessage({ method: "browser.list_windows" });
+          // Handle-consuming methods (list_tabs, read_tab) require a
+          // caller-supplied browserSessionId matching the extension's
+          // current session (project.md Stage 2); a real client obtains it
+          // from a prior result's envelope, exactly as done here.
+          const browserSessionId = windows?.browserSessionId;
           const tabs = await chrome.runtime.sendMessage({
             method: "browser.list_tabs",
             windowId: ${JSON.stringify(readableTab.windowId)},
+            browserSessionId,
           });
           const readableSnapshot = await chrome.runtime.sendMessage({
             method: "browser.read_tab",
             tabId: ${JSON.stringify(readableTab.id)},
+            browserSessionId,
           });
           const protectedSnapshot = await chrome.runtime.sendMessage({
             method: "browser.read_tab",
             tabId: ${JSON.stringify(protectedTab.id)},
+            browserSessionId,
           });
           const unknownMethodResult = await chrome.runtime.sendMessage({ method: "browser.not_a_real_method" });
           return { windows, tabs, readableSnapshot, protectedSnapshot, unknownMethodResult };
@@ -200,12 +208,15 @@ async function main() {
     // Product assertions: a failure here means the extension behaved
     // incorrectly, as distinct from the infrastructure blockers handled in
     // the catch block below.
-    if (!Array.isArray(outcome.windows) || outcome.windows.length === 0) {
+    if (outcome.windows?.status !== "ok" || !Array.isArray(outcome.windows.windows) || outcome.windows.windows.length === 0) {
       fail(`browser.list_windows returned no windows: ${JSON.stringify(outcome.windows)}`);
     }
+    if (typeof outcome.windows?.browserSessionId !== "string" || !outcome.windows.browserSessionId) {
+      fail(`browser.list_windows did not carry a browser-session identity: ${JSON.stringify(outcome.windows)}`);
+    }
 
-    const readableTabEntry = Array.isArray(outcome.tabs)
-      ? outcome.tabs.find((tab) => tab.tabId === readableTab.id)
+    const readableTabEntry = Array.isArray(outcome.tabs?.tabs)
+      ? outcome.tabs.tabs.find((tab) => tab.tabId === readableTab.id)
       : undefined;
     if (!readableTabEntry) {
       fail(`browser.list_tabs did not include the fixture tab: ${JSON.stringify(outcome.tabs)}`);

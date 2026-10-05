@@ -2,10 +2,78 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { WebSocketServer } from "ws";
 
-import { ERROR_CODES, HEARTBEAT_GRACE_MS, HEARTBEAT_INTERVAL_MS, PROTOCOL_VERSION, WS_MESSAGE_TYPES } from "../extension/protocol.js";
+import {
+  ERROR_CODES,
+  HEARTBEAT_GRACE_MS,
+  HEARTBEAT_INTERVAL_MS,
+  MAX_RESPONSE_BYTES,
+  MAX_WS_MESSAGE_BYTES,
+  PROTOCOL_VERSION,
+  RATE_LIMIT_MAX_REQUESTS,
+  RATE_LIMIT_WINDOW_MS,
+  WS_MESSAGE_TYPES,
+  validateMethodResult,
+} from "../extension/protocol.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
+
+// Reads a numeric query parameter. `null` (param absent) is passed through
+// as `undefined` so the extension side's own validation can distinguish
+// "not supplied" from a value, but an explicitly *empty* value (`?id=`) is
+// never silently coerced to 0 via `Number("")` — it becomes `NaN`, the same
+// as any other malformed numeric string, so it is rejected as
+// `invalid_params` there rather than accepted as a real handle.
+function numberParam(url, name) {
+  const raw = url.searchParams.get(name);
+  if (raw === null) return undefined;
+  if (raw === "") return NaN;
+  return Number(raw);
+}
+
+// Reads a string query parameter as-is (including an empty string, which
+// the extension side's own session-matching check already rejects as a
+// mismatch — no special-casing needed here).
+function stringParam(url, name) {
+  const raw = url.searchParams.get(name);
+  return raw === null ? undefined : raw;
+}
+
+// Stage 2: the allowlist of named browser.* methods exposed as GET
+// /api/<method> routes, each paired with how to read its parameters off the
+// query string. A `Map` (not a plain object or object literal) so route
+// lookup can never be confused with inherited `Object.prototype` members —
+// `/api/toString` or `/api/__proto__` simply have no entry and 404, rather
+// than resolving to a function and crashing when called as a route handler.
+// The extension side (extension/service-worker.js) owns the actual
+// parameter validation (project.md's trust-boundary convention already
+// established in Stage 1), so an absent or unparsable value is rejected
+// there as `invalid_params` rather than guessed at here.
+const API_ROUTES = new Map([
+  ["browser.list_windows", () => ({})],
+  [
+    "browser.list_tabs",
+    (url) => ({ windowId: numberParam(url, "windowId"), browserSessionId: stringParam(url, "browserSessionId") }),
+  ],
+  [
+    "browser.list_tab_groups",
+    (url) => ({ windowId: numberParam(url, "windowId"), browserSessionId: stringParam(url, "browserSessionId") }),
+  ],
+  [
+    "browser.read_tab",
+    (url) => ({ tabId: numberParam(url, "tabId"), browserSessionId: stringParam(url, "browserSessionId") }),
+  ],
+  [
+    "browser.query_history",
+    (url) => ({
+      startTime: numberParam(url, "startTime"),
+      endTime: numberParam(url, "endTime"),
+      maxResults: numberParam(url, "maxResults"),
+      cursor: numberParam(url, "cursor"),
+    }),
+  ],
+  ["browser.get_capabilities", () => ({})],
+]);
 
 // HTTP statuses for the stable transport-error codes a caller can receive
 // from the API route. Anything else is reported as a generic internal error
@@ -49,6 +117,17 @@ export function createService({
   authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS,
   heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
   heartbeatGraceMs = HEARTBEAT_GRACE_MS,
+  // Conservative request-rate and response-size bounds enforced at this
+  // service boundary (project.md Stage 2), independent of whatever an
+  // individual browser operation itself bounds. Overridable so tests can
+  // exercise both limits without waiting on production-sized windows.
+  rateLimitWindowMs = RATE_LIMIT_WINDOW_MS,
+  rateLimitMaxRequests = RATE_LIMIT_MAX_REQUESTS,
+  maxResponseBytes = MAX_RESPONSE_BYTES,
+  // Inbound WebSocket message cap, independent of (but deliberately sized
+  // around) `maxResponseBytes` above. Overridable so a test can exercise
+  // the bound directly without needing to send a multi-megabyte message.
+  maxWsMessageBytes = MAX_WS_MESSAGE_BYTES,
   // Invoked (not awaited) after a successful authenticated POST
   // /control/stop response has been flushed to the caller. The CLI wires
   // this to the same graceful-shutdown routine used for SIGINT/SIGTERM, so
@@ -61,6 +140,23 @@ export function createService({
   let extensionSocket = null;
   let extensionConnectedAt = null;
   let shuttingDown = false;
+
+  // Fixed-window counter shared across all API callers: this project's
+  // trust model is a single local user and one connected browser profile
+  // (project.md), so one global counter is sufficient conservative
+  // protection against a runaway or malicious local caller flooding the
+  // extension, without the complexity of per-client tracking.
+  let rateWindowStart = Date.now();
+  let rateWindowCount = 0;
+  function checkRateLimit() {
+    const now = Date.now();
+    if (now - rateWindowStart >= rateLimitWindowMs) {
+      rateWindowStart = now;
+      rateWindowCount = 0;
+    }
+    rateWindowCount += 1;
+    return rateWindowCount <= rateLimitMaxRequests;
+  }
 
   function checkAuth(req) {
     const header = req.headers.authorization;
@@ -123,7 +219,7 @@ export function createService({
     });
   }
 
-  async function handleListWindows(req, res) {
+  async function handleApiMethod(method, req, res, url) {
     const requestId = requestIdFor(req);
     const authFailure = checkAuth(req);
     if (authFailure) {
@@ -131,12 +227,74 @@ export function createService({
       return;
     }
 
+    // Checked after authentication (an unauthenticated caller already gets
+    // turned away above) but before the extension round trip: a flood of
+    // otherwise-valid requests is rejected here at the service boundary,
+    // never forwarded to the extension at all.
+    if (!checkRateLimit()) {
+      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
+      return;
+    }
+
+    // Guarded: a route's parameter-extraction function runs against a
+    // caller-controlled query string, and must never be allowed to crash
+    // the request handler even if it throws unexpectedly.
+    let params;
     try {
-      const result = await sendExtensionRequest("browser.list_windows", {});
-      respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result });
+      params = API_ROUTES.get(method)(url);
+    } catch (error) {
+      respondJson(res, 500, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        error: { code: ERROR_CODES.INTERNAL_ERROR, detail: error instanceof Error ? error.message : String(error) },
+      });
+      return;
+    }
+
+    try {
+      const result = await sendExtensionRequest(method, params);
+
+      // The extension sits at a trust boundary (project.md's trust model):
+      // its response is validated like any other untrusted input before
+      // ever being forwarded to an HTTP caller with a 200. A legacy
+      // (pre-Stage-2) shape, a result for the wrong method, or any other
+      // malformed envelope becomes an explicit error here instead of
+      // reaching a client as if it were trustworthy. Guarded so a defect in
+      // the validator itself can never crash the request handler either.
+      let validation;
+      try {
+        validation = validateMethodResult(method, result);
+      } catch (error) {
+        validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      if (!validation.valid) {
+        respondJson(res, 502, {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId,
+          error: { code: ERROR_CODES.INVALID_EXTENSION_RESPONSE, detail: validation.reason },
+        });
+        return;
+      }
+
+      const body = { protocolVersion: PROTOCOL_VERSION, requestId, result };
+      const payload = JSON.stringify(body);
+      // Defense in depth on top of the extension's own per-operation bounds
+      // (list/history page sizes, snapshot text length): rejects an
+      // unexpectedly oversized response here rather than ever writing it to
+      // the socket.
+      if (Buffer.byteLength(payload) > maxResponseBytes) {
+        respondJson(res, 502, {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId,
+          error: { code: ERROR_CODES.RESPONSE_TOO_LARGE },
+        });
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) });
+      res.end(payload);
     } catch (error) {
       const status = ERROR_STATUS[error.code] ?? 502;
-      const code = error.code in ERROR_STATUS ? error.code : "internal_error";
+      const code = error.code in ERROR_STATUS ? error.code : ERROR_CODES.INTERNAL_ERROR;
       const body = { protocolVersion: PROTOCOL_VERSION, requestId, error: { code } };
       if (!(error.code in ERROR_STATUS)) body.error.detail = error.message;
       respondJson(res, status, body);
@@ -173,22 +331,50 @@ export function createService({
       return;
     }
 
-    if (req.method === "GET" && req.url === "/health") {
+    // Guarded: `req.url` is the raw, caller-controlled HTTP request target,
+    // and `new URL(...)` throws `ERR_INVALID_URL` for a malformed one (e.g.
+    // an invalid raw target like `//[`). That must become an explicit,
+    // bounded 400 response — never an uncaught exception that could crash
+    // the process — and must happen before any authentication or route
+    // dispatch is attempted.
+    let url;
+    try {
+      url = new URL(req.url, "http://127.0.0.1");
+    } catch (error) {
+      respondJson(res, 400, {
+        protocolVersion: PROTOCOL_VERSION,
+        error: { code: ERROR_CODES.INVALID_REQUEST, detail: error instanceof Error ? error.message : String(error) },
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
       handleHealth(req, res);
       return;
     }
-    if (req.method === "GET" && req.url === "/api/browser.list_windows") {
-      handleListWindows(req, res);
-      return;
-    }
-    if (req.method === "POST" && req.url === "/control/stop") {
+    if (req.method === "POST" && url.pathname === "/control/stop") {
       handleControlStop(req, res);
       return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/api/")) {
+      const method = url.pathname.slice("/api/".length);
+      if (API_ROUTES.has(method)) {
+        handleApiMethod(method, req, res, url);
+        return;
+      }
     }
     respondJson(res, 404, { protocolVersion: PROTOCOL_VERSION, error: { code: "not_found" } });
   });
 
-  const wss = new WebSocketServer({ noServer: true });
+  // `maxPayload` bounds a single inbound WebSocket message from the
+  // extension consistent with this service's own outbound response-size
+  // boundary (maxResponseBytes, defaulted from MAX_RESPONSE_BYTES) plus a
+  // small, fixed allowance for envelope/JSON framing overhead — so a
+  // misbehaving or compromised extension connection cannot force a huge
+  // buffer allocation merely by sending an oversized message; `ws` rejects
+  // and closes the connection itself once this is exceeded, before the
+  // message is ever fully buffered or parsed.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: maxWsMessageBytes });
 
   httpServer.on("upgrade", (req, socket, head) => {
     if (shuttingDown) {
@@ -216,6 +402,18 @@ export function createService({
     // fresh map, and this socket's eventual close only ever rejects entries
     // in *this* map (see sendExtensionRequest and the close handler below).
     ws.pendingRequests = new Map();
+
+    // Registered immediately, before any other listener: an unhandled
+    // 'error' event on a Node EventEmitter crashes the process, and `ws`
+    // emits one for socket-level faults including an inbound message that
+    // exceeds `maxPayload` above. The existing 'close' handler already
+    // performs all necessary cleanup (rejecting in-flight requests,
+    // clearing the heartbeat monitor) — 'close' always follows 'error' for
+    // a `ws` connection, so nothing further is needed here beyond not
+    // crashing.
+    ws.on("error", (error) => {
+      log(`extension websocket error: ${error instanceof Error ? error.message : String(error)}`);
+    });
 
     let authenticated = false;
     const authTimer = setTimeout(() => {

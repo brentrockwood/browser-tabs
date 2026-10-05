@@ -11,6 +11,11 @@
 //   1. Pairing via chrome.storage.local (as the options page would do).
 //   2. A real HTTP request -> service -> actual extension ->
 //      browser.list_windows round trip.
+//   2.5. Stage 2 read-API routes (capabilities, list_tabs, a real harness-
+//        created tab group, read_tab for an ordinary/protected/closed-stale/
+//        deliberately-slow-loading/best-effort-discarded tab, and
+//        two-entry paginated query_history), plus a stale-session rejection
+//        proof, exercised once over this connection, inline in main() below.
 //   3. The connection survives past the Manifest V3 service-worker idle
 //      window (default ~35s wait) thanks to the chosen Stage 1 checkpoint
 //      resolution: an authenticated ping/pong heartbeat no more than 20s
@@ -59,7 +64,11 @@
 //      same staged extension path while the service keeps running. The
 //      extension must reconnect using the persisted token — no
 //      re-pairing — proven via an authenticated browser.list_windows
-//      request, not merely CDP visibility.
+//      request, not merely CDP visibility. browserSessionId must also
+//      rotate (chrome.storage.session is cleared by the browser restart);
+//      the pre-restart session id must then be rejected as stale_session
+//      against an otherwise-valid post-restart handle, and the new session
+//      id must still work.
 //   6. A real (non-extension) browser page's WebSocket attempt to the
 //      service's /extension endpoint is rejected — the real browser sets
 //      the Origin header here, not a spoofed one.
@@ -90,6 +99,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_SERVICE_PORT,
+  ERROR_CODES,
   PROTOCOL_VERSION,
   RECONNECT_ALARM_DELAY_MINUTES,
   RECONNECT_ALARM_NAME,
@@ -128,6 +138,7 @@ const SERVICE_DOWNTIME_MS = Math.max(35_000, IDLE_WAIT_MS);
 // This is a generous *test* timeout, not a documented product SLA.
 const SERVICE_RESTART_RECOVERY_WAIT_MS = RECONNECT_ALARM_DELAY_MINUTES * 60_000 + 45_000;
 const DIAGNOSTICS_LIMIT = 20;
+const PROTECTED_URL = "chrome://version/";
 
 // Stages the same test-only harness page Stage 0 uses, so this test also
 // has a *persistent* extension page available — one that is not subject to
@@ -140,6 +151,23 @@ async function stageExtensionWithHarness(stagingRoot) {
   const harnessHtml = await readFile(HARNESS_FIXTURE_PATH, "utf8");
   await writeFile(join(stagingDir, "smoke-harness.html"), harnessHtml, "utf8");
   return stagingDir;
+}
+
+// A fixture server that deliberately holds its response open for
+// `delayMs`, so a tab pointed at it is still genuinely "loading" (not
+// merely assumed to be) at the moment read_tab is called against it —
+// test scaffolding only, not a product mutation.
+function startSlowFixtureServer(delayMs = 4000) {
+  return new Promise((resolve) => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.write("<html><body>loading...");
+      setTimeout(() => {
+        res.end("<p>done</p></body></html>");
+      }, delayMs);
+    });
+    server.listen(0, "127.0.0.1", () => resolve(server));
+  });
 }
 
 function fail(message) {
@@ -217,6 +245,22 @@ async function readClientState(cdp) {
   } catch (error) {
     return `(failed to read client state: ${error instanceof Error ? error.message : String(error)})`;
   }
+}
+
+// Diagnostic-only hook (extension/service-worker.js's
+// `globalThis.__browserTabsSessionId`), used here to learn the real
+// browserSessionId a client would otherwise have to obtain via a prior
+// get_capabilities/list_windows call — and, after a browser restart, to
+// prove it actually rotated (project.md Stage 2 remediation).
+async function readSessionId(swCdp) {
+  const value = await evaluate(
+    swCdp,
+    "(typeof globalThis.__browserTabsSessionId === 'function') ? globalThis.__browserTabsSessionId() : null",
+  );
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`could not read a valid browserSessionId via the diagnostic hook; got: ${JSON.stringify(value)}`);
+  }
+  return value;
 }
 
 // Wraps waitUntilExtensionConnected so a failure's error message includes
@@ -387,15 +431,180 @@ async function expectListWindows(port, token, label) {
   if (status !== 200) {
     throw new Error(`[${label}] expected 200 from browser.list_windows, got ${status}: ${JSON.stringify(json)}`);
   }
-  if (!Array.isArray(json.result) || json.result.length === 0) {
-    throw new Error(`[${label}] browser.list_windows returned no windows: ${JSON.stringify(json.result)}`);
+  const result = json.result;
+  if (result?.status !== "ok" || !Array.isArray(result.windows) || result.windows.length === 0) {
+    throw new Error(`[${label}] browser.list_windows returned no windows: ${JSON.stringify(result)}`);
   }
   for (const key of ["windowId", "focused", "type", "state", "tabCount"]) {
-    if (!(key in json.result[0])) {
-      throw new Error(`[${label}] window entry missing "${key}": ${JSON.stringify(json.result[0])}`);
+    if (!(key in result.windows[0])) {
+      throw new Error(`[${label}] window entry missing "${key}": ${JSON.stringify(result.windows[0])}`);
     }
   }
-  return json.result;
+  for (const key of ["browserSessionId", "sourceOperation", "capturedAt"]) {
+    if (!(key in result)) {
+      throw new Error(`[${label}] browser.list_windows result missing capture-provenance field "${key}": ${JSON.stringify(result)}`);
+    }
+  }
+  return result.windows;
+}
+
+// Stage 2 read-API proofs, exercised once over a proven connection (see
+// "Step 2.5" below) — deliberately kept separate from the Stage 1
+// idle/restart resilience steps, which exist to prove the *transport*, not
+// these routes.
+async function expectCapabilities(port, token) {
+  const { status, json } = await serviceRequest(port, "/api/browser.get_capabilities", { token });
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "ok") {
+    throw new Error(`browser.get_capabilities did not return an ok result: ${status} ${JSON.stringify(json)}`);
+  }
+  for (const key of ["tabGroups", "history", "scripting", "maxTextCharacters", "maxHistoryResults"]) {
+    if (!(key in result)) throw new Error(`browser.get_capabilities result missing "${key}": ${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
+function assertProvenance(label, result) {
+  for (const key of ["schemaVersion", "browserSessionId", "sourceOperation", "capturedAt", "status"]) {
+    if (!(key in result)) throw new Error(`[${label}] result missing capture-provenance field "${key}": ${JSON.stringify(result)}`);
+  }
+  if (typeof result.browserSessionId !== "string" || result.browserSessionId.length === 0) {
+    throw new Error(`[${label}] browserSessionId must be a non-empty string: ${JSON.stringify(result)}`);
+  }
+}
+
+async function expectListTabsIncludes(port, token, sessionId, windowId, expectedTabId) {
+  const { status, json } = await serviceRequest(port, `/api/browser.list_tabs?windowId=${windowId}&browserSessionId=${sessionId}`, { token });
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "ok" || !Array.isArray(result.tabs)) {
+    throw new Error(`browser.list_tabs did not return an ok result: ${status} ${JSON.stringify(json)}`);
+  }
+  assertProvenance("browser.list_tabs", result);
+  if (!result.tabs.some((tab) => tab.tabId === expectedTabId)) {
+    throw new Error(`browser.list_tabs did not include tab ${expectedTabId}: ${JSON.stringify(result.tabs)}`);
+  }
+}
+
+async function expectListTabsStaleSession(port, token, staleSessionId, windowId) {
+  const { status, json } = await serviceRequest(
+    port,
+    `/api/browser.list_tabs?windowId=${windowId}&browserSessionId=${staleSessionId}`,
+    { token },
+  );
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "error" || result?.code !== ERROR_CODES.STALE_SESSION) {
+    throw new Error(`browser.list_tabs with a stale session did not reject it explicitly: ${status} ${JSON.stringify(json)}`);
+  }
+}
+
+async function expectListTabGroups(port, token, sessionId, windowId, { supported }) {
+  const { status, json } = await serviceRequest(port, `/api/browser.list_tab_groups?windowId=${windowId}&browserSessionId=${sessionId}`, {
+    token,
+  });
+  const result = json?.result;
+  if (status !== 200) {
+    throw new Error(`browser.list_tab_groups returned HTTP ${status}: ${JSON.stringify(json)}`);
+  }
+  assertProvenance("browser.list_tab_groups", result);
+  if (supported) {
+    if (result?.status !== "ok" || !Array.isArray(result.groups)) {
+      throw new Error(`browser.list_tab_groups (capability reported as supported) did not return an ok result: ${JSON.stringify(result)}`);
+    }
+  } else if (result?.status !== "unsupported" || result?.code !== ERROR_CODES.UNSUPPORTED_FEATURE) {
+    throw new Error(
+      `browser.list_tab_groups (capability reported as unsupported) did not report the capability explicitly: ${JSON.stringify(result)}`,
+    );
+  }
+  return result;
+}
+
+async function expectReadTabOk(port, token, sessionId, tabId) {
+  const { status, json } = await serviceRequest(port, `/api/browser.read_tab?tabId=${tabId}&browserSessionId=${sessionId}`, { token });
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "ok" || typeof result.text !== "string") {
+    throw new Error(`browser.read_tab (ordinary page) did not return an ok snapshot: ${status} ${JSON.stringify(json)}`);
+  }
+  assertProvenance("browser.read_tab", result);
+  for (const key of ["url", "title", "documentReadyState", "characterCount", "returnedCharacterCount", "truncated", "windowId"]) {
+    if (!(key in result)) throw new Error(`browser.read_tab result missing "${key}": ${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
+async function expectReadTabProtected(port, token, sessionId, tabId) {
+  const { status, json } = await serviceRequest(port, `/api/browser.read_tab?tabId=${tabId}&browserSessionId=${sessionId}`, { token });
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "unsupported" || result?.code !== ERROR_CODES.INJECTION_REJECTED) {
+    throw new Error(`browser.read_tab (protected page) did not report the expected unsupported outcome: ${status} ${JSON.stringify(json)}`);
+  }
+}
+
+// Proves that a closed tab's handle is explicitly rejected rather than
+// silently retargeted (project.md Stage 2: "Reject stale tab and window
+// handles rather than silently targeting a replacement").
+async function expectReadTabStale(port, token, sessionId, tabId) {
+  const { status, json } = await serviceRequest(port, `/api/browser.read_tab?tabId=${tabId}&browserSessionId=${sessionId}`, { token });
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "error" || result?.code !== ERROR_CODES.STALE_HANDLE) {
+    throw new Error(`browser.read_tab (closed tab) did not reject the stale handle explicitly: ${status} ${JSON.stringify(json)}`);
+  }
+}
+
+// A tab still mid-navigation is caught before injection is even attempted
+// (tabs.get's own `status: "loading"`) and must report this exact,
+// deterministic outcome — not any explicit-but-unspecified one — since
+// readTab no longer calls scripting.executeScript (which could otherwise
+// block for the remainder of the page load, past the service's own HTTP
+// request timeout) against it at all.
+async function expectReadTabLoading(port, token, sessionId, tabId) {
+  const { status, json } = await serviceRequest(port, `/api/browser.read_tab?tabId=${tabId}&browserSessionId=${sessionId}`, { token });
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "not_ready" || result?.code !== ERROR_CODES.TAB_LOADING) {
+    throw new Error(`browser.read_tab (loading page) did not report the expected tab_loading outcome: ${status} ${JSON.stringify(json)}`);
+  }
+  assertProvenance("browser.read_tab (loading page)", result);
+  return result;
+}
+
+// Returns the outcome (whatever it is) rather than asserting a single
+// expected value, since the browser does not guarantee discarding a given
+// tab on request. The caller must still get back an explicit, well-formed,
+// recognized outcome — never an undefined/garbage shape — per project.md
+// Stage 2's "supported/unsupported/not-ready, never merely informational"
+// remediation.
+async function expectReadTabExplicitOutcome(port, token, sessionId, tabId, label) {
+  const { status, json } = await serviceRequest(port, `/api/browser.read_tab?tabId=${tabId}&browserSessionId=${sessionId}`, { token });
+  const result = json?.result;
+  if (status !== 200) throw new Error(`[${label}] browser.read_tab returned HTTP ${status}: ${JSON.stringify(json)}`);
+  assertProvenance(label, result);
+  if (!["ok", "unsupported", "not_ready", "error"].includes(result.status)) {
+    throw new Error(`[${label}] browser.read_tab returned an unrecognized status: ${JSON.stringify(result)}`);
+  }
+  if (result.status !== "ok" && !(typeof result.code === "string" && result.code.length > 0)) {
+    throw new Error(`[${label}] a non-ok browser.read_tab result must carry a non-empty code: ${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
+async function expectHistoryPage(port, token, { startTime, endTime, maxResults, cursor }) {
+  const cursorParam = cursor === undefined ? "" : `&cursor=${cursor}`;
+  const { status, json } = await serviceRequest(
+    port,
+    `/api/browser.query_history?startTime=${startTime}&endTime=${endTime}&maxResults=${maxResults}${cursorParam}`,
+    { token },
+  );
+  const result = json?.result;
+  if (status !== 200 || result?.status !== "ok" || !Array.isArray(result.entries)) {
+    throw new Error(`browser.query_history did not return an ok, bounded result: ${status} ${JSON.stringify(json)}`);
+  }
+  assertProvenance("browser.query_history", result);
+  if (result.entries.length > maxResults) {
+    throw new Error(`browser.query_history returned more than the requested maxResults: ${JSON.stringify(result)}`);
+  }
+  for (const key of ["returnedCount", "truncated", "nextCursor"]) {
+    if (!(key in result)) throw new Error(`browser.query_history result missing "${key}": ${JSON.stringify(result)}`);
+  }
+  return result;
 }
 
 async function connectCdpForPage(webSocketDebuggerUrl) {
@@ -454,6 +663,14 @@ async function main() {
   let cdpPort;
 
   try {
+    // Created once, up front, so it is available for Step 2.5's ordinary-
+    // page read_tab proof as well as Step 6's Origin-rejection proof after
+    // the browser restart; only the browser *tab* pointed at it needs to be
+    // recreated after a restart, not the Node HTTP server itself.
+    fixtureServer = await startFixtureServer();
+    const fixturePort = fixtureServer.address().port;
+    const fixtureUrl = `http://127.0.0.1:${fixturePort}/`;
+
     service = spawnService(serviceDataDir, port);
     const token = await waitForToken(service);
     await waitForHealth(port);
@@ -505,7 +722,140 @@ async function main() {
 
     // Step 2: a real HTTP request -> service -> actual extension ->
     // browser.list_windows round trip.
-    await expectListWindows(port, token, "initial request");
+    const windows = await expectListWindows(port, token, "initial request");
+    const targetWindowId = windows[0].windowId;
+
+    // Step 2.5: Stage 2 read-API routes, exercised once over this proven
+    // connection — deliberately kept separate from the idle/restart
+    // resilience steps below, which exist to prove Stage 1's transport
+    // specifically, not these routes.
+    console.log("exercising Stage 2 read-API routes (capabilities, tabs, groups, read_tab, history)...");
+    const capabilities = await expectCapabilities(port, token);
+    const sessionId = await readSessionId(swCdp);
+
+    const stage2Tab = await createAndWaitForTab(swCdp, fixtureUrl);
+    const protectedTab = await createAndWaitForTab(swCdp, PROTECTED_URL);
+
+    await expectListTabsIncludes(port, token, sessionId, targetWindowId, stage2Tab.id);
+
+    // Stale session: the same, still-open, still-valid windowId must be
+    // rejected explicitly when paired with a session id that is not the
+    // current one — before any numeric handle is even considered.
+    await expectListTabsStaleSession(port, token, "not-the-real-session", targetWindowId);
+
+    // Real tab-group scaffolding (harness mutation, not a product
+    // operation): create an actual group so the listing has something
+    // non-empty to find, when this browser supports tab groups at all.
+    if (capabilities.tabGroups) {
+      const groupTab = await createAndWaitForTab(swCdp, fixtureUrl);
+      const groupId = await evaluate(
+        swCdp,
+        `(async () => {
+          const id = await chrome.tabs.group({ tabIds: [${JSON.stringify(groupTab.id)}] });
+          await chrome.tabGroups.update(id, { title: "smoke-test-group" });
+          return id;
+        })()`,
+      );
+      const groupsResult = await expectListTabGroups(port, token, sessionId, targetWindowId, { supported: true });
+      if (!groupsResult.groups.some((group) => group.groupId === groupId)) {
+        fail(`browser.list_tab_groups did not include the harness-created group ${groupId}: ${JSON.stringify(groupsResult.groups)}`);
+        return;
+      }
+      await evaluate(swCdp, `chrome.tabs.ungroup(${JSON.stringify(groupTab.id)})`).catch(() => {});
+      await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(groupTab.id)})`).catch(() => {});
+    } else {
+      await expectListTabGroups(port, token, sessionId, targetWindowId, { supported: false });
+      console.log("tabGroups capability not reported by this browser; skipping the real-group listing proof.");
+    }
+
+    await expectReadTabOk(port, token, sessionId, stage2Tab.id);
+    await expectReadTabProtected(port, token, sessionId, protectedTab.id);
+
+    // Stale handle: close the tab, then confirm the handle is explicitly
+    // rejected rather than silently retargeted (project.md Stage 2).
+    await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(stage2Tab.id)})`);
+    await expectReadTabStale(port, token, sessionId, stage2Tab.id);
+    await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(protectedTab.id)})`).catch(() => {});
+
+    // Deliberately slow-loading page: a fixture server that holds the
+    // response open past the point read_tab is called, so the tab is
+    // genuinely still loading when queried, and the explicit result (not a
+    // guess) is asserted.
+    const slowServer = await startSlowFixtureServer();
+    try {
+      const slowPort = slowServer.address().port;
+      const slowUrl = `http://127.0.0.1:${slowPort}/`;
+      const slowTab = await evaluate(swCdp, `chrome.tabs.create(${JSON.stringify({ url: slowUrl, active: false })})`);
+      const loadingResult = await expectReadTabLoading(port, token, sessionId, slowTab.id);
+      console.log(`slow-loading page read_tab outcome: status=${loadingResult.status}, code=${loadingResult.code}`);
+      await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(slowTab.id)})`).catch(() => {});
+    } finally {
+      await closeFixtureServer(slowServer);
+    }
+
+    // Discarded tab: Chrome does not guarantee discarding a given tab on
+    // request (e.g. it may refuse to discard a very recently created or
+    // focused tab), so only the *request to discard* is treated as
+    // best-effort and caught below. Once a discard is actually confirmed,
+    // the resulting read_tab outcome is asserted unguarded (outside any
+    // catch): a malformed or failed outcome at that point is a real product
+    // failure, not an infrastructure hiccup, and must fail this smoke test
+    // rather than being logged as "non-fatal" and silently passed over.
+    let discardTab;
+    let discardConfirmed = false;
+    try {
+      discardTab = await createAndWaitForTab(swCdp, fixtureUrl);
+      const discarded = await evaluate(
+        swCdp,
+        `(async () => { try { return await chrome.tabs.discard(${JSON.stringify(discardTab.id)}); } catch (error) { return null; } })()`,
+      );
+      discardConfirmed = Boolean(discarded && discarded.discarded);
+    } catch (error) {
+      console.log(`unable to request/confirm discard (non-fatal): ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (discardConfirmed) {
+      const discardedResult = await expectReadTabExplicitOutcome(port, token, sessionId, discardTab.id, "discarded tab");
+      console.log(`discarded-tab read_tab outcome: status=${discardedResult.status}`);
+    } else {
+      console.log("the browser did not discard the tab on request (or the request/confirmation itself failed); skipping the discarded-tab read_tab assertion.");
+    }
+    if (discardTab) await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(discardTab.id)})`).catch(() => {});
+
+    if (capabilities.history) {
+      // Harness mutation (test setup only, not a product operation):
+      // deterministically create at least two distinct history entries so
+      // pagination has something real to page through, then page through
+      // them one at a time via the offset cursor.
+      const now = Date.now();
+      const historyUrls = [`${fixtureUrl}?smoke-history=1`, `${fixtureUrl}?smoke-history=2`];
+      for (const url of historyUrls) {
+        await evaluate(swCdp, `chrome.history.addUrl({ url: ${JSON.stringify(url)} })`);
+      }
+      try {
+        const firstPage = await expectHistoryPage(port, token, { startTime: 0, endTime: now + 60_000, maxResults: 1 });
+        if (firstPage.entries.length !== 1 || firstPage.nextCursor === null) {
+          fail(`expected a single-entry first history page with a further page available: ${JSON.stringify(firstPage)}`);
+          return;
+        }
+        const secondPage = await expectHistoryPage(port, token, {
+          startTime: 0,
+          endTime: now + 60_000,
+          maxResults: 1,
+          cursor: firstPage.nextCursor,
+        });
+        if (secondPage.entries.length !== 1 || secondPage.entries[0].url === firstPage.entries[0].url) {
+          fail(`expected the second history page to return a different entry than the first: ${JSON.stringify({ firstPage, secondPage })}`);
+          return;
+        }
+      } finally {
+        for (const url of historyUrls) {
+          await evaluate(swCdp, `chrome.history.deleteUrl({ url: ${JSON.stringify(url)} })`).catch(() => {});
+        }
+      }
+    } else {
+      console.log("history capability not reported by this browser; skipping the paginated-history proof.");
+    }
 
     // Detach from the service worker's own CDP target *before* the idle
     // wait, and do not reattach until a later step genuinely needs it
@@ -659,22 +1009,56 @@ async function main() {
     // The actual proof: reconnect using the *persisted* token (nothing
     // here re-pairs), and a real authenticated request succeeds. Failure
     // here is the product failure this step exists to catch.
+    let windowsAfterRestart;
     try {
       await waitUntilExtensionConnectedOrDiagnose(port, RECONNECT_WAIT_MS, () => swCdp, diagnostics);
-      await expectListWindows(port, token, "request after browser restart");
+      windowsAfterRestart = await expectListWindows(port, token, "request after browser restart");
     } catch (error) {
       fail(`[browser restart] ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
 
+    // Session rotation across a full browser restart (project.md Stage 2
+    // remediation): browserSessionId is backed by chrome.storage.session,
+    // which the browser itself clears on restart, so a fresh worker
+    // incarnation here must mint a new one — never reuse the pre-restart id.
+    const sessionIdAfterRestart = await readSessionId(swCdp);
+    if (sessionIdAfterRestart === sessionId) {
+      fail(
+        `[browser restart] browserSessionId did not rotate across a full browser restart (still "${sessionId}"); ` +
+          "chrome.storage.session should have been cleared, forcing a fresh id.",
+      );
+      return;
+    }
+
+    const windowIdAfterRestart = windowsAfterRestart[0].windowId;
+
+    // The pre-restart session id, paired with a handle that is still
+    // otherwise perfectly valid in the new session, must be rejected
+    // explicitly rather than silently honored against the new session's
+    // state.
+    await expectListTabsStaleSession(port, token, sessionId, windowIdAfterRestart);
+
+    // The new session id, used correctly, must still work normally: a
+    // refetch succeeds with an "ok" result.
+    const refetched = await serviceRequest(
+      port,
+      `/api/browser.list_tabs?windowId=${windowIdAfterRestart}&browserSessionId=${sessionIdAfterRestart}`,
+      { token },
+    );
+    if (refetched.status !== 200 || refetched.json?.result?.status !== "ok") {
+      fail(
+        `[browser restart] browser.list_tabs with the new (post-restart) session id did not succeed: ` +
+          `${refetched.status} ${JSON.stringify(refetched.json)}`,
+      );
+      return;
+    }
+
     // Step 6: confirm real Origin behavior from an actual (non-extension)
     // browser page — the browser sets this Origin header; nothing in this
-    // script constructs or spoofs it. The fixture page is recreated here
-    // (via the now-current swCdp) since the one from before the restart
-    // no longer exists.
-    fixtureServer = await startFixtureServer();
-    const fixturePort = fixtureServer.address().port;
-    const fixtureUrl = `http://127.0.0.1:${fixturePort}/`;
+    // script constructs or spoofs it. Only the browser *tab* is recreated
+    // here (via the now-current swCdp); the fixture HTTP server itself was
+    // created once up front and survived the browser restart untouched.
     const fixtureTab = await createAndWaitForTab(swCdp, fixtureUrl);
     fixtureTabId = fixtureTab.id;
     const fixturePageTarget = await findPageTarget(cdpPort, fixtureUrl);
@@ -717,10 +1101,13 @@ async function main() {
     if (process.exitCode !== 1) {
       console.log(
         "SMOKE_PASS: storage.local pairing, an authenticated HTTP->service->extension->browser.list_windows " +
-          `round trip, survival past a ${IDLE_WAIT_MS}ms idle wait via the heartbeat, the durable reconnect alarm ` +
+          `round trip, Stage 2 read-API routes (capabilities, tabs, a real tab group, read_tab outcomes including ` +
+          "protected/stale/slow-loading/best-effort-discarded, two-entry paginated history, and stale-session " +
+          `rejection), survival past a ${IDLE_WAIT_MS}ms idle wait via the heartbeat, the durable reconnect alarm ` +
           "being registered with the expected schedule before a service restart, automatic reconnect after that " +
-          "restart and after a full browser restart (neither requiring re-pairing), and a real browser page's " +
-          "Origin header being rejected, all behaved as expected.",
+          "restart and after a full browser restart (neither requiring re-pairing), browserSessionId rotating " +
+          "across that browser restart with the old session rejected and the new one working, and a real browser " +
+          "page's Origin header being rejected, all behaved as expected.",
       );
     }
   } catch (error) {

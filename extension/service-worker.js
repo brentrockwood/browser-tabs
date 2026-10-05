@@ -1,43 +1,271 @@
 import {
+  DEFAULT_HISTORY_MAX_RESULTS,
   ERROR_CODES,
+  MAX_HISTORY_RESULTS,
+  MAX_HISTORY_SCAN,
+  MAX_TAB_GROUPS_RETURNED,
+  MAX_TABS_RETURNED,
   MAX_TEXT_CHARACTERS,
-  SNAPSHOT_SCHEMA_VERSION,
+  MAX_WINDOWS_RETURNED,
+  PROTOCOL_VERSION,
+  captureEnvelope,
+  compareHistoryEntries,
   isValidHandle,
+  isValidSessionId,
+  isValidTimestamp,
+  normalizeHistoryEntry,
   normalizeTab,
+  normalizeTabGroup,
   normalizeWindow,
   pageTextSnapshot,
   requestError,
-  unsupportedSnapshot,
 } from "./protocol.js";
 import { createServiceClient } from "./service-client.js";
 
 const browserApi = globalThis.browser ?? globalThis.chrome;
 
+function generateSessionId() {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  // Fallback for test/runtime environments without the Web Crypto API.
+  return `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+// Identifies this browser session (project.md protocol rules: every browser
+// record carries a browser-session identifier), persisted across Manifest V3
+// service-worker eviction via `chrome.storage.session` — in-memory storage
+// the browser itself clears on a full browser restart, which is exactly the
+// "rotate on browser restart" behavior wanted here: no separate rotation
+// logic is needed, because the storage backing it is already scoped to one
+// browser session.
+//
+// Falls back to a per-worker-load, non-persisted id when `storage.session`
+// is unavailable (e.g. this module's own unit tests, or a future runtime
+// without session storage). That fallback is safe but weaker: such a
+// worker's id may also appear to rotate on mere worker eviction, not only a
+// full browser restart — any caller holding a handle across that eviction
+// simply gets an explicit `stale_session` rejection and must refetch, the
+// same outcome as a genuine restart, never a silent misattribution.
+async function getOrCreateSessionId() {
+  const sessionStorage = browserApi.storage?.session;
+  if (sessionStorage) {
+    try {
+      const stored = await sessionStorage.get(["browserSessionId"]);
+      if (typeof stored.browserSessionId === "string" && stored.browserSessionId.length > 0) {
+        return stored.browserSessionId;
+      }
+      const fresh = generateSessionId();
+      await sessionStorage.set({ browserSessionId: fresh });
+      return fresh;
+    } catch {
+      // Fall through to the ephemeral fallback below.
+    }
+  }
+  return generateSessionId();
+}
+
+// Deliberately NOT awaited at module top level: Manifest V3 requires a
+// service worker's event listeners (runtime.onMessage.addListener below,
+// the alarms/storage listeners further down) to be registered during the
+// first, synchronous turn of module evaluation, or Chrome may never
+// recognize the worker as ready (observed as "could not locate the
+// extension's service worker" in both smoke tests after this module grew a
+// top-level `await getOrCreateSessionId()`). `browserSessionId` therefore
+// starts `null` and is filled in once `sessionReady` resolves; every
+// exported browser operation below awaits `sessionReady` as its first
+// statement, before any envelope/checkSession use, instead of the module
+// doing so at the top level.
+let browserSessionId = null;
+const sessionReady = getOrCreateSessionId().then((id) => {
+  browserSessionId = id;
+});
+
+function envelope(sourceOperation, status) {
+  return captureEnvelope(browserSessionId, sourceOperation, status);
+}
+
+function errMsg(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function errorResult(sourceOperation, code, detail) {
+  return { ...envelope(sourceOperation, "error"), ...requestError(code, detail) };
+}
+
+// Every handle-consuming method (list_tabs, list_tab_groups, read_tab) must
+// reject a missing or mismatched caller-supplied browserSessionId as a
+// stale session *before* resolving any numeric window/tab handle — a stale
+// or absent session is never silently retargeted at whatever the current
+// session's handles happen to mean.
+function checkSession(op, callerSessionId) {
+  if (!isValidSessionId(callerSessionId) || callerSessionId !== browserSessionId) {
+    return errorResult(op, ERROR_CODES.STALE_SESSION, "browserSessionId is missing or does not match the current browser session");
+  }
+  return null;
+}
+
+// Confirms a window handle still resolves before trusting it for a listing
+// or capability query. Window/tab IDs are session-scoped handles (project.md
+// protocol rules), never array positions or durable identities: a stale one
+// must be rejected explicitly, not silently retargeted at whatever a
+// looser query (e.g. tabs.query({windowId})) happens to match.
+async function assertWindowExists(windowId) {
+  await browserApi.windows.get(windowId);
+}
+
 export async function listWindows() {
+  await sessionReady;
+  const op = "browser.list_windows";
   try {
-    const windows = await browserApi.windows.getAll({ populate: true });
-    return windows.map(normalizeWindow);
+    const all = await browserApi.windows.getAll({ populate: true });
+    const truncated = all.length > MAX_WINDOWS_RETURNED;
+    const windows = all.slice(0, MAX_WINDOWS_RETURNED).map(normalizeWindow);
+    return {
+      ...envelope(op, "ok"),
+      windows,
+      returnedCount: windows.length,
+      totalCount: all.length,
+      truncated,
+    };
   } catch (error) {
-    return requestError(ERROR_CODES.LISTING_FAILED, error instanceof Error ? error.message : String(error));
+    return errorResult(op, ERROR_CODES.LISTING_FAILED, errMsg(error));
   }
 }
 
-export async function listTabs(windowId) {
+export async function listTabs(windowId, callerSessionId) {
+  await sessionReady;
+  const op = "browser.list_tabs";
+  const sessionError = checkSession(op, callerSessionId);
+  if (sessionError) return sessionError;
+
   if (!isValidHandle(windowId)) {
-    return requestError(ERROR_CODES.INVALID_PARAMS, "windowId must be a non-negative safe integer");
+    return errorResult(op, ERROR_CODES.INVALID_PARAMS, "windowId must be a non-negative safe integer");
   }
 
   try {
-    const tabs = await browserApi.tabs.query({ windowId });
-    return tabs.map(normalizeTab);
+    await assertWindowExists(windowId);
   } catch (error) {
-    return requestError(ERROR_CODES.LISTING_FAILED, error instanceof Error ? error.message : String(error));
+    return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
+  }
+
+  try {
+    const all = await browserApi.tabs.query({ windowId });
+    const truncated = all.length > MAX_TABS_RETURNED;
+    const tabs = all.slice(0, MAX_TABS_RETURNED).map(normalizeTab);
+    return {
+      ...envelope(op, "ok"),
+      windowId,
+      tabs,
+      returnedCount: tabs.length,
+      totalCount: all.length,
+      truncated,
+    };
+  } catch (error) {
+    return errorResult(op, ERROR_CODES.LISTING_FAILED, errMsg(error));
   }
 }
 
-export async function readTab(tabId) {
+// Tab groups are not universally supported (a browser's current version may
+// lack a tabGroups API entirely — Firefox, as of this writing). The handle
+// itself is validated (session, then window existence) *before* the
+// capability check below, so a stale/invalid window is never reported as
+// merely "unsupported" — a caller can tell apart "your handle is no good"
+// from "this browser can't do this" even when both would be true.
+export async function listTabGroups(windowId, callerSessionId) {
+  await sessionReady;
+  const op = "browser.list_tab_groups";
+  const sessionError = checkSession(op, callerSessionId);
+  if (sessionError) return sessionError;
+
+  if (!isValidHandle(windowId)) {
+    return errorResult(op, ERROR_CODES.INVALID_PARAMS, "windowId must be a non-negative safe integer");
+  }
+
+  try {
+    await assertWindowExists(windowId);
+  } catch (error) {
+    return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
+  }
+
+  if (!browserApi.tabGroups) {
+    return {
+      ...envelope(op, "unsupported"),
+      windowId,
+      code: ERROR_CODES.UNSUPPORTED_FEATURE,
+      detail: "tabGroups API is not available in this browser",
+    };
+  }
+
+  try {
+    const all = await browserApi.tabGroups.query({ windowId });
+    const truncated = all.length > MAX_TAB_GROUPS_RETURNED;
+    const groups = all.slice(0, MAX_TAB_GROUPS_RETURNED).map(normalizeTabGroup);
+    return {
+      ...envelope(op, "ok"),
+      windowId,
+      groups,
+      returnedCount: groups.length,
+      totalCount: all.length,
+      truncated,
+    };
+  } catch (error) {
+    return errorResult(op, ERROR_CODES.TAB_GROUPS_QUERY_FAILED, errMsg(error));
+  }
+}
+
+// Validates the object returned by the injected pageTextSnapshot function
+// (extension/protocol.js) before any of its fields are accessed. That
+// function is our own trusted code, but its return value crosses a
+// serialization boundary (scripting.executeScript) and must not be assumed
+// well-formed — a malformed result must become an explicit error result,
+// never an accessed-undefined-field exception that rejects readTab's
+// promise (see ERROR_CODES.INVALID_EXTENSION_RESPONSE's doc comment).
+function isValidSnapshotResult(result) {
+  if (result === null || typeof result !== "object") return false;
+  if (result.status === "not_ready") {
+    return typeof result.code === "string" && result.code.length > 0;
+  }
+  if (result.status === "ok") {
+    return (
+      typeof result.text === "string" &&
+      typeof result.url === "string" &&
+      typeof result.title === "string" &&
+      typeof result.documentReadyState === "string" &&
+      Number.isInteger(result.characterCount) &&
+      typeof result.truncated === "boolean"
+    );
+  }
+  return false;
+}
+
+export async function readTab(tabId, callerSessionId) {
+  await sessionReady;
+  const op = "browser.read_tab";
+  const sessionError = checkSession(op, callerSessionId);
+  if (sessionError) return sessionError;
+
   if (!isValidHandle(tabId)) {
-    return requestError(ERROR_CODES.INVALID_PARAMS, "tabId must be a non-negative safe integer");
+    return errorResult(op, ERROR_CODES.INVALID_PARAMS, "tabId must be a non-negative safe integer");
+  }
+
+  // Confirmed to exist before injection is attempted, so a closed tab is
+  // rejected explicitly as a stale handle rather than producing whatever
+  // ambiguous error scripting.executeScript happens to throw for an ID that
+  // no longer resolves to anything.
+  let tabInfo;
+  try {
+    tabInfo = await browserApi.tabs.get(tabId);
+  } catch (error) {
+    return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
+  }
+  const windowId = tabInfo.windowId;
+
+  // Caught before injection is attempted at all: scripting.executeScript on
+  // a tab still mid-navigation can block for the remainder of that
+  // navigation (observed hanging a real slow-loading page well past the
+  // service's HTTP request timeout) rather than failing fast. tabs.get's
+  // own `status` already tells us this without needing to inject anything.
+  if (tabInfo.status === "loading") {
+    return { ...envelope(op, "not_ready"), tabId, windowId, code: ERROR_CODES.TAB_LOADING };
   }
 
   let injections;
@@ -48,27 +276,165 @@ export async function readTab(tabId) {
       args: [MAX_TEXT_CHARACTERS, ERROR_CODES.DOCUMENT_HAS_NO_BODY],
     });
   } catch (error) {
-    return unsupportedSnapshot(
+    return {
+      ...envelope(op, "unsupported"),
       tabId,
-      ERROR_CODES.INJECTION_REJECTED,
-      error instanceof Error ? error.message : String(error),
-    );
+      windowId,
+      code: ERROR_CODES.INJECTION_REJECTED,
+      detail: errMsg(error),
+    };
   }
 
   if (!Array.isArray(injections) || injections.length === 0) {
-    return unsupportedSnapshot(tabId, ERROR_CODES.NO_INJECTION_RESULT);
+    return { ...envelope(op, "unsupported"), tabId, windowId, code: ERROR_CODES.NO_INJECTION_RESULT };
   }
 
   const result = injections[0]?.result;
   if (!result) {
-    return unsupportedSnapshot(tabId, ERROR_CODES.NO_MAIN_FRAME_RESULT);
+    return { ...envelope(op, "unsupported"), tabId, windowId, code: ERROR_CODES.NO_MAIN_FRAME_RESULT };
   }
 
-  // `result` was produced by code running in the page's world; a page can
-  // never be trusted to not shadow fields. Spread it first so the trusted
-  // envelope fields always win, even if `result` happens to contain keys
-  // named `schemaVersion` or `tabId`.
-  return { ...result, schemaVersion: SNAPSHOT_SCHEMA_VERSION, tabId };
+  if (!isValidSnapshotResult(result)) {
+    return {
+      ...envelope(op, "error"),
+      tabId,
+      windowId,
+      code: ERROR_CODES.INVALID_EXTENSION_RESPONSE,
+      detail: "the injected page-snapshot function returned an unexpected shape",
+    };
+  }
+
+  if (result.status === "not_ready") {
+    return { ...envelope(op, "not_ready"), tabId, windowId, code: result.code };
+  }
+
+  return {
+    ...envelope(op, "ok"),
+    tabId,
+    windowId,
+    url: result.url,
+    title: result.title,
+    documentReadyState: result.documentReadyState,
+    text: result.text,
+    characterCount: result.characterCount,
+    returnedCharacterCount: result.text.length,
+    truncated: result.truncated,
+  };
+}
+
+// Queries browsing-history metadata, kept deliberately separate from open
+// tabs (project.md Stage 2). startTime/endTime are required so a caller
+// always states an explicit range rather than implicitly querying all
+// history; maxResults is bounded.
+//
+// `cursor` is a plain offset into a deterministic sort (compareHistoryEntries
+// in extension/protocol.js) of chrome.history.search's own results for
+// [startTime, endTime] — not a timestamp.
+//
+// Every page for a given [startTime, endTime] range re-fetches the *same*
+// bounded scan set — up to MAX_HISTORY_SCAN entries, regardless of `offset`
+// or `maxResults` — and sorts that whole set deterministically before
+// slicing out the requested page. This is deliberate: chrome.history.search
+// does not guarantee a stable relative order for entries sharing the exact
+// same `lastVisitTime` across *differently-sized* `maxResults` requests (a
+// LIMIT-N query's tie-breaking is not guaranteed consistent for different
+// N), so an earlier design that requested a page-size-dependent amount
+// (`offset + pageSize + 1`) could duplicate or skip tied entries across
+// pages. Requesting the identical MAX_HISTORY_SCAN-sized set every time, and
+// only ever slicing after sorting that one set, removes that inconsistency
+// entirely: the same input always sorts to the same output.
+//
+// This does not protect against *history changing between two page
+// requests* (a new visit recorded, or an existing one re-visited, between
+// fetching page 1 and page 2) — that is an inherent limitation of stateless,
+// non-transactional pagination over a live, mutable data source, not a bug;
+// see README.md's "History pagination" section.
+export async function queryHistory({ startTime, endTime, maxResults, cursor } = {}) {
+  await sessionReady;
+  const op = "browser.query_history";
+  if (!browserApi.history) {
+    return { ...envelope(op, "unsupported"), code: ERROR_CODES.UNSUPPORTED_FEATURE, detail: "history API is not available in this browser" };
+  }
+
+  if (!isValidTimestamp(startTime) || !isValidTimestamp(endTime) || startTime > endTime) {
+    return errorResult(
+      op,
+      ERROR_CODES.INVALID_PARAMS,
+      "startTime and endTime are required, must be non-negative numbers (ms since epoch), and startTime must not exceed endTime",
+    );
+  }
+
+  const pageSize = maxResults === undefined ? DEFAULT_HISTORY_MAX_RESULTS : maxResults;
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_HISTORY_RESULTS) {
+    return errorResult(op, ERROR_CODES.INVALID_PARAMS, `maxResults must be an integer between 1 and ${MAX_HISTORY_RESULTS}`);
+  }
+
+  const offset = cursor === undefined ? 0 : cursor;
+  if (!isValidHandle(offset)) {
+    return errorResult(op, ERROR_CODES.INVALID_PARAMS, "cursor must be a non-negative safe integer offset");
+  }
+
+  if (offset >= MAX_HISTORY_SCAN) {
+    return {
+      ...envelope(op, "incomplete"),
+      code: ERROR_CODES.PAGINATION_LIMIT_REACHED,
+      detail: `cursor offset ${offset} is at or beyond the ${MAX_HISTORY_SCAN}-entry scan ceiling for a single query_history page`,
+    };
+  }
+
+  try {
+    const fetched = await browserApi.history.search({ text: "", startTime, endTime, maxResults: MAX_HISTORY_SCAN });
+    const sorted = [...fetched].sort(compareHistoryEntries);
+    const scannedEverything = sorted.length < MAX_HISTORY_SCAN;
+
+    if (!scannedEverything && offset + pageSize >= sorted.length) {
+      // The scan ceiling was reached (the browser had at least
+      // MAX_HISTORY_SCAN matching entries), and this page's end touches or
+      // exceeds the boundary of what was actually scanned — so neither this
+      // page's full content nor whether a further page exists beyond it can
+      // be determined reliably. Reported explicitly rather than silently
+      // returning a possibly-incomplete "ok" page.
+      return {
+        ...envelope(op, "incomplete"),
+        code: ERROR_CODES.PAGINATION_LIMIT_REACHED,
+        detail: `the ${MAX_HISTORY_SCAN}-entry scan ceiling was reached before a complete page at offset ${offset} could be determined`,
+      };
+    }
+
+    const page = sorted.slice(offset, offset + pageSize);
+    const hasMore = sorted.length > offset + pageSize;
+    return {
+      ...envelope(op, "ok"),
+      startTime,
+      endTime,
+      entries: page.map(normalizeHistoryEntry),
+      returnedCount: page.length,
+      truncated: hasMore,
+      nextCursor: hasMore ? offset + pageSize : null,
+    };
+  } catch (error) {
+    return errorResult(op, ERROR_CODES.HISTORY_QUERY_FAILED, errMsg(error));
+  }
+}
+
+// Lets a client check what this browser supports before calling a
+// capability-dependent method, instead of inferring support from brand name
+// (project.md Stage 2).
+export async function getCapabilities() {
+  await sessionReady;
+  const op = "browser.get_capabilities";
+  return {
+    ...envelope(op, "ok"),
+    protocolVersion: PROTOCOL_VERSION,
+    tabGroups: Boolean(browserApi.tabGroups),
+    history: Boolean(browserApi.history),
+    scripting: Boolean(browserApi.scripting),
+    maxTextCharacters: MAX_TEXT_CHARACTERS,
+    maxWindowsReturned: MAX_WINDOWS_RETURNED,
+    maxTabsReturned: MAX_TABS_RETURNED,
+    maxTabGroupsReturned: MAX_TAB_GROUPS_RETURNED,
+    maxHistoryResults: MAX_HISTORY_RESULTS,
+  };
 }
 
 // Shared by the extension's own runtime.onMessage listener and by requests
@@ -79,11 +445,26 @@ export async function routeMessage(message) {
     case "browser.list_windows":
       return listWindows();
     case "browser.list_tabs":
-      return listTabs(message.windowId);
+      return listTabs(message.windowId, message.browserSessionId);
+    case "browser.list_tab_groups":
+      return listTabGroups(message.windowId, message.browserSessionId);
     case "browser.read_tab":
-      return readTab(message.tabId);
+      return readTab(message.tabId, message.browserSessionId);
+    case "browser.query_history":
+      return queryHistory({
+        startTime: message.startTime,
+        endTime: message.endTime,
+        maxResults: message.maxResults,
+        cursor: message.cursor,
+      });
+    case "browser.get_capabilities":
+      return getCapabilities();
     default:
-      return requestError(ERROR_CODES.UNKNOWN_METHOD, message?.method);
+      return errorResult(
+        typeof message?.method === "string" ? message.method : "unknown",
+        ERROR_CODES.UNKNOWN_METHOD,
+        message?.method,
+      );
   }
 }
 
@@ -97,6 +478,12 @@ if (browserApi.storage?.local) {
     storage: browserApi.storage.local,
     routeMessage,
     alarms: browserApi.alarms,
+    // Used only if routeMessage itself rejects (a product bug, not an
+    // expected outcome) — see service-client.js's catch handler — so that
+    // even that failure mode still produces a valid capture-provenance
+    // envelope instead of a second, unrelated validation failure masking
+    // the original error.
+    getBrowserSessionId: () => browserSessionId,
   });
   serviceClient.start();
   browserApi.storage.onChanged?.addListener((changes, areaName) =>
@@ -127,4 +514,9 @@ if (browserApi.storage?.local) {
   // times out, so a failure can be classified instead of only showing a
   // final boolean. Not read by any product code path.
   globalThis.__browserTabsServiceClientState = () => serviceClient.getState();
+  // Diagnostic-only, same rationale as above: lets a smoke test read the
+  // current browser-session id directly (e.g. to confirm it rotates across
+  // a full browser restart) without depending on a particular API call's
+  // result shape.
+  globalThis.__browserTabsSessionId = () => browserSessionId;
 }

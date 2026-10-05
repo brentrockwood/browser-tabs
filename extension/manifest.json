@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Browser Tabs (Deterministic Prototype)",
   "version": "0.1.0",
-  "description": "Enumerates browser windows and tabs and reads explicit page-text snapshots.",
-  "permissions": ["tabs", "scripting", "storage", "alarms"],
+  "description": "Enumerates browser windows, tabs, and tab groups, reads explicit page-text snapshots, and queries browsing history.",
+  "permissions": ["tabs", "scripting", "storage", "alarms", "tabGroups", "history"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "service-worker.js",

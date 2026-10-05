@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 
 import { createServiceClient as createUntrackedServiceClient, SERVICE_URL } from "../extension/service-client.js";
+import { ERROR_CODES, PROTOCOL_VERSION, RESULT_SCHEMA_VERSION } from "../extension/protocol.js";
 
 // Wraps createServiceClient so every client this file creates is tracked
 // and stopped after each test, regardless of pass/fail. Several tests reach
@@ -87,7 +88,7 @@ async function authenticate(ws, token = "tok-123") {
   const authMessage = ws.sent[0];
   assert.equal(authMessage.type, "auth");
   assert.equal(authMessage.token, token);
-  ws._receive({ type: "auth_ok", protocolVersion: 1 });
+  ws._receive({ type: "auth_ok", protocolVersion: PROTOCOL_VERSION });
 }
 
 // Minimal fake of the chrome.alarms adapter (create/clear) the client uses
@@ -143,10 +144,10 @@ test("connects, authenticates with the stored token and the protocol version, an
   assert.equal(ws.url, "ws://127.0.0.1:9999/extension");
 
   ws._open();
-  assert.deepEqual(ws.sent[0], { type: "auth", protocolVersion: 1, token: "tok-123" });
+  assert.deepEqual(ws.sent[0], { type: "auth", protocolVersion: PROTOCOL_VERSION, token: "tok-123" });
   assert.equal(client.getState(), "authenticating");
 
-  ws._receive({ type: "auth_ok", protocolVersion: 1 });
+  ws._receive({ type: "auth_ok", protocolVersion: PROTOCOL_VERSION });
   assert.equal(client.getState(), "connected");
   client.stop(); // clears the heartbeat interval auth_ok started
 });
@@ -165,12 +166,40 @@ test("routes an incoming request through routeMessage and sends the correlated, 
   const ws = FakeWebSocket.instances[0];
   await authenticate(ws);
 
-  ws._receive({ type: "request", protocolVersion: 1, id: "req-1", method: "browser.list_windows", params: {} });
+  ws._receive({ type: "request", protocolVersion: PROTOCOL_VERSION, id: "req-1", method: "browser.list_windows", params: {} });
   await flushMicrotasks();
 
   const response = ws.sent.find((message) => message.type === "response");
-  assert.deepEqual(response, { type: "response", protocolVersion: 1, id: "req-1", result: [{ windowId: 1 }] });
+  assert.deepEqual(response, { type: "response", protocolVersion: PROTOCOL_VERSION, id: "req-1", result: [{ windowId: 1 }] });
   client.stop(); // clears the heartbeat interval auth_ok started
+});
+
+test("sends an explicit error response if routeMessage itself rejects, instead of leaving the request unanswered", async () => {
+  const WebSocketImpl = freshFakeWebSocket();
+  const storage = fakeStorage({ serviceToken: "tok-123" });
+  const routeMessage = async () => {
+    throw new Error("boom");
+  };
+  const client = createServiceClient({ storage, routeMessage, WebSocketImpl, getBrowserSessionId: () => "test-session" });
+
+  client.start();
+  await flushMicrotasks();
+  const ws = FakeWebSocket.instances[0];
+  await authenticate(ws);
+
+  ws._receive({ type: "request", protocolVersion: PROTOCOL_VERSION, id: "req-1", method: "browser.list_windows", params: {} });
+  await flushMicrotasks();
+
+  const response = ws.sent.find((message) => message.type === "response");
+  assert.ok(response, "a response must still be sent even though routeMessage rejected");
+  assert.equal(response.id, "req-1");
+  assert.equal(response.result.schemaVersion, RESULT_SCHEMA_VERSION);
+  assert.equal(response.result.browserSessionId, "test-session");
+  assert.equal(response.result.sourceOperation, "browser.list_windows");
+  assert.equal(response.result.status, "error");
+  assert.equal(response.result.code, ERROR_CODES.INTERNAL_ERROR);
+  assert.equal(response.result.detail, "boom");
+  client.stop();
 });
 
 test("never dispatches a request received before auth_ok", async () => {
@@ -191,15 +220,15 @@ test("never dispatches a request received before auth_ok", async () => {
 
   // A request arriving before auth_ok (malformed/unexpected peer, or a
   // stray message) must be ignored, not executed or answered.
-  ws._receive({ type: "request", protocolVersion: 1, id: "early-1", method: "browser.list_windows", params: {} });
+  ws._receive({ type: "request", protocolVersion: PROTOCOL_VERSION, id: "early-1", method: "browser.list_windows", params: {} });
   await flushMicrotasks();
 
   assert.equal(routeMessageCalled, false);
   assert.equal(ws.sent.some((message) => message.type === "response"), false);
 
   // Confirm the connection still works normally once actually authenticated.
-  ws._receive({ type: "auth_ok", protocolVersion: 1 });
-  ws._receive({ type: "request", protocolVersion: 1, id: "late-1", method: "browser.list_windows", params: {} });
+  ws._receive({ type: "auth_ok", protocolVersion: PROTOCOL_VERSION });
+  ws._receive({ type: "request", protocolVersion: PROTOCOL_VERSION, id: "late-1", method: "browser.list_windows", params: {} });
   await flushMicrotasks();
   assert.equal(routeMessageCalled, true);
   client.stop(); // clears the heartbeat interval auth_ok started
@@ -226,7 +255,7 @@ test("sends an authenticated heartbeat ping no more than the configured interval
   await new Promise((resolve) => setTimeout(resolve, 45));
   const pings = ws.sent.filter((message) => message.type === "ping");
   assert.ok(pings.length >= 2, `expected at least 2 pings in 45ms at a 10ms interval, got ${pings.length}`);
-  for (const ping of pings) assert.deepEqual(ping, { type: "ping", protocolVersion: 1 });
+  for (const ping of pings) assert.deepEqual(ping, { type: "ping", protocolVersion: PROTOCOL_VERSION });
   client.stop(); // clears the (10ms!) heartbeat interval before the test ends
 });
 
@@ -565,7 +594,7 @@ test("ignores an auth_ok with a missing or wrong protocol version instead of tre
   ws._receive({ type: "auth_ok", protocolVersion: 999 }); // wrong protocolVersion
   assert.equal(client.getState(), "authenticating", "must not authenticate with the wrong protocol version");
 
-  ws._receive({ type: "auth_ok", protocolVersion: 1 });
+  ws._receive({ type: "auth_ok", protocolVersion: PROTOCOL_VERSION });
   assert.equal(client.getState(), "connected");
   client.stop();
 });
@@ -593,7 +622,7 @@ test("ignores a request with a missing or wrong protocol version instead of disp
   await flushMicrotasks();
   assert.equal(calls, 0, "a request with the wrong protocol version must not be dispatched");
 
-  ws._receive({ type: "request", protocolVersion: 1, id: "right-version", method: "browser.list_windows", params: {} });
+  ws._receive({ type: "request", protocolVersion: PROTOCOL_VERSION, id: "right-version", method: "browser.list_windows", params: {} });
   await flushMicrotasks();
   assert.equal(calls, 1, "a correctly versioned request is still dispatched normally");
   client.stop();

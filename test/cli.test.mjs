@@ -195,7 +195,7 @@ test("start/status/stop treat an unrelated JSON-returning server on the recorded
       const started = spawnStart(dataDir, port);
       try {
         const health = await waitForHealth(port);
-        assert.equal(health.protocolVersion, 1);
+        assert.equal(health.protocolVersion, PROTOCOL_VERSION);
         assert.equal(health.ok, true);
         assert.equal(typeof health.extension.connected, "boolean");
       } finally {

@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION,
   RECONNECT_ALARM_DELAY_MINUTES,
   RECONNECT_ALARM_NAME,
+  RESULT_SCHEMA_VERSION,
   WS_MESSAGE_TYPES,
 } from "./protocol.js";
 
@@ -40,6 +41,13 @@ export function createServiceClient({
   // service-worker.js). See RECONNECT_ALARM_NAME in protocol.js for why
   // this exists: a setTimeout-based retry cannot wake a terminated worker.
   alarms,
+  // Used only to build a minimal, still envelope-valid error result if
+  // `routeMessage` itself rejects (see the `.catch` below) — a product bug,
+  // not an expected browser-API outcome, which `routeMessage`'s own
+  // functions already convert to a resolved error result in the normal
+  // case. Defaults to a fixed placeholder so this module stays testable
+  // without a browser or a real session id.
+  getBrowserSessionId = () => "service-client-unknown-session",
   log = () => {},
 }) {
   let stopped = true;
@@ -170,17 +178,44 @@ export function createServiceClient({
           log(`ignoring a "${WS_MESSAGE_TYPES.REQUEST}" received before authentication completed`);
           return;
         }
-        routeMessage({ method: message.method, ...message.params }).then((result) => {
-          if (myGeneration !== generation) return;
-          ws.send(
-            JSON.stringify({
-              type: WS_MESSAGE_TYPES.RESPONSE,
-              protocolVersion: PROTOCOL_VERSION,
-              id: message.id,
-              result,
-            }),
-          );
-        });
+        routeMessage({ method: message.method, ...message.params })
+          .then((result) => {
+            if (myGeneration !== generation) return;
+            ws.send(
+              JSON.stringify({
+                type: WS_MESSAGE_TYPES.RESPONSE,
+                protocolVersion: PROTOCOL_VERSION,
+                id: message.id,
+                result,
+              }),
+            );
+          })
+          .catch((error) => {
+            // routeMessage's own functions are expected to resolve to an
+            // error-shaped result, never reject — but if one somehow does
+            // (a product bug), the request must still be answered
+            // explicitly rather than left for the service's request
+            // timeout to eventually report as a generic, uninformative
+            // failure.
+            if (myGeneration !== generation) return;
+            log(`routeMessage rejected for method "${message.method}": ${error instanceof Error ? error.message : String(error)}`);
+            ws.send(
+              JSON.stringify({
+                type: WS_MESSAGE_TYPES.RESPONSE,
+                protocolVersion: PROTOCOL_VERSION,
+                id: message.id,
+                result: {
+                  schemaVersion: RESULT_SCHEMA_VERSION,
+                  browserSessionId: getBrowserSessionId(),
+                  sourceOperation: message.method,
+                  capturedAt: Date.now(),
+                  status: "error",
+                  code: ERROR_CODES.INTERNAL_ERROR,
+                  detail: error instanceof Error ? error.message : String(error),
+                },
+              }),
+            );
+          });
       }
     });
 

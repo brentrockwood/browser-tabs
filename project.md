@@ -226,31 +226,34 @@ useful workflow.
 
 Implementation:
 
-- [ ] Enumerate windows with focused state, type, state, and tab count.
-- [ ] Enumerate tabs with window ID, index, active, pinned, audible, discarded,
+- [x] Enumerate windows with focused state, type, state, and tab count.
+- [x] Enumerate tabs with window ID, index, active, pinned, audible, discarded,
   loading status, title, and URL.
-- [ ] Enumerate tab groups where the browser supports them and report the
+- [x] Enumerate tab groups where the browser supports them and report the
   capability where it does not.
-- [ ] Read bounded rendered-text snapshots from the main frame.
-- [ ] Include URL, title, document readiness, capture time, full character
+- [x] Read bounded rendered-text snapshots from the main frame.
+- [x] Include URL, title, document readiness, capture time, full character
   count, returned character count, truncation, and capture status.
-- [ ] Query browsing-history metadata separately from open tabs with explicit
+- [x] Query browsing-history metadata separately from open tabs with explicit
   time ranges, result limits, and pagination.
-- [ ] Add a capability response so clients do not infer browser features from
+- [x] Add a capability response so clients do not infer browser features from
   brand names.
-- [ ] Reject stale tab and window handles rather than silently targeting a
+- [x] Reject stale tab and window handles rather than silently targeting a
   replacement.
-- [ ] Apply conservative response-size and request-rate bounds at the service
+- [x] Apply conservative response-size and request-rate bounds at the service
   boundary.
 
 Exit criteria:
 
-- [ ] A client can distinguish open tabs, historical visits, and captured page
+- [x] A client can distinguish open tabs, historical visits, and captured page
   text.
-- [ ] Every returned browser-derived value carries capture provenance.
-- [ ] Protected, discarded, loading, closed, and ordinary pages have tested
-  outcomes.
-- [ ] No API response is unbounded.
+- [x] Every returned browser-derived value carries capture provenance.
+- [x] Protected, discarded, loading, closed, and ordinary pages have tested
+  outcomes. (Discarded's observed outcome depends on whether the browser has
+  actually unloaded the tab at test time; `status: "ok"` is also a valid
+  outcome if the browser chose not to discard it — see README.md's Stage 2
+  verification notes.)
+- [x] No API response is unbounded.
 
 ### Stage 3 — Add the derived store
 
@@ -427,31 +430,169 @@ and an implemented Stage 1 local bridge: a Node.js service (`service/`)
 bound to loopback, an extension-owned WebSocket connection authenticated
 with a locally-generated credential, an authenticated ping/pong heartbeat
 plus a `chrome.alarms` backstop for waking a terminated worker, and one
-authenticated HTTP route (`browser.list_windows`). There is still no
-derived store, review UI, browser-history query, tab-group support, or
-browser mutation (Stage 2+). Stage 1 has been exercised repeatedly against
+authenticated HTTP route (`browser.list_windows`), since extended by Stage 2
+(below) into a complete bounded read API covering windows, tabs, tab
+groups, page-text snapshots, browsing history, and capabilities. There is
+still no derived store, review UI, or browser mutation (Stage 3+). Stage 1
+has been exercised repeatedly against
 a real Chrome for Testing browser via `test/smoke/stage1-bridge-smoke.mjs`,
 with real defects found and fixed as a direct result (see git history), and
 that smoke test passes on the current revision — see "Verification status"
 in the Stage 1 section of README.md for the full evidence.
 
+Stage 2 (the read API) has been implemented, remediated against a round of
+review findings, and verified against this revision:
+`extension/service-worker.js` exposes `browser.list_tab_groups`,
+`browser.query_history`, and `browser.get_capabilities` alongside the
+existing `browser.list_windows`/`browser.list_tabs`/`browser.read_tab`, all
+wrapped in a shared capture-provenance envelope (`schemaVersion`,
+`browserSessionId`, `sourceOperation`, `capturedAt`, `status`). The
+remediation pass: bumped `PROTOCOL_VERSION` to `2` (a breaking response-shape
+and session-requirement change) and added `validateMethodResult` in
+`extension/protocol.js`, which `service/server.mjs` uses to reject a legacy
+array, a wrong-method, or any other malformed extension response as
+`invalid_extension_response` rather than ever forwarding it as trustworthy;
+added a `browserSessionId` requirement (persisted via
+`chrome.storage.session`, which the browser itself clears on restart, with a
+tested non-persisted fallback where that API is absent) that
+`list_tabs`/`list_tab_groups`/`read_tab` validate as `stale_session` before
+resolving any numeric handle, and re-ordered `list_tab_groups` to validate
+the session and window handle *before* its capability check; replaced
+`service/server.mjs`'s route object with a `Map` so a method name colliding
+with `Object.prototype` (`toString`, `__proto__`, ...) 404s instead of
+risking misuse, with parameter extraction and envelope validation both
+guarded against throwing; fixed an empty numeric query value (`?windowId=`)
+from silently coercing to `0` via `Number("")`; replaced `query_history`'s
+lossy timestamp cursor with a bounded offset cursor over a deterministic
+sort (tie-broken by the browser's own per-URL id), with an explicit
+`incomplete`/`pagination_limit_reached` outcome when its scan ceiling is
+reached before a full page can be determined; validated the injected
+snapshot result's shape in `readTab` before accessing its fields (a
+malformed result is now an explicit `invalid_extension_response`, never a
+rejected promise), and added a `.catch` in `extension/service-client.js` so
+a `routeMessage` rejection still produces an explicit error response instead
+of only a timeout; set the WebSocket server's `maxPayload` consistent with
+the response-size boundary, with an explicit `error` handler so an oversized
+inbound message cannot crash the service; and corrected several
+Firefox-related comments to runtime-capability language rather than a
+blanket "Firefox lacks X" claim. See README.md's "Stage 2: the read API"
+section for the full route/bounds/provenance/session documentation.
+Unit/integration tests were extended accordingly across
+`test/protocol.test.mjs`, `test/service-worker.test.mjs`,
+`test/service-client.test.mjs`, and `test/bridge.test.mjs`, and
+`test/smoke/stage1-bridge-smoke.mjs`/`test/smoke/chromium-smoke.mjs` were
+extended for the session requirement and the additional scenarios (a real
+harness-created tab group, two-entry paginated history, a deliberately
+slow-loading page, a best-effort discarded-tab assertion, and
+browserSessionId rotation/rejection across a full browser restart). **All of
+this has since been executed**: `npm install`, `npm test`,
+`npm run test:smoke`, `npm run test:smoke:bridge`, and `npm audit` have all
+been run against this revision — see "Current verification status" below
+for the results. Stage 2's checklist is now checked accordingly.
+
+A further remediation pass fixed five remaining issues found while this was
+still unverified (since resolved, see below): (1) `query_history`'s offset-cursor redesign itself had a latent
+consistency bug — each page requested a *page-size-dependent* amount
+(`offset + pageSize + 1`) from `chrome.history.search`, and that API's
+tie-breaking for entries sharing the exact same `lastVisitTime` is not
+guaranteed stable across differently-sized requests, so two pages could in
+principle duplicate or skip a tied entry. Fixed by always re-fetching the
+same bounded `MAX_HISTORY_SCAN`-sized set for a given range and sorting that
+one set deterministically before slicing, with an explicit
+`incomplete`/`pagination_limit_reached` outcome when the browser has at
+least that many matching entries and a page's end reaches the scanned
+boundary; a new regression test uses three same-timestamp entries returned
+by the browser in scrambled order (`[c, b, a]`) and proves three sequential
+pages return them as distinct, deterministic entries. The only remaining,
+intentionally undocumented-as-a-bug limitation is that history changing
+*between* two page requests can still make them inconsistent with each
+other — inherent to stateless pagination over a live data source.
+(2) `MAX_WS_MESSAGE_BYTES` was previously derived from `MAX_RESPONSE_BYTES`
+(2 MiB) plus a small fixed margin, which could reject a fully legitimate,
+bounded `browser.read_tab` result at the transport layer before the service
+ever got to evaluate and report it as `response_too_large` — worst-case JSON
+escaping of `MAX_TEXT_CHARACTERS` (500,000) characters alone can serialize
+to roughly 2.9 MB. Changed to an independent, larger constant (8 MiB), with
+new tests proving a response above 2 MiB but below 8 MiB still reaches the
+service and is reported `response_too_large`, while one above 8 MiB is
+rejected at the transport layer instead. (3) `validateMethodResult` was
+deepened considerably: `capturedAt` must be non-negative; every list
+(`windows`/`tabs`/`groups`/`entries`) now has each of its own records
+validated against the corresponding `normalize*` output shape, not merely
+"it is an array"; `returnedCount` must equal the actual array length and
+`totalCount` must be at least `returnedCount`; `read_tab`'s `url`/`title`
+are nullable strings, and its `returnedCharacterCount`/`characterCount`/
+`truncated` must be mutually consistent (exact length match, full count
+never less than returned, and the truncation flag exactly reflecting
+whether any characters were actually cut); `query_history`'s `startTime`/
+`endTime`/range and per-entry records are checked; and
+`get_capabilities`'s `protocolVersion` and `max*` bound fields are now
+required and type/range-checked. (4) The real-browser discard-tab smoke
+scenario previously ran its read_tab assertion *inside* the same try/catch
+guarding the discard request itself, so a malformed/failed read_tab result
+after a confirmed discard was logged as "non-fatal" instead of failing the
+smoke; the catch now covers only the request/confirmation of the discard,
+and the assertion runs unguarded once a discard is confirmed. (5) A stale
+`protocolVersion: 1` example in README.md's "Calling the API" section (left
+over from the Stage 2 protocol bump) was corrected to `2`, and the
+"Bounds"/"History pagination"/"Verification status" prose was brought in
+line with the above; project.md's Stage 2 checklist is now checked (see
+below).
+
 The injected snapshot function no longer depends on module lexical scope: the
 text limit is passed into it as an argument, so it runs correctly once the
-browser serializes it into the target tab. `npm test` passes 84/84, covering
+browser serializes it into the target tab. As of the last revision actually
+verified (before the Stage 2 work above), `npm test` passed 84/84, covering
 Stage 0's record normalization, page-text extraction (successful snapshots,
 missing bodies, CRLF normalization, character counts, truncation), the
 service worker's `readTab`/`listTabs`/`listWindows` functions, and the
 registered `runtime.onMessage` listener's routing and error responses, plus
 Stage 1's own test files (`test/credential.test.mjs`,
 `test/service-client.test.mjs`, `test/bridge.test.mjs`,
-`test/cli.test.mjs`). A real-browser smoke test (`npm run test:smoke`)
-additionally loads the unpacked extension in Chrome for Testing and, through
-the extension's actual `runtime.onMessage` entry point, confirms window
-listing, tab listing, and reading an ordinary page, plus that a protected
-page returns an explicit `unsupported`/`injection_rejected` result rather
-than empty content. `npm run test:smoke:bridge` separately proves the
-Stage 1 bridge end to end against a real Chrome for Testing browser and a
-real service process. `npm audit` reports no vulnerabilities.
+`test/cli.test.mjs`); `npm run test:smoke` and `npm run test:smoke:bridge`
+also passed against a real Chrome for Testing browser, and `npm audit`
+reported no vulnerabilities. The Stage 2 changes above grew and changed the
+shape of every one of those test files' assertions (the envelope fields are
+additive but change exact `deepEqual` shapes); `npm test` has since been
+re-run against this revision and passes 179/179 (see "Current verification
+status" below for the full Stage 2 evidence).
+
+### Current verification status (Stage 2)
+
+Verified against this revision:
+
+- `npm test`: 179/179 passing, covering Stage 0 and Stage 1's existing
+  coverage plus Stage 2's envelope validation, session handling, history
+  pagination, and response-bound regressions described above.
+- `npm audit`: no vulnerabilities reported.
+- `npm run test:smoke` (Stage 0, Chromium): `SMOKE_PASS`, against a real
+  Chrome for Testing browser.
+- `npm run test:smoke:bridge` (Stage 1 + Stage 2, Chromium), expanded for
+  Stage 2: `SMOKE_PASS`, against a real Chrome for Testing browser and a
+  real service process, proving `browser.get_capabilities`,
+  windows/tabs enumeration, a real harness-created tab group, bounded
+  page-snapshot outcomes (`ok`, `unsupported`/protected, `stale_handle`,
+  `not_ready`/`tab_loading`, and a best-effort discarded-tab case),
+  paginated `browser.query_history`, capture-provenance fields on every
+  result, `browserSessionId` rotation across a full browser restart and
+  `stale_session` rejection of a pre-restart session id, and the
+  service-boundary response-size/rate bounds. No mutation API is exposed by
+  any route exercised.
+
+Honest limits that remain, unchanged by this verification pass:
+
+- Firefox parity is still Stage 6, not Stage 2; `tabGroups` support is
+  feature-detected, not implemented for Firefox.
+- History pagination is only consistent within a single, unchanging history;
+  if history mutates between two page requests, those two pages can still be
+  inconsistent with each other (see "History pagination" above).
+- Reaching `MAX_HISTORY_SCAN` within a page's scan window produces an
+  explicit `incomplete`/`pagination_limit_reached` outcome rather than a
+  silently wrong page.
+- The discarded-tab smoke scenario is best-effort: whether the browser has
+  actually discarded the tab by the time it's read depends on the browser's
+  own memory-pressure/wake behavior, so a passing run may observe either the
+  discarded outcome or `status: "ok"` if the browser chose not to discard it.
 
 Completed foundation (Stage 0):
 

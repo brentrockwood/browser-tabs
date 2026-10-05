@@ -2,14 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ALLOWED_RESULT_STATUSES,
   ERROR_CODES,
   MAX_TEXT_CHARACTERS,
+  PROTOCOL_VERSION,
+  RESULT_SCHEMA_VERSION,
+  captureEnvelope,
+  compareHistoryEntries,
+  isNonEmptyString,
   isValidHandle,
+  isValidSessionId,
+  isValidTimestamp,
+  normalizeHistoryEntry,
   normalizeTab,
+  normalizeTabGroup,
   normalizeWindow,
   pageTextSnapshot,
   requestError,
-  unsupportedSnapshot,
+  validateMethodResult,
 } from "../extension/protocol.js";
 
 // pageTextSnapshot runs inside a tab in real use; here we stub the DOM
@@ -62,23 +72,91 @@ test("normalizes tab metadata with explicit nulls for absent sensitive fields", 
   });
 });
 
-test("represents unavailable content as an explicit unsupported result with diagnostic detail", () => {
-  assert.deepEqual(unsupportedSnapshot(9, "injection_rejected", "Cannot access contents"), {
-    schemaVersion: 1,
-    tabId: 9,
-    status: "unsupported",
-    code: "injection_rejected",
-    detail: "Cannot access contents",
+test("normalizes a tab group without leaking browser-specific fields", () => {
+  assert.deepEqual(normalizeTabGroup({ id: 3, windowId: 7, title: "Work", color: "blue", collapsed: 1 }), {
+    groupId: 3,
+    windowId: 7,
+    title: "Work",
+    color: "blue",
+    collapsed: true,
   });
 });
 
-test("unsupportedSnapshot omits detail when none is given", () => {
-  assert.deepEqual(unsupportedSnapshot(9, "no_injection_result"), {
-    schemaVersion: 1,
-    tabId: 9,
-    status: "unsupported",
-    code: "no_injection_result",
+test("normalizes a tab group with absent title/color as explicit nulls", () => {
+  assert.deepEqual(normalizeTabGroup({ id: 3, windowId: 7, collapsed: false }), {
+    groupId: 3,
+    windowId: 7,
+    title: null,
+    color: null,
+    collapsed: false,
   });
+});
+
+test("normalizes a history entry, carrying untrusted url/title through as data", () => {
+  assert.deepEqual(
+    normalizeHistoryEntry({ id: 42, url: "https://example.com", title: "Example", lastVisitTime: 1000, visitCount: 2, typedCount: 1 }),
+    { id: "42", url: "https://example.com", title: "Example", lastVisitTime: 1000, visitCount: 2, typedCount: 1 },
+  );
+});
+
+test("normalizeHistoryEntry defaults absent fields explicitly", () => {
+  assert.deepEqual(normalizeHistoryEntry({}), { id: null, url: null, title: null, lastVisitTime: null, visitCount: 0, typedCount: 0 });
+});
+
+test("compareHistoryEntries orders by lastVisitTime descending", () => {
+  const older = { id: "1", lastVisitTime: 100 };
+  const newer = { id: "2", lastVisitTime: 200 };
+  assert.ok(compareHistoryEntries(newer, older) < 0);
+  assert.ok(compareHistoryEntries(older, newer) > 0);
+});
+
+test("compareHistoryEntries tie-breaks entries sharing the exact same lastVisitTime by id", () => {
+  const a = { id: "a", lastVisitTime: 100 };
+  const b = { id: "b", lastVisitTime: 100 };
+  assert.ok(compareHistoryEntries(a, b) < 0);
+  assert.ok(compareHistoryEntries(b, a) > 0);
+  assert.equal(compareHistoryEntries(a, { id: "a", lastVisitTime: 100 }), 0);
+
+  // A real-world use: sorting is deterministic regardless of input order.
+  const entries = [b, a];
+  entries.sort(compareHistoryEntries);
+  assert.deepEqual(entries.map((entry) => entry.id), ["a", "b"]);
+});
+
+test("captureEnvelope carries browser-session identity, source operation, status, and a fresh capture timestamp", () => {
+  const before = Date.now();
+  const envelope = captureEnvelope("session-1", "browser.list_windows", "ok");
+  const after = Date.now();
+  assert.equal(envelope.schemaVersion, 1);
+  assert.equal(envelope.browserSessionId, "session-1");
+  assert.equal(envelope.sourceOperation, "browser.list_windows");
+  assert.equal(envelope.status, "ok");
+  assert.ok(envelope.capturedAt >= before && envelope.capturedAt <= after);
+});
+
+test("isValidTimestamp accepts only non-negative finite numbers", () => {
+  assert.equal(isValidTimestamp(0), true);
+  assert.equal(isValidTimestamp(1_700_000_000_000), true);
+  assert.equal(isValidTimestamp(-1), false);
+  assert.equal(isValidTimestamp(Infinity), false);
+  assert.equal(isValidTimestamp(NaN), false);
+  assert.equal(isValidTimestamp("1"), false);
+  assert.equal(isValidTimestamp(undefined), false);
+});
+
+test("isNonEmptyString accepts only non-empty strings", () => {
+  assert.equal(isNonEmptyString("a"), true);
+  assert.equal(isNonEmptyString(""), false);
+  assert.equal(isNonEmptyString(null), false);
+  assert.equal(isNonEmptyString(undefined), false);
+  assert.equal(isNonEmptyString(42), false);
+});
+
+test("isValidSessionId accepts only non-empty strings", () => {
+  assert.equal(isValidSessionId("session-1"), true);
+  assert.equal(isValidSessionId(""), false);
+  assert.equal(isValidSessionId(undefined), false);
+  assert.equal(isValidSessionId(123), false);
 });
 
 test("isValidHandle accepts only non-negative safe integers", () => {
@@ -102,6 +180,298 @@ test("requestError carries a stable code and optional diagnostic detail", () => 
     code: "invalid_params",
     detail: "windowId required",
   });
+});
+
+function okWindowsResult(overrides = {}) {
+  return {
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    browserSessionId: "session-1",
+    sourceOperation: "browser.list_windows",
+    capturedAt: Date.now(),
+    status: "ok",
+    windows: [],
+    returnedCount: 0,
+    totalCount: 0,
+    truncated: false,
+    ...overrides,
+  };
+}
+
+test("validateMethodResult accepts a well-formed ok result for the requested method", () => {
+  assert.deepEqual(validateMethodResult("browser.list_windows", okWindowsResult()), { valid: true });
+});
+
+test("validateMethodResult rejects a legacy (pre-Stage-2) bare array response", () => {
+  const result = validateMethodResult("browser.list_windows", [{ windowId: 1, focused: true, type: "normal", state: "normal", tabCount: 0 }]);
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /not a plain object/);
+});
+
+test("validateMethodResult rejects a null or non-object result", () => {
+  assert.equal(validateMethodResult("browser.list_windows", null).valid, false);
+  assert.equal(validateMethodResult("browser.list_windows", "ok").valid, false);
+  assert.equal(validateMethodResult("browser.list_windows", 42).valid, false);
+  assert.equal(validateMethodResult("browser.list_windows", undefined).valid, false);
+});
+
+test("validateMethodResult rejects a result with the wrong schemaVersion", () => {
+  const result = validateMethodResult("browser.list_windows", okWindowsResult({ schemaVersion: 999 }));
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /schemaVersion/);
+});
+
+test("validateMethodResult rejects a missing or empty browserSessionId", () => {
+  assert.equal(validateMethodResult("browser.list_windows", okWindowsResult({ browserSessionId: "" })).valid, false);
+  assert.equal(validateMethodResult("browser.list_windows", okWindowsResult({ browserSessionId: undefined })).valid, false);
+});
+
+test("validateMethodResult rejects a result whose sourceOperation does not exactly match the requested method", () => {
+  const result = validateMethodResult("browser.list_windows", okWindowsResult({ sourceOperation: "browser.list_tabs" }));
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /sourceOperation/);
+});
+
+test("validateMethodResult rejects a non-finite capturedAt", () => {
+  assert.equal(validateMethodResult("browser.list_windows", okWindowsResult({ capturedAt: NaN })).valid, false);
+  assert.equal(validateMethodResult("browser.list_windows", okWindowsResult({ capturedAt: Infinity })).valid, false);
+  assert.equal(validateMethodResult("browser.list_windows", okWindowsResult({ capturedAt: "now" })).valid, false);
+});
+
+test("validateMethodResult rejects a status outside the allowed set", () => {
+  const result = validateMethodResult("browser.list_windows", okWindowsResult({ status: "weird" }));
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /status must be one of/);
+});
+
+test("validateMethodResult accepts every allowed status with a non-empty code (except ok)", () => {
+  for (const status of ALLOWED_RESULT_STATUSES) {
+    if (status === "ok") continue;
+    const result = validateMethodResult(
+      "browser.list_windows",
+      okWindowsResult({ status, code: "some_code", windows: undefined, returnedCount: undefined, totalCount: undefined, truncated: undefined }),
+    );
+    assert.equal(result.valid, true, `status "${status}" with a code should validate`);
+  }
+});
+
+test("validateMethodResult rejects a non-ok status missing its code", () => {
+  const result = validateMethodResult("browser.list_windows", okWindowsResult({ status: "error", code: undefined }));
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /code/);
+});
+
+test("validateMethodResult rejects an ok result missing method-specific fields", () => {
+  const result = validateMethodResult("browser.list_windows", okWindowsResult({ windows: undefined }));
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /missing required fields/);
+});
+
+test("validateMethodResult rejects a window list containing a malformed record", () => {
+  const malformed = okWindowsResult({ windows: [{ windowId: 1, focused: "yes", type: "normal", state: "normal", tabCount: 0 }] });
+  assert.equal(validateMethodResult("browser.list_windows", malformed).valid, false);
+});
+
+test("validateMethodResult rejects a returnedCount that does not match the actual array length", () => {
+  const mismatched = okWindowsResult({
+    windows: [{ windowId: 1, focused: true, type: "normal", state: "normal", tabCount: 0 }],
+    returnedCount: 2,
+  });
+  assert.equal(validateMethodResult("browser.list_windows", mismatched).valid, false);
+});
+
+test("validateMethodResult rejects a totalCount smaller than returnedCount", () => {
+  const impossible = okWindowsResult({
+    windows: [{ windowId: 1, focused: true, type: "normal", state: "normal", tabCount: 0 }],
+    returnedCount: 1,
+    totalCount: 0,
+  });
+  assert.equal(validateMethodResult("browser.list_windows", impossible).valid, false);
+});
+
+test("validateMethodResult rejects a negative capturedAt", () => {
+  assert.equal(validateMethodResult("browser.list_windows", okWindowsResult({ capturedAt: -1 })).valid, false);
+});
+
+test("validateMethodResult checks list_tabs-specific fields, including each tab record's own shape", () => {
+  const ok = {
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    browserSessionId: "s",
+    sourceOperation: "browser.list_tabs",
+    capturedAt: Date.now(),
+    status: "ok",
+    windowId: 1,
+    tabs: [
+      {
+        tabId: 5,
+        windowId: 1,
+        index: 0,
+        active: true,
+        pinned: false,
+        audible: false,
+        discarded: false,
+        status: "complete",
+        title: null,
+        url: null,
+      },
+    ],
+    returnedCount: 1,
+    totalCount: 1,
+    truncated: false,
+  };
+  assert.equal(validateMethodResult("browser.list_tabs", ok).valid, true);
+  assert.equal(validateMethodResult("browser.list_tabs", { ...ok, windowId: "not-a-handle" }).valid, false);
+  assert.equal(validateMethodResult("browser.list_tabs", { ...ok, tabs: "not-an-array" }).valid, false);
+  assert.equal(
+    validateMethodResult("browser.list_tabs", { ...ok, tabs: [{ ...ok.tabs[0], active: "yes" }] }).valid,
+    false,
+    "a malformed nested tab record must be rejected, not merely 'it is an array'",
+  );
+  assert.equal(
+    validateMethodResult("browser.list_tabs", { ...ok, returnedCount: 2 }).valid,
+    false,
+    "returnedCount must equal the actual tabs array length",
+  );
+  assert.equal(
+    validateMethodResult("browser.list_tabs", { ...ok, totalCount: 0 }).valid,
+    false,
+    "totalCount must never be smaller than returnedCount",
+  );
+});
+
+test("validateMethodResult checks read_tab-specific fields", () => {
+  const ok = {
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    browserSessionId: "s",
+    sourceOperation: "browser.read_tab",
+    capturedAt: Date.now(),
+    status: "ok",
+    tabId: 1,
+    windowId: 2,
+    url: "https://example.com",
+    title: "T",
+    documentReadyState: "complete",
+    text: "hi",
+    characterCount: 2,
+    returnedCharacterCount: 2,
+    truncated: false,
+  };
+  assert.equal(validateMethodResult("browser.read_tab", ok).valid, true);
+  assert.equal(validateMethodResult("browser.read_tab", { ...ok, text: 123 }).valid, false);
+  assert.equal(validateMethodResult("browser.read_tab", { ...ok, characterCount: "2" }).valid, false);
+  assert.equal(validateMethodResult("browser.read_tab", { ...ok, returnedCharacterCount: undefined }).valid, false);
+  assert.equal(validateMethodResult("browser.read_tab", { ...ok, url: null, title: null }).valid, true, "url/title are nullable strings");
+  assert.equal(
+    validateMethodResult("browser.read_tab", { ...ok, returnedCharacterCount: 1 }).valid,
+    false,
+    "returnedCharacterCount must exactly equal text.length",
+  );
+  assert.equal(
+    validateMethodResult("browser.read_tab", { ...ok, characterCount: 1 }).valid,
+    false,
+    "characterCount can never be smaller than returnedCharacterCount",
+  );
+  assert.equal(
+    validateMethodResult("browser.read_tab", { ...ok, truncated: true }).valid,
+    false,
+    "truncated must not claim true when characterCount === returnedCharacterCount",
+  );
+  assert.equal(
+    validateMethodResult("browser.read_tab", { ...ok, characterCount: 20, truncated: false }).valid,
+    false,
+    "truncated must not claim false when characterCount exceeds returnedCharacterCount",
+  );
+  assert.equal(
+    validateMethodResult("browser.read_tab", { ...ok, characterCount: 20, truncated: true }).valid,
+    true,
+    "truncated: true is consistent once characterCount exceeds returnedCharacterCount",
+  );
+});
+
+test("validateMethodResult checks query_history-specific fields, including a null or numeric nextCursor", () => {
+  const ok = {
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    browserSessionId: "s",
+    sourceOperation: "browser.query_history",
+    capturedAt: Date.now(),
+    status: "ok",
+    startTime: 0,
+    endTime: 1000,
+    entries: [],
+    returnedCount: 0,
+    truncated: false,
+    nextCursor: null,
+  };
+  assert.equal(validateMethodResult("browser.query_history", ok).valid, true);
+  assert.equal(validateMethodResult("browser.query_history", { ...ok, nextCursor: 20 }).valid, true);
+  assert.equal(validateMethodResult("browser.query_history", { ...ok, nextCursor: -1 }).valid, false);
+  assert.equal(validateMethodResult("browser.query_history", { ...ok, nextCursor: "20" }).valid, false);
+  assert.equal(validateMethodResult("browser.query_history", { ...ok, entries: {} }).valid, false);
+  assert.equal(
+    validateMethodResult("browser.query_history", { ...ok, startTime: 2000, endTime: 1000 }).valid,
+    false,
+    "startTime must not exceed endTime",
+  );
+  assert.equal(validateMethodResult("browser.query_history", { ...ok, startTime: -1 }).valid, false);
+  assert.equal(
+    validateMethodResult("browser.query_history", { ...ok, returnedCount: 1 }).valid,
+    false,
+    "returnedCount must equal the actual entries array length",
+  );
+
+  const withEntry = {
+    ...ok,
+    entries: [{ id: "1", url: "https://example.com", title: null, lastVisitTime: 100, visitCount: 1, typedCount: 0 }],
+    returnedCount: 1,
+  };
+  assert.equal(validateMethodResult("browser.query_history", withEntry).valid, true);
+  assert.equal(
+    validateMethodResult("browser.query_history", { ...withEntry, entries: [{ ...withEntry.entries[0], visitCount: -1 }] }).valid,
+    false,
+    "a malformed nested history entry must be rejected",
+  );
+});
+
+test("validateMethodResult checks get_capabilities-specific fields", () => {
+  const ok = {
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    browserSessionId: "s",
+    sourceOperation: "browser.get_capabilities",
+    capturedAt: Date.now(),
+    status: "ok",
+    protocolVersion: PROTOCOL_VERSION,
+    tabGroups: true,
+    history: true,
+    scripting: true,
+    maxTextCharacters: 500_000,
+    maxWindowsReturned: 500,
+    maxTabsReturned: 2_000,
+    maxTabGroupsReturned: 500,
+    maxHistoryResults: 500,
+  };
+  assert.equal(validateMethodResult("browser.get_capabilities", ok).valid, true);
+  assert.equal(validateMethodResult("browser.get_capabilities", { ...ok, tabGroups: "yes" }).valid, false);
+  assert.equal(
+    validateMethodResult("browser.get_capabilities", { ...ok, protocolVersion: PROTOCOL_VERSION + 1 }).valid,
+    false,
+    "protocolVersion must match this service's own PROTOCOL_VERSION",
+  );
+  assert.equal(validateMethodResult("browser.get_capabilities", { ...ok, maxTextCharacters: 0 }).valid, false);
+  assert.equal(validateMethodResult("browser.get_capabilities", { ...ok, maxHistoryResults: -1 }).valid, false);
+});
+
+test("validateMethodResult never crashes or false-rejects for a method name that collides with an Object.prototype member", () => {
+  // Confirms the per-method shape lookup uses Object.hasOwn (not `in` or a
+  // bare property access), so a method name like "toString" or "__proto__"
+  // — which would otherwise resolve to an inherited Object.prototype value
+  // instead of `undefined` — is never mistaken for a registered validator.
+  // There is no such registered browser.* method in practice (server.mjs's
+  // route table is a fixed allowlist), but this function must not crash
+  // either way.
+  for (const method of ["toString", "__proto__", "constructor", "hasOwnProperty"]) {
+    const result = okWindowsResult({ sourceOperation: method });
+    assert.doesNotThrow(() => validateMethodResult(method, result));
+    assert.equal(validateMethodResult(method, result).valid, true);
+  }
 });
 
 test("pageTextSnapshot returns an ok snapshot with title, url, and readiness", () => {
