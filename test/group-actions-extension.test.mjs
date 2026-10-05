@@ -25,8 +25,8 @@ import {
 const CREATE = { operation: "create", tabId: 5, windowId: 2 };
 const UPDATE = { operation: "update", groupId: 9, windowId: 2, expectedTitle: "Old", expectedColor: "blue" };
 
-test("protocol version 4 is required for the group methods", () => {
-  assert.equal(PROTOCOL_VERSION, 4);
+test("protocol version 4 or later is required for the group methods", () => {
+  assert.ok(PROTOCOL_VERSION >= 4);
 });
 
 test("the color enum is Chrome's native tabGroups.Color set, and a title is bounded plain text where '' means clear", () => {

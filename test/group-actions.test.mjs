@@ -891,7 +891,6 @@ test("browser.configure_group and browser.inspect_group_target have no HTTP rout
           "/api/action.configure_group",
           "/api/action.configure_group.execute?id=1",
           "/api/action.configure_group.move?id=1",
-          "/api/action.move_tabs.preview",
           "/api/workflow.configure_group",
           "/api/store.actions.create",
           "/api/store.actions.update?id=1",

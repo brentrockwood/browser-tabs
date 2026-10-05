@@ -17,7 +17,7 @@ import { createDecisionTracker, createGenerationCounter, createListVersionGuard,
 // Must match extension/protocol.js's PROTOCOL_VERSION. Duplicated here
 // (not imported) because this is a standalone static page with no build
 // step and no access to that module's path.
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 
 // Mirrors extension/protocol.js's ERROR_CODES.STALE_SESSION — the one
 // code this page must react to specially (see handleStaleBrowserSession
@@ -101,6 +101,13 @@ let actionDecisionsInFlight = 0;
 // The tab or group chosen for the tab-group form (`{ operation, tabId |
 // groupId }`), or null — see "tab groups" below.
 let groupTarget = null;
+// The move form's state: the ticked tabs (tab id -> the window it was loaded
+// in; all one window) and the destination — `null` for a new group, or
+// `{ groupId, windowId }` for a loaded existing group. Both are dropped
+// whenever the browser session or the loaded lists they came from go away.
+let moveSelection = new Map();
+let moveDestination = null;
+const MAX_MOVE_TABS = 100;
 
 function qs(id) {
   return document.getElementById(id);
@@ -223,7 +230,10 @@ function rememberSessionFromWindowsResult(result) {
     // A different session than the one previously known replaces it: the chosen
     // tab-group target belongs to the old one, so drop it before anything from
     // the new list is rendered. The same session leaves the target alone.
-    if (isReplacedSession(state.sessionId, result.browserSessionId)) clearGroupTarget();
+    if (isReplacedSession(state.sessionId, result.browserSessionId)) {
+      clearGroupTarget();
+      clearMoveSelection();
+    }
     state.sessionId = result.browserSessionId;
   }
 }
@@ -247,6 +257,7 @@ function handleStaleBrowserSession() {
   state.browserGeneration.bump();
   state.sessionId = null;
   clearGroupTarget();
+  clearMoveSelection();
   clearChildren(qs("windows-list"));
   setStatus(
     qs("inspector-status"),
@@ -283,6 +294,9 @@ const AUTH_GATED_BUTTON_IDS = [
   "refresh-proposals-button",
   "preview-button",
   "group-preview-button",
+  "move-preview-button",
+  "move-new-button",
+  "move-clear-button",
   "refresh-actions-button",
   "refresh-audit-button",
   "refresh-tags-button",
@@ -305,8 +319,9 @@ function resetDisplayedData() {
   clearChildren(qs("proposals-list"));
   clearChildren(qs("actions-list"));
   clearChildren(qs("audit-list"));
-  for (const id of ["action-form-status", "group-form-status", "action-decision-status", "actions-status", "audit-status"]) qs(id).textContent = "";
+  for (const id of ["action-form-status", "group-form-status", "move-form-status", "action-decision-status", "actions-status", "audit-status"]) qs(id).textContent = "";
   clearGroupTarget();
+  clearMoveSelection();
   clearChildren(qs("tags-list"));
   clearChildren(qs("collections-list"));
   clearChildren(qs("queue-list"));
@@ -437,14 +452,25 @@ function renderTabRow(t) {
   const groupButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Group this tab…")]);
   groupButton.addEventListener("click", () => chooseGroupTarget({ operation: "create", tabId: t.tabId }, `Tab ${t.tabId} — ${t.title ?? "(none)"}`));
 
-  return el("li", {}, [infoLine, titleLine, urlLine, captureButton, el("span", { text: " " }), groupButton, el("span", { text: " " }), captureStatus]);
+  // Selecting a tab only records its id for the move form below; nothing is
+  // sent until that form's own Preview, and nothing moves until Apply. A
+  // pinned tab cannot be selected (pinned tabs are never grouped).
+  const selectBox = el("input", { attrs: { type: "checkbox", "data-move-tab": String(t.tabId) } });
+  selectBox.checked = moveSelection.has(t.tabId);
+  selectBox.disabled = Boolean(t.pinned);
+  selectBox.addEventListener("change", () => toggleMoveTab(t, selectBox));
+  const selectLabel = el("label", {}, [selectBox, document.createTextNode(t.pinned ? ` Tab ${t.tabId} is pinned and cannot be moved` : ` Select tab ${t.tabId} for moving`)]);
+
+  return el("li", {}, [infoLine, titleLine, urlLine, captureButton, el("span", { text: " " }), groupButton, el("span", { text: " " }), captureStatus, el("div", {}, [selectLabel])]);
 }
 
 function renderGroupRow(g) {
   const description = `Group ${g.groupId} — title: ${g.title ?? "(none)"}, color: ${g.color ?? "(none)"}, collapsed: ${g.collapsed}`;
   const editButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Edit this group…")]);
   editButton.addEventListener("click", () => chooseGroupTarget({ operation: "update", groupId: g.groupId }, description));
-  return el("li", {}, [el("p", { text: description }), editButton]);
+  const moveHereButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Move selected tabs here…")]);
+  moveHereButton.addEventListener("click", () => chooseMoveDestination({ groupId: g.groupId, windowId: g.windowId }, description));
+  return el("li", {}, [el("p", { text: description }), editButton, el("span", { text: " " }), moveHereButton]);
 }
 
 function renderWindowRow(w) {
@@ -455,6 +481,10 @@ function renderWindowRow(w) {
 
   const loadTabsButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Load tabs")]);
   loadTabsButton.addEventListener("click", async () => {
+    // This list's tab rows are about to be replaced, so the ticked tabs (and the
+    // destination chosen alongside them) are dropped rather than left pointing
+    // at rows that no longer exist.
+    clearMoveSelection();
     const bgen = state.browserGeneration.snapshot();
     loadTabsButton.disabled = true;
     setStatus(tabsStatus, "Loading…");
@@ -483,6 +513,9 @@ function renderWindowRow(w) {
 
   const loadGroupsButton = el("button", { attrs: { type: "button" } }, [document.createTextNode("Load groups")]);
   loadGroupsButton.addEventListener("click", async () => {
+    // Only the group rows are replaced, so only a destination chosen from them
+    // is dropped; the ticked tabs stay (select tabs, then load groups).
+    clearMoveDestination();
     const bgen = state.browserGeneration.snapshot();
     loadGroupsButton.disabled = true;
     setStatus(groupsStatus, "Loading…");
@@ -527,6 +560,9 @@ qs("load-windows-button").addEventListener("click", async () => {
     const { result } = await apiRequest("/api/browser.list_windows");
     if (state.browserGeneration.isStale(bgen)) return;
     rememberSessionFromWindowsResult(result);
+    // Every row below is rebuilt, so the ticked tabs and chosen destination from
+    // the previous list are dropped rather than carried over to new rows.
+    clearMoveSelection();
     const list = qs("windows-list");
     clearChildren(list);
     for (const w of result.windows) list.appendChild(renderWindowRow(w));
@@ -1043,9 +1079,46 @@ const GROUP_MUTATION_LABELS = {
   unknown: "unknown — the request may have been acted on, but no usable answer came back",
 };
 
+// Phase 2 Action 3 (moving tabs into a group) states and wording.
+const MOVE_STATE_LABELS = {
+  previewed: "awaiting your decision — no tab has been moved",
+  approved: "approved — no result recorded yet",
+  rejected: "rejected — no tab was moved",
+  executed: "applied — the tabs were moved and observed in the group",
+  partial: "partly done — a move into the group was made, but a later step failed or not every tab was seen in the group afterwards",
+  stale: "refused as stale — what was previewed no longer holds, no tab was moved",
+  failed: "failed",
+};
+
+const MOVE_MUTATION_LABELS = {
+  moved: "yes — a move into the group was made (see which tabs were observed there)",
+  none: "no — no tab was moved",
+  unknown: "unknown — the move may or may not have been applied, and no usable answer says which",
+};
+
 function actionStateLabel(a) {
-  const labels = a.kind === "configure_group" ? GROUP_STATE_LABELS : ACTION_STATE_LABELS;
+  const labels = a.kind === "configure_group" ? GROUP_STATE_LABELS : a.kind === "move_tabs" ? MOVE_STATE_LABELS : ACTION_STATE_LABELS;
   return labels[a.state] ?? a.state;
+}
+
+// The exact tabs (each with the group it is in now), window, and destination
+// a stored move preview binds. Only that bound state is stored: tab ids and
+// memberships, no tab title or address. The destination group's current title
+// is untrusted browser text; only ever rendered with textContent.
+function describeMoveBinding(b) {
+  const change = [];
+  if (b.title !== undefined && b.title !== null) change.push(`title "${b.title}"`);
+  if (b.color !== undefined && b.color !== null) change.push(`color ${b.color}`);
+  const destination =
+    b.destination === "new"
+      ? `a new group${change.length > 0 ? ` with ${change.join(" and ")}` : ""}`
+      : `existing group ${b.groupId} (currently titled "${b.expectedTitle}", color ${b.expectedColor})`;
+  return `Move ${b.tabs.length} tab(s) in window ${b.windowId} into ${destination}.`;
+}
+
+function describeMoveTab(t) {
+  const membership = t.groupId === -1 ? "ungrouped" : `in group ${t.groupId}`;
+  return `Tab ${t.tabId} — currently ${membership}`;
 }
 
 // The exact target and requested change a stored group preview binds. The
@@ -1073,10 +1146,17 @@ function setActionsRefreshDisabled(disabled) {
 function renderActionItem(a) {
   const urlId = `action-${a.id}-url`;
   const isGroup = a.kind === "configure_group";
+  const isMove = a.kind === "move_tabs";
   const li = el("li", { attrs: { id: `action-${a.id}`, tabindex: "-1" } });
-  li.appendChild(el("p", { text: `Action #${a.id} — ${isGroup ? "tab group" : "open in a new tab"} — ${actionStateLabel(a)}` }));
+  li.appendChild(el("p", { text: `Action #${a.id} — ${isGroup ? "tab group" : isMove ? "move tabs" : "open in a new tab"} — ${actionStateLabel(a)}` }));
   if (isGroup) li.appendChild(el("p", { text: describeGroupBinding(a.binding), attrs: { id: urlId } }));
-  else li.appendChild(el("p", { text: `Address: ${a.url}`, attrs: { id: urlId } }));
+  else if (isMove) {
+    li.appendChild(el("p", { text: describeMoveBinding(a.binding), attrs: { id: urlId } }));
+    const tabLines = el("ul", { className: "plain-list" });
+    for (const tab of a.binding.tabs) tabLines.appendChild(el("li", { text: describeMoveTab(tab) }));
+    li.appendChild(tabLines);
+    li.appendChild(el("p", { text: "Each tab leaves the group it is in now; a group left with no tabs is removed by the browser itself." }));
+  } else li.appendChild(el("p", { text: `Address: ${a.url}`, attrs: { id: urlId } }));
 
   const dl = el("dl");
   dlEntry(dl, "Previewed at", formatTimestamp(a.previewedAt));
@@ -1085,10 +1165,22 @@ function renderActionItem(a) {
   if (a.completedAt !== null) dlEntry(dl, "Completed at", formatTimestamp(a.completedAt));
   if (a.result) {
     const r = a.result;
-    dlEntry(dl, "Browser changed", (isGroup ? GROUP_MUTATION_LABELS : ACTION_MUTATION_LABELS)[r.mutation] ?? r.mutation);
+    dlEntry(dl, "Browser changed", (isGroup ? GROUP_MUTATION_LABELS : isMove ? MOVE_MUTATION_LABELS : ACTION_MUTATION_LABELS)[r.mutation] ?? r.mutation);
     if (r.code) dlEntry(dl, "Outcome code", r.code);
     if (r.detail) dlEntry(dl, "Detail", r.detail);
-    if (isGroup) {
+    if (isMove) {
+      if (r.groupId !== null) dlEntry(dl, "Group / window", `group ${r.groupId} in window ${r.windowId ?? "—"}`);
+      // Only the tabs actually seen in the group afterwards; a known move does
+      // not mean every selected tab was observed there.
+      if (a.state === "executed" || a.state === "partial") {
+        dlEntry(dl, "Observed in the group", r.tabIds ? r.tabIds.join(", ") : "none observed (or observation unavailable)");
+      }
+      if (r.observed) {
+        dlEntry(dl, "Observed title (untrusted browser text)", r.observed.title ?? "—");
+        dlEntry(dl, "Observed color", r.observed.color ?? "—");
+        dlEntry(dl, "Observed collapsed", formatBoolean(r.observed.collapsed));
+      }
+    } else if (isGroup) {
       if (r.groupId !== null) dlEntry(dl, "Group / window", `group ${r.groupId} in window ${r.windowId ?? "—"}`);
       if (r.tabId !== null) dlEntry(dl, "Tab", `tab ${r.tabId}`);
       if (r.observed) {
@@ -1099,7 +1191,7 @@ function renderActionItem(a) {
     } else if (r.tabId !== null) {
       dlEntry(dl, "Tab / window", `tab ${r.tabId} in window ${r.windowId ?? "—"}`);
     }
-    if (!isGroup && r.observed) {
+    if (!isGroup && !isMove && r.observed) {
       dlEntry(dl, "Observed status", r.observed.status);
       dlEntry(dl, "Observed title (untrusted browser text)", r.observed.title ?? "—");
       dlEntry(dl, "Observed address (untrusted browser text)", r.observed.url ?? "—");
@@ -1109,7 +1201,7 @@ function renderActionItem(a) {
   li.appendChild(dl);
 
   if (a.state === "previewed") {
-    const openButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode(isGroup ? "Apply" : "Open")]);
+    const openButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode(isGroup || isMove ? "Apply" : "Open")]);
     const rejectButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode("Reject")]);
     li.appendChild(el("div", { className: "decision-buttons" }, [openButton, rejectButton]));
     // A row rebuilt while its own decision is still in flight (any refresh
@@ -1134,12 +1226,14 @@ async function decideAction(id, operation, buttons, kind) {
   for (const button of buttons) button.disabled = true;
   actionDecisionsInFlight += 1;
   setActionsRefreshDisabled(true);
-  const verb = operation === "approve" ? (kind === "configure_group" ? "Apply" : "Open") : "Reject";
+  const verb = operation === "approve" ? (kind === "configure_group" || kind === "move_tabs" ? "Apply" : "Open") : "Reject";
   setStatus(qs("action-decision-status"), `${verb} for action #${id}: submitting…`);
   try {
-    const { result } = await (kind === "configure_group"
-      ? apiRequest(`/api/action.configure_group.${operation}?id=${id}`, { method: "POST" })
-      : apiRequest(`/api/action.open_tab.${operation}?id=${id}`, { method: "POST" }));
+    let request;
+    if (kind === "configure_group") request = apiRequest(`/api/action.configure_group.${operation}?id=${id}`, { method: "POST" });
+    else if (kind === "move_tabs") request = apiRequest(`/api/action.move_tabs.${operation}?id=${id}`, { method: "POST" });
+    else request = apiRequest(`/api/action.open_tab.${operation}?id=${id}`, { method: "POST" });
+    const { result } = await request;
     if (!state.generation.isStale(gen)) {
       setStatus(qs("action-decision-status"), `Action #${id}: ${actionStateLabel(result)}.`, result.state === "failed");
     }
@@ -1372,6 +1466,106 @@ async function refreshTags() {
   }
 }
 qs("refresh-tags-button").addEventListener("click", refreshTags);
+
+// ---- moving tabs into a group (Phase 2 Action 3) ----
+
+// Ticking tabs and choosing a destination only fills in the move form; the
+// request that stores a preview sends the exact tab ids and the destination
+// (`existing` + the group id, or `new` + an optional title/color) — no browser
+// session, no window, no current state (the service learns those from the
+// browser itself). Nothing moves until the preview's own Apply, decided by its
+// id alone like any other action. Everything here is dropped whenever the
+// browser session or the loaded lists it came from go away, so ids can never
+// be carried into another session.
+function updateMoveReadout() {
+  const ids = [...moveSelection.keys()];
+  const windowId = ids.length > 0 ? moveSelection.get(ids[0]) : null;
+  qs("move-selection").textContent =
+    ids.length === 0 ? "No tabs selected." : `${ids.length} tab(s) selected in window ${windowId}: ${ids.map((id) => `tab ${id}`).join(", ")}.`;
+  qs("move-destination").textContent =
+    moveDestination === null ? "Destination: a new group." : `Destination: existing ${moveDestination.description}`;
+  qs("move-title-input").disabled = moveDestination !== null;
+  qs("move-color-select").disabled = moveDestination !== null;
+}
+
+function clearMoveDestination() {
+  moveDestination = null;
+  updateMoveReadout();
+}
+
+function clearMoveSelection() {
+  moveSelection = new Map();
+  moveDestination = null;
+  for (const box of document.querySelectorAll("input[data-move-tab]")) box.checked = false;
+  updateMoveReadout();
+}
+
+function toggleMoveTab(tab, box) {
+  const status = qs("move-form-status");
+  if (!box.checked) {
+    moveSelection.delete(tab.tabId);
+  } else if (moveSelection.size >= MAX_MOVE_TABS) {
+    box.checked = false;
+    setStatus(status, `At most ${MAX_MOVE_TABS} tabs can be moved at once.`, true);
+    return;
+  } else if (moveSelection.size > 0 && moveSelection.values().next().value !== tab.windowId) {
+    box.checked = false;
+    setStatus(status, "All selected tabs must be in one window; clear the selection to choose tabs from another.", true);
+    return;
+  } else {
+    moveSelection.set(tab.tabId, tab.windowId);
+  }
+  status.textContent = "";
+  updateMoveReadout();
+}
+
+function chooseMoveDestination(destination, description) {
+  moveDestination = { ...destination, description };
+  updateMoveReadout();
+}
+
+qs("move-new-button").addEventListener("click", clearMoveDestination);
+
+qs("move-clear-button").addEventListener("click", () => {
+  clearMoveSelection();
+  qs("move-form-status").textContent = "";
+});
+
+qs("move-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = qs("move-form-status");
+  if (moveSelection.size === 0) {
+    setStatus(status, 'Tick "Select for moving" on at least one loaded tab first.', true);
+    return;
+  }
+  const body = { tabIds: [...moveSelection.keys()], destination: moveDestination === null ? "new" : "existing" };
+  if (moveDestination !== null) {
+    body.groupId = moveDestination.groupId;
+  } else {
+    const title = qs("move-title-input").value;
+    const color = qs("move-color-select").value;
+    if (title !== "") body.title = title;
+    if (color !== "") body.color = color;
+  }
+
+  const button = qs("move-preview-button");
+  const gen = state.generation.snapshot();
+  button.disabled = true;
+  setStatus(status, "Creating preview…");
+  try {
+    const { result } = await apiRequest("/api/action.move_tabs.preview", { method: "POST", body });
+    if (state.generation.isStale(gen)) return;
+    setStatus(status, `Preview #${result.id} created. No tab has been moved yet: review it below, then choose Apply or Reject.`);
+    await refreshActions();
+    if (state.generation.isStale(gen)) return;
+    qs(`action-${result.id}`)?.focus();
+  } catch (error) {
+    if (state.generation.isStale(gen)) return;
+    setStatus(status, `Could not create a preview: ${describeError(error)}`, true);
+  } finally {
+    if (!state.generation.isStale(gen)) button.disabled = false;
+  }
+});
 
 // ---- collections ----
 

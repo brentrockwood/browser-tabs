@@ -1809,6 +1809,272 @@ async function main() {
       }
     }
 
+    // Step 2.10: Phase 2 Action 3 ("move selected tabs into an existing or new
+    // tab group"), against the real browser's own tabs and groups
+    // (chrome.tabs/chrome.tabGroups from the service worker), never only
+    // against what the service says:
+    //   - a preview moves nothing; Apply moves exactly the previewed tabs
+    //     (an ungrouped tab, tabs ungrouped and grouped elsewhere) into an
+    //     existing group, leaving that group's title and color alone, and a
+    //     source group emptied by the move disappears by itself;
+    //   - Apply on a new-group preview creates one group around exactly the
+    //     previewed tabs with the requested title/color, in their own window;
+    //   - the recorded result and observed group match the real ones, and a
+    //     repeated decision changes nothing; Reject moves nothing, ever;
+    //   - a pinned tab, tabs in two windows, a no-op move, and a missing handle
+    //     are refused at preview with nothing stored;
+    //   - a tab ungrouped, or a destination renamed, by someone else after the
+    //     preview is refused as stale (state_mismatch) and moves nothing;
+    //   - the agent credential cannot reach any of it, the extension-level
+    //     methods have no HTTP route, and the audit log holds no title/URL;
+    //   - one move preview is left pending here and approved only *after* the
+    //     browser restart (Step 5), where it must be refused as stale.
+    // A browser without tab groups must instead answer 501 unsupported at
+    // preview, with nothing changed. (The 100-tab bound is covered by the
+    // deterministic tests, not exercised in a real browser.)
+    console.log("exercising Phase 2 Action 3 (move tabs: existing group, new group, reject, refusals, stale/mismatch)...");
+    let staleMoveActionId = null;
+    {
+      const MOVE_FIXTURE = (name) => `${fixtureUrl}?smoke-move=${name}`;
+      const post = (path, body) => serviceRequest(port, path, { method: "POST", token, body });
+      const decide = (operation, id) => post(`/api/action.move_tabs.${operation}?id=${id}`);
+      const preview = (body) => post("/api/action.move_tabs.preview", body);
+      const NO_GROUP = -1;
+      const realTab = (tabId) => evaluate(swCdp, `chrome.tabs.get(${JSON.stringify(tabId)}).then((t) => ({ windowId: t.windowId, groupId: t.groupId, pinned: t.pinned }))`);
+      const realGroup = (groupId) =>
+        evaluate(swCdp, `chrome.tabGroups.get(${JSON.stringify(groupId)}).then((g) => ({ title: g.title, color: g.color, windowId: g.windowId }))`);
+      const realGroupExists = (groupId) => evaluate(swCdp, `chrome.tabGroups.query({}).then((groups) => groups.some((g) => g.id === ${JSON.stringify(groupId)}))`);
+      const realGroupTabIds = (groupId) =>
+        evaluate(swCdp, `chrome.tabs.query({ groupId: ${JSON.stringify(groupId)} }).then((tabs) => tabs.map((t) => t.id).sort((a, b) => a - b))`);
+      const sorted = (ids) => JSON.stringify([...ids].sort((a, b) => a - b));
+      const check = (condition, message) => {
+        if (!condition) fail(`[Phase 2 move_tabs] ${message}`);
+        return Boolean(condition);
+      };
+
+      for (const [path, body, expectedStatus] of [
+        ["/api/action.move_tabs.preview", { tabIds: [1], destination: "new" }, 403],
+        ["/api/action.move_tabs.approve?id=1", undefined, 403],
+        ["/api/action.move_tabs.reject?id=1", undefined, 403],
+        ["/api/browser.move_tabs", { destination: "new", windowId: 1, tabs: [{ tabId: 1, groupId: -1 }], browserSessionId: sessionId }, 404],
+        ["/api/browser.inspect_move_target?tabIds=1", undefined, 404],
+      ]) {
+        const attempt = await serviceRequest(port, path, { method: "POST", token: agentToken, body });
+        if (!check(attempt.status === expectedStatus, `agent credential POST ${path} expected HTTP ${expectedStatus}, got ${attempt.status} ${JSON.stringify(attempt.json)}`)) return;
+      }
+
+      if (!capabilities.tabGroups) {
+        const tab = await createAndWaitForTab(swCdp, MOVE_FIXTURE("unsupported"));
+        try {
+          const refused = await preview({ tabIds: [tab.id], destination: "new" });
+          if (!check(refused.status === 501 && refused.json?.error?.code === "unsupported_feature", `a browser without tab groups did not answer unsupported: ${refused.status} ${JSON.stringify(refused.json)}`)) return;
+        } finally {
+          await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(tab.id)})`).catch(() => {});
+        }
+        console.log("Phase 2 Action 3: this browser reports no tab groups; preview answered unsupported and nothing changed.");
+      } else {
+        const m1 = await createAndWaitForTab(swCdp, MOVE_FIXTURE("1"));
+        const m2 = await createAndWaitForTab(swCdp, MOVE_FIXTURE("2"));
+        const m3 = await createAndWaitForTab(swCdp, MOVE_FIXTURE("3"));
+        const m4 = await createAndWaitForTab(swCdp, MOVE_FIXTURE("4"));
+        const m5 = await createAndWaitForTab(swCdp, MOVE_FIXTURE("5"));
+        const extraTabIds = [];
+        let secondWindowId = null;
+        try {
+          // Harness scaffolding (not a product operation): m3 alone in a source
+          // group, m4 in the destination group.
+          const sourceGroupId = await evaluate(swCdp, `(async () => { const id = await chrome.tabs.group({ tabIds: [${JSON.stringify(m3.id)}] }); await chrome.tabGroups.update(id, { title: "smoke-src" }); return id; })()`);
+          const destGroupId = await evaluate(
+            swCdp,
+            `(async () => { const id = await chrome.tabs.group({ tabIds: [${JSON.stringify(m4.id)}] }); await chrome.tabGroups.update(id, { title: "smoke-dest", color: "blue" }); return id; })()`,
+          );
+
+          // --- Existing group: a preview moves nothing; Apply moves exactly the previewed tabs. ---
+          const existingPreview = await preview({ tabIds: [m1.id, m2.id, m3.id], destination: "existing", groupId: destGroupId });
+          const existing = existingPreview.json?.result;
+          if (
+            !check(
+              existingPreview.status === 200 &&
+                existing?.state === "previewed" &&
+                existing.browserSessionId === sessionId &&
+                existing.binding?.destination === "existing" &&
+                existing.binding.groupId === destGroupId &&
+                existing.binding.expectedTitle === "smoke-dest" &&
+                !JSON.stringify(existing.binding).includes("smoke-move") &&
+                JSON.stringify(existing.binding.tabs.map((t) => [t.tabId, t.groupId])) === JSON.stringify([[m1.id, NO_GROUP], [m2.id, NO_GROUP], [m3.id, sourceGroupId]]),
+              `the existing-group preview does not bind the exact tabs, their groups, and the destination: ${existingPreview.status} ${JSON.stringify(existingPreview.json)}`,
+            )
+          ) {
+            return;
+          }
+          if (!check((await realTab(m1.id)).groupId === NO_GROUP && (await realTab(m3.id)).groupId === sourceGroupId, "a preview moved a tab")) return;
+
+          const existingApproval = await decide("approve", existing.id);
+          const existingDone = existingApproval.json?.result;
+          if (
+            !check(
+              existingApproval.status === 200 &&
+                existingDone?.state === "executed" &&
+                existingDone.result?.mutation === "moved" &&
+                existingDone.result.groupId === destGroupId &&
+                sorted(existingDone.result.tabIds ?? []) === sorted([m1.id, m2.id, m3.id]),
+              `the approved move was not recorded as executed into the destination: ${existingApproval.status} ${JSON.stringify(existingApproval.json)}`,
+            )
+          ) {
+            return;
+          }
+          const realDest = await realGroup(destGroupId);
+          if (
+            !check(
+              sorted(await realGroupTabIds(destGroupId)) === sorted([m1.id, m2.id, m3.id, m4.id]) &&
+                realDest.title === "smoke-dest" &&
+                realDest.color === "blue" &&
+                existingDone.result.observed?.title === "smoke-dest" &&
+                existingDone.result.observed?.color === "blue" &&
+                existingDone.result.windowId === realDest.windowId,
+              `the destination group does not hold exactly the previewed tabs plus its own, or was renamed/recolored: ${JSON.stringify({ realDest, existingDone })}`,
+            )
+          ) {
+            return;
+          }
+          if (!check(!(await realGroupExists(sourceGroupId)), "the emptied source group was expected to disappear by itself")) return;
+          for (const operation of ["approve", "reject"]) {
+            const again = await decide(operation, existing.id);
+            if (!check(again.status === 409, `a repeated ${operation} of a decided move was not refused: ${again.status} ${JSON.stringify(again.json)}`)) return;
+          }
+          if (!check(sorted(await realGroupTabIds(destGroupId)) === sorted([m1.id, m2.id, m3.id, m4.id]), "a repeated decision changed the group")) return;
+
+          // --- New group: exactly the previewed tabs, the requested title/color, their window. ---
+          const newPreview = await preview({ tabIds: [m1.id, m2.id], destination: "new", title: "smoke-moved", color: "orange" });
+          const created = newPreview.json?.result;
+          if (!check(newPreview.status === 200 && created?.binding?.destination === "new" && created.binding.title === "smoke-moved", `the new-group preview is wrong: ${JSON.stringify(newPreview.json)}`)) return;
+          if (!check((await realTab(m1.id)).groupId === destGroupId, "a new-group preview moved a tab")) return;
+          const createdApproval = await decide("approve", created.id);
+          const createdDone = createdApproval.json?.result;
+          if (!check(createdApproval.status === 200 && createdDone?.state === "executed" && Number.isInteger(createdDone.result?.groupId), `the approved new-group move was not recorded as executed: ${JSON.stringify(createdApproval.json)}`)) return;
+          const newGroupId = createdDone.result.groupId;
+          const realNew = await realGroup(newGroupId);
+          const realM1 = await realTab(m1.id);
+          if (
+            !check(
+              newGroupId !== destGroupId &&
+                sorted(await realGroupTabIds(newGroupId)) === sorted([m1.id, m2.id]) &&
+                sorted(await realGroupTabIds(destGroupId)) === sorted([m3.id, m4.id]) &&
+                realNew.title === "smoke-moved" &&
+                realNew.color === "orange" &&
+                realNew.windowId === realM1.windowId &&
+                createdDone.result.windowId === realNew.windowId &&
+                createdDone.result.observed?.title === realNew.title,
+              `the new group does not hold exactly the previewed tabs with the requested title/color in their window: ${JSON.stringify({ realNew, realM1, createdDone })}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- Reject: nothing is ever moved. ---
+          const rejectPreview = await preview({ tabIds: [m3.id], destination: "new", title: "smoke-rejected" });
+          const rejectId = rejectPreview.json?.result?.id;
+          const rejected = await decide("reject", rejectId);
+          const lateApprove = await decide("approve", rejectId);
+          await delay(300);
+          if (
+            !check(
+              rejected.json?.result?.state === "rejected" &&
+                rejected.json.result.result === null &&
+                lateApprove.status === 409 &&
+                (await realTab(m3.id)).groupId === destGroupId,
+              `a rejected move preview was approvable or moved a tab: ${JSON.stringify({ rejected: rejected.json, lateApprove: lateApprove.json })}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- Refused up front, nothing stored. ---
+          const pinnedTabId = await evaluate(swCdp, `chrome.tabs.create({ url: ${JSON.stringify(MOVE_FIXTURE("pinned"))}, pinned: true, active: false }).then((t) => t.id)`);
+          extraTabIds.push(pinnedTabId);
+          const secondWindow = await evaluate(
+            swCdp,
+            `chrome.windows.create({ url: ${JSON.stringify(MOVE_FIXTURE("window2"))}, focused: false }).then((w) => ({ id: w.id, tabId: w.tabs[0].id }))`,
+          );
+          secondWindowId = secondWindow.id;
+          await evaluate(swCdp, `chrome.windows.update(${JSON.stringify(targetWindowId)}, { focused: true })`);
+          await delay(500);
+          const storedBefore = (await serviceRequest(port, "/api/store.actions.list?limit=1", { token })).json?.result?.total;
+          for (const [name, body, expectedStatus, expectedCode] of [
+            ["a pinned tab", { tabIds: [m5.id, pinnedTabId], destination: "new" }, 409, "conflict"],
+            ["tabs in two windows", { tabIds: [m5.id, secondWindow.tabId], destination: "new" }, 409, "conflict"],
+            ["a destination group in another window", { tabIds: [secondWindow.tabId], destination: "existing", groupId: destGroupId }, 409, "conflict"],
+            ["a no-op move", { tabIds: [m3.id, m4.id], destination: "existing", groupId: destGroupId }, 400, "validation_error"],
+            ["a missing tab", { tabIds: [m5.id, 999_999], destination: "new" }, 409, "stale_handle"],
+            ["a missing group", { tabIds: [m5.id], destination: "existing", groupId: 999_999 }, 409, "stale_handle"],
+            ["a repeated tab", { tabIds: [m5.id, m5.id], destination: "new" }, 400, "validation_error"],
+            ["a caller-supplied session", { tabIds: [m5.id], destination: "new", browserSessionId: sessionId }, 400, "validation_error"],
+          ]) {
+            const refused = await preview(body);
+            if (!check(refused.status === expectedStatus && refused.json?.error?.code === expectedCode, `a preview for ${name} was not refused with ${expectedStatus} ${expectedCode}: ${refused.status} ${JSON.stringify(refused.json)}`)) return;
+          }
+          const storedAfter = (await serviceRequest(port, "/api/store.actions.list?limit=1", { token })).json?.result?.total;
+          const pinnedReal = await realTab(pinnedTabId);
+          if (!check(storedBefore === storedAfter && pinnedReal.pinned === true && pinnedReal.groupId === NO_GROUP, "a refused preview was stored, or changed the pinned tab")) return;
+
+          // --- Mismatch: a selected tab is ungrouped by someone else after the preview. ---
+          const staleTabPreview = await preview({ tabIds: [m3.id, m4.id], destination: "new", title: "smoke-mismatch" });
+          await evaluate(swCdp, `chrome.tabs.ungroup(${JSON.stringify(m4.id)})`);
+          const staleTab = await decide("approve", staleTabPreview.json?.result?.id);
+          if (
+            !check(
+              staleTabPreview.status === 200 &&
+                staleTab.json?.result?.state === "stale" &&
+                staleTab.json.result.result?.code === "state_mismatch" &&
+                staleTab.json.result.result?.mutation === "none" &&
+                (await realTab(m3.id)).groupId === destGroupId &&
+                (await realTab(m4.id)).groupId === NO_GROUP &&
+                (await evaluate(swCdp, `chrome.tabGroups.query({ title: "smoke-mismatch" }).then((groups) => groups.length)`)) === 0,
+              `a tab ungrouped after the preview was not refused as a state mismatch without change: ${JSON.stringify(staleTab.json)}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- Mismatch: the destination is renamed by someone else after the preview. ---
+          const staleDestPreview = await preview({ tabIds: [m4.id], destination: "existing", groupId: newGroupId });
+          await evaluate(swCdp, `chrome.tabGroups.update(${JSON.stringify(newGroupId)}, { title: "renamed-elsewhere" })`);
+          const staleDest = await decide("approve", staleDestPreview.json?.result?.id);
+          if (
+            !check(
+              staleDestPreview.status === 200 &&
+                staleDest.json?.result?.state === "stale" &&
+                staleDest.json.result.result?.code === "state_mismatch" &&
+                staleDest.json.result.result?.mutation === "none" &&
+                (await realTab(m4.id)).groupId === NO_GROUP &&
+                (await realGroup(newGroupId)).title === "renamed-elsewhere",
+              `a destination renamed after the preview was not refused as a state mismatch without change: ${JSON.stringify(staleDest.json)}`,
+            )
+          ) {
+            return;
+          }
+
+          // --- Audit: append-only record, no title, URL, or handle. ---
+          const auditResponse = await serviceRequest(port, "/api/store.actions.audit.list?limit=200", { token });
+          const auditItems = auditResponse.json?.result?.items ?? [];
+          const eventsFor = (id) => auditItems.filter((e) => e.actionId === id).map((e) => e.event);
+          if (!check(JSON.stringify(eventsFor(existing.id)) === JSON.stringify(["result", "approve", "preview"]), `the executed move's audit events are wrong: ${JSON.stringify(eventsFor(existing.id))}`)) return;
+          if (!check(JSON.stringify(eventsFor(rejectId)) === JSON.stringify(["reject", "preview"]), `the rejected move's audit events are wrong: ${JSON.stringify(eventsFor(rejectId))}`)) return;
+          if (!check(!/smoke-|127\.0\.0\.1/.test(JSON.stringify(auditResponse.json)), "the audit log contains a title or URL")) return;
+
+          // Left pending on purpose: approved after the browser restart below.
+          const pendingPreview = await preview({ tabIds: [m5.id], destination: "new", title: "smoke-stale-move" });
+          if (!check(pendingPreview.status === 200 && pendingPreview.json?.result?.browserSessionId === sessionId, `could not preview the stale-session move: ${JSON.stringify(pendingPreview.json)}`)) return;
+          staleMoveActionId = pendingPreview.json.result.id;
+
+          console.log("Phase 2 Action 3 proof passed: previews moved nothing; Apply moved exactly the previewed tabs into an existing group and a new group; Reject moved nothing; invalid previews refused; a changed tab/destination was refused as stale; audit recorded.");
+        } finally {
+          for (const tabId of [m1.id, m2.id, m3.id, m4.id, ...extraTabIds]) await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(tabId)})`).catch(() => {});
+          if (secondWindowId !== null) await evaluate(swCdp, `chrome.windows.remove(${JSON.stringify(secondWindowId)})`).catch(() => {});
+        }
+      }
+    }
+
     // Detach from the service worker's own CDP target *before* the idle
     // wait, and do not reattach until a later step genuinely needs it
     // (Step 5's browser restart). A live DevTools Protocol session to a
@@ -2029,6 +2295,28 @@ async function main() {
     // Step 2.9 is bound to the pre-restart browser session, so the extension
     // must refuse it as stale before reading or changing anything — and the
     // real browser must have no group for it.
+    // Phase 2 Action 3, stale approval: the move preview left pending in Step
+    // 2.10 is bound to the pre-restart browser session, so the extension must
+    // refuse it as stale before reading or changing anything.
+    if (staleMoveActionId !== null) {
+      const staleMoveApproval = await serviceRequest(port, `/api/action.move_tabs.approve?id=${staleMoveActionId}`, { method: "POST", token });
+      const staleMoveOutcome = staleMoveApproval.json?.result;
+      if (
+        staleMoveApproval.status !== 200 ||
+        staleMoveOutcome?.state !== "stale" ||
+        staleMoveOutcome.result?.mutation !== "none" ||
+        staleMoveOutcome.result?.code !== "stale_session"
+      ) {
+        fail(`[Phase 2 move_tabs] approving a pre-restart preview was not refused as stale: ${staleMoveApproval.status} ${JSON.stringify(staleMoveApproval.json)}`);
+        return;
+      }
+      const leakedMoves = await evaluate(swCdp, `chrome.tabGroups.query({ title: "smoke-stale-move" }).then((groups) => groups.length)`);
+      if (leakedMoves !== 0) {
+        fail(`[Phase 2 move_tabs] a stale approval created ${leakedMoves} group(s)`);
+        return;
+      }
+    }
+
     if (staleGroupActionId !== null) {
       const staleGroupApproval = await serviceRequest(port, `/api/action.configure_group.approve?id=${staleGroupActionId}`, { method: "POST", token });
       const staleGroupOutcome = staleGroupApproval.json?.result;

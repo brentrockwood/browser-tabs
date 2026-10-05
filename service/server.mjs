@@ -27,6 +27,7 @@ import {
   MAX_REQUEST_BODY_BYTES,
   clipText,
   validateGroupPreviewRequest,
+  validateMovePreviewRequest,
 } from "./validation.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -137,6 +138,11 @@ const ACTION_ROUTES = new Map([
   ["action.configure_group.preview", { kind: "configure_group", operation: "preview" }],
   ["action.configure_group.approve", { kind: "configure_group", operation: "approve" }],
   ["action.configure_group.reject", { kind: "configure_group", operation: "reject" }],
+  // Phase 2 Action 3: move 1..100 selected tabs into one existing group or one
+  // new group, in one window — the same three owner-only routes.
+  ["action.move_tabs.preview", { kind: "move_tabs", operation: "preview" }],
+  ["action.move_tabs.approve", { kind: "move_tabs", operation: "approve" }],
+  ["action.move_tabs.reject", { kind: "move_tabs", operation: "reject" }],
 ]);
 // A preview body is one short URL (see MAX_OPEN_URL_LENGTH) or a handle and a
 // short title; anything near the store routes' 8 MiB request bound is refused
@@ -907,6 +913,58 @@ export function createService({
     return store.createAction({ kind: "configure_group", browserSessionId: inspected.browserSessionId, binding });
   }
 
+  // Phase 2 Action 3, step one: records a move preview and changes nothing. The
+  // body is exactly the tab ids and a destination — `existing` + `groupId`, or
+  // `new` + an optional `title`/`color` — never a session, window, or any
+  // current state. The extension is asked (read-only) about those tabs and the
+  // destination group: the answer's envelope supplies the browser session the
+  // preview is bound to, and each tab's window, group membership, and pinned
+  // state (and the group's window, title, and color) are what the preview
+  // binds and the extension re-checks before moving anything. Refused up
+  // front, with nothing stored: a pinned tab, tabs in more than one window, a
+  // destination group in another window, a missing handle, and a move that
+  // would change nothing (every tab already in the existing group).
+  async function previewMoveTabs(req) {
+    const request = validateMovePreviewRequest(parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES)));
+    const existing = request.destination === "existing";
+    const inspected = await sendExtensionRequest("browser.inspect_move_target", existing ? { tabIds: request.tabIds, groupId: request.groupId } : { tabIds: request.tabIds });
+    let validation;
+    try {
+      validation = validateMethodResult("browser.inspect_move_target", inspected);
+    } catch (error) {
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!validation.valid) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
+    if (inspected.status === "unsupported") throw codedError(ERROR_CODES.UNSUPPORTED_FEATURE, "this browser does not support tab groups; nothing was changed");
+    if (inspected.status !== "ok") {
+      if (inspected.code === ERROR_CODES.STALE_HANDLE) throw codedError(ERROR_CODES.STALE_HANDLE, "a tab or the group no longer exists");
+      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tabs or group");
+    }
+
+    const { tabs, group } = inspected;
+    const answeredFor = tabs.length === request.tabIds.length && tabs.every((tab, index) => tab.tabId === request.tabIds[index]);
+    if (!answeredFor || (existing ? group === null || group.groupId !== request.groupId : group !== null)) {
+      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported different tabs or a different group than the ones requested");
+    }
+    const windowId = tabs[0].windowId;
+    if (tabs.some((tab) => tab.windowId !== windowId)) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tabs are not all in one window");
+    if (tabs.some((tab) => tab.pinned)) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "a selected tab is pinned; a pinned tab cannot be put in a group");
+    if (existing && group.windowId !== windowId) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the destination group is not in the tabs' window");
+
+    const binding = {
+      destination: request.destination,
+      windowId,
+      // Only the bound state is kept: each tab's id and the group it is in now.
+      // The titles and addresses the inspection returned are read-only and are
+      // neither stored nor returned for a move.
+      tabs: tabs.map((tab) => ({ tabId: tab.tabId, groupId: tab.groupId })),
+      ...(existing
+        ? { groupId: group.groupId, expectedTitle: group.title ?? "", expectedColor: group.color }
+        : { title: request.title, color: request.color }),
+    };
+    return store.createAction({ kind: "move_tabs", browserSessionId: inspected.browserSessionId, binding });
+  }
+
   // Interprets the extension's answer to one approved `browser.open_tab`
   // into the outcome recorded on the action. Never throws: whatever
   // happened, the approved action must end in a recorded result, because
@@ -1066,7 +1124,116 @@ export function createService({
     };
   }
 
-  // Phase 2 Action 1, step two (and Action 2's, by kind): the one terminal
+  // Phase 2 Action 3: interprets the extension's answer to one approved
+  // `browser.move_tabs` into the outcome recorded on the action, on the same
+  // terms as executeConfigureGroup: never throws, `mutation` is "none" only when
+  // nothing was sent or changed and "unknown" when the request may have been
+  // acted on but the answer was lost, unusable, or says the one `tabs.group`
+  // call's effect is unknown (`changed: null`). A refusal because the previewed
+  // session, handle, or bound state no longer holds is `stale`; another
+  // refusal is `failed`/none. A move known to have been made but not completed
+  // or fully observed is `partial`, whose `tabIds` records only which tabs were
+  // actually observed in the destination (null, or an ordered subset of the
+  // bound ids). Every handle in a changed answer — the tab ids, the window, the
+  // destination group, and each observed tab — is compared with the stored
+  // binding; any mismatch makes the whole answer unusable (`failed`/unknown)
+  // rather than recording another browser object's state.
+  async function executeMoveTabs(action) {
+    const failed = (mutation, code, detail) => ({
+      state: "failed",
+      mutation,
+      code,
+      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
+      tabIds: null,
+      groupId: null,
+      windowId: null,
+      observed: null,
+    });
+    // The binding holds only the bound state (tab ids and their groups, the
+    // window, the destination): exactly what the extension is asked to check.
+    const bound = action.binding;
+    const boundIds = bound.tabs.map((tab) => tab.tabId);
+    const existing = bound.destination === "existing";
+
+    let result;
+    try {
+      result = await sendExtensionRequest("browser.move_tabs", { browserSessionId: action.browserSessionId, ...bound });
+    } catch (error) {
+      const code = Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR;
+      return error?.requestSent === false
+        ? failed("none", code, "the request was never sent to the extension")
+        : failed("unknown", code, "the request was sent but no answer arrived; the browser may or may not have moved the tabs");
+    }
+
+    let validation;
+    try {
+      validation = validateMethodResult("browser.move_tabs", result);
+    } catch (error) {
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!validation.valid) return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
+
+    const detail = typeof result.detail === "string" ? clipText(result.detail, MAX_ACTION_DETAIL_LENGTH) : null;
+    const mismatch = () => failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview");
+    if (result.changed === false) {
+      const state = STALE_GROUP_CODES.includes(result.code) ? "stale" : "failed";
+      return { state, mutation: "none", code: clipText(result.code, MAX_CODE_LENGTH), detail, tabIds: null, groupId: null, windowId: null, observed: null };
+    }
+    if (result.changed === null) {
+      // The one tabs.group call was attempted and whether it changed the
+      // browser is unknown: terminal failed with an unknown mutation — never
+      // "none" (it may have applied) and never "moved" (it may not have).
+      if (result.browserSessionId !== action.browserSessionId) return mismatch();
+      return failed("unknown", clipText(result.code, MAX_CODE_LENGTH), detail ?? "the browser may or may not have moved the tabs");
+    }
+
+    // A move is known to have been made. Its answer must still be about *this* preview.
+    if (result.browserSessionId !== action.browserSessionId) return mismatch();
+    if (result.status !== "ok") {
+      // Partial: the window must be the preview's own, and an existing
+      // destination its own group; only a new group's handle is newly assigned
+      // (and may be null). `tabIds` says which tabs were actually *observed* in
+      // the destination: null, or an ordered subset of the bound tabs — never
+      // other tabs, repeats, or another order.
+      let next = 0;
+      const subset =
+        result.tabIds === null ||
+        result.tabIds.every((id) => {
+          next = boundIds.indexOf(id, next) + 1;
+          return next > 0;
+        });
+      const ownHandles = subset && result.windowId === bound.windowId && (!existing || result.groupId === bound.groupId);
+      if (!ownHandles) return mismatch();
+      return { state: "partial", mutation: "moved", code: result.code, detail, tabIds: result.tabIds, groupId: result.groupId, windowId: result.windowId, observed: null };
+    }
+    const { group, tabs } = result;
+    if (
+      result.destination !== bound.destination ||
+      group.windowId !== bound.windowId ||
+      (existing && group.groupId !== bound.groupId) ||
+      tabs.length !== boundIds.length ||
+      !tabs.every((tab, index) => tab.tabId === boundIds[index] && tab.windowId === bound.windowId && tab.groupId === group.groupId)
+    ) {
+      return mismatch();
+    }
+    return {
+      state: "executed",
+      mutation: "moved",
+      code: null,
+      detail: null,
+      tabIds: boundIds,
+      groupId: group.groupId,
+      windowId: group.windowId,
+      observed: {
+        windowId: group.windowId,
+        title: clipText(group.title, MAX_OBSERVED_TITLE_LENGTH),
+        color: clipText(group.color, MAX_OBSERVED_STATUS_LENGTH),
+        collapsed: group.collapsed,
+      },
+    };
+  }
+
+  // Phase 2 Action 1, step two (and Action 2's and 3's, by kind): the one terminal
   // decision on a stored preview, by id alone — no body and no other query
   // parameter, so the caller cannot restate or alter what is being decided.
   // The route names the action kind and an action of another kind is simply
@@ -1097,7 +1264,8 @@ export function createService({
       throw error;
     }
     const action = store.decideAction(id, "approve");
-    const outcome = await (kind === "open_tab" ? executeOpenTab(action) : executeConfigureGroup(action));
+    const execute = kind === "open_tab" ? executeOpenTab : kind === "configure_group" ? executeConfigureGroup : executeMoveTabs;
+    const outcome = await execute(action);
     try {
       return store.recordActionResult(id, outcome);
     } catch (error) {
@@ -1151,7 +1319,9 @@ export function createService({
     try {
       let result;
       if (route.operation !== "preview") result = await decideBrowserAction(route.kind, route.operation, req, url);
-      else result = route.kind === "open_tab" ? await previewOpenTab(req) : await previewConfigureGroup(req);
+      else if (route.kind === "open_tab") result = await previewOpenTab(req);
+      else if (route.kind === "configure_group") result = await previewConfigureGroup(req);
+      else result = await previewMoveTabs(req);
       respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result });
     } catch (error) {
       const known =

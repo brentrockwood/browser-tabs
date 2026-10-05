@@ -6,6 +6,7 @@
 // never string concatenation — this module is the separate, additional
 // defense of rejecting malformed/oversized input outright.
 import {
+  MAX_MOVE_TABS,
   MAX_TEXT_CHARACTERS,
   TAB_GROUP_COLORS,
   isValidGroupColor,
@@ -13,6 +14,7 @@ import {
   isValidHandle,
   isValidTimestamp,
   normalizeGroupConfig,
+  normalizeMoveConfig,
   normalizeOpenUrl,
   validateMethodResult,
 } from "../extension/protocol.js";
@@ -502,15 +504,16 @@ export function validateRetentionUpdateInput(input = {}) {
 
 // ---- Phase 2 Action 1: open a URL in a new tab ----
 
-export const ACTION_KINDS = Object.freeze(["open_tab", "configure_group"]);
+export const ACTION_KINDS = Object.freeze(["open_tab", "configure_group", "move_tabs"]);
 // previewed -> approved | rejected; approved -> one of the four result
 // states. Every state after "previewed" other than "approved" is terminal.
 export const ACTION_STATES = Object.freeze(["previewed", "approved", "rejected", "executed", "partial", "stale", "failed"]);
 export const ACTION_RESULT_STATES = Object.freeze(["executed", "partial", "stale", "failed"]);
 // What the browser is known to have undergone: nothing, one new tab (or, for a
 // group action, one new group), one existing group updated, or unknown (the
-// request was sent but its outcome never came back intact).
-export const ACTION_MUTATIONS = Object.freeze(["none", "created", "updated", "unknown"]);
+// request was sent but its outcome never came back intact), or — for a
+// move_tabs action — the selected tabs moved into a group.
+export const ACTION_MUTATIONS = Object.freeze(["none", "created", "updated", "moved", "unknown"]);
 // Each kind's own subset: opening a tab never "updates" anything.
 const OPEN_TAB_MUTATIONS = Object.freeze(["none", "created", "unknown"]);
 export const ACTION_AUDIT_EVENTS = Object.freeze(["preview", "approve", "reject", "result"]);
@@ -543,6 +546,10 @@ export function validateActionPreviewInput(input = {}) {
   if (input.kind === "configure_group") {
     const browserSessionId = requireNonEmptyString(input.browserSessionId, "browserSessionId", { maxLength: MAX_SESSION_ID_LENGTH });
     return { kind: "configure_group", url: null, binding: validateGroupBinding(input.binding), browserSessionId };
+  }
+  if (input.kind === "move_tabs") {
+    const browserSessionId = requireNonEmptyString(input.browserSessionId, "browserSessionId", { maxLength: MAX_SESSION_ID_LENGTH });
+    return { kind: "move_tabs", url: null, binding: validateMoveBinding(input.binding), browserSessionId };
   }
   if (input.kind !== undefined && input.kind !== "open_tab") fail("kind", `must be one of: ${ACTION_KINDS.join(", ")}`);
   const checked = normalizeOpenUrl(input.url);
@@ -589,6 +596,46 @@ export function validateGroupPreviewRequest(body) {
   return { operation: body.operation, [handleName]: body[handleName], title: body.title ?? null, color: body.color ?? null };
 }
 
+// Phase 2 Action 3: what a stored move preview binds — the destination, the
+// window, and every selected tab with the group it was in (see
+// normalizeMoveConfig in extension/protocol.js for the rules, shared with the
+// extension). Only that bound state is kept: no tab title or address, whatever
+// the input carried, so a stored move is small enough to always list (at most
+// 100 short entries) and retains no more browser content than it must.
+function validateMoveBinding(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) fail("binding", "must be a plain object");
+  const checked = normalizeMoveConfig(value);
+  if (!checked.valid) fail("binding", checked.reason);
+  return checked.config;
+}
+
+// The HTTP body of a move preview: the exact tab ids and a destination, and
+// nothing else — never a session, a window, or any current state (those are
+// learned from the browser). `destination: "existing"` names one group;
+// `destination: "new"` may carry a title and/or color for the group created.
+export function validateMovePreviewRequest(body) {
+  const accepted = {
+    existing: ["tabIds", "destination", "groupId"],
+    new: ["tabIds", "destination", "title", "color"],
+  };
+  if (typeof body.destination !== "string" || !Object.hasOwn(accepted, body.destination)) fail("destination", 'must be "existing" or "new"');
+  for (const key of Object.keys(body)) {
+    if (!accepted[body.destination].includes(key)) fail(key, `is not accepted for destination "${body.destination}"`);
+  }
+  const { tabIds } = body;
+  if (!Array.isArray(tabIds) || tabIds.length < 1 || tabIds.length > MAX_MOVE_TABS) fail("tabIds", `must list between 1 and ${MAX_MOVE_TABS} tab ids`);
+  if (!tabIds.every(isValidHandle)) fail("tabIds", "every entry must be a non-negative safe integer");
+  if (new Set(tabIds).size !== tabIds.length) fail("tabIds", "must not repeat a tab id");
+  if (body.destination === "existing") {
+    if (!isValidHandle(body.groupId)) fail("groupId", "must be a non-negative safe integer");
+    return { tabIds, destination: "existing", groupId: body.groupId };
+  }
+  if (Object.hasOwn(body, "title") && !isValidGroupTitle(body.title)) fail("title", "must be plain text with no control characters, within the bound");
+  if (Object.hasOwn(body, "color") && !isValidGroupColor(body.color)) fail("color", `must be one of: ${TAB_GROUP_COLORS.join(", ")}`);
+  if (body.title === "") fail("title", "a new group cannot be created with an empty title");
+  return { tabIds, destination: "new", title: body.title ?? null, color: body.color ?? null };
+}
+
 function validateObservedTab(value) {
   if (value === null) return null;
   if (typeof value !== "object" || Array.isArray(value)) fail("observed", "must be a plain object or null");
@@ -609,6 +656,7 @@ function validateObservedTab(value) {
 // "stale" means nothing was.
 export function validateActionResultInput(input = {}, kind = "open_tab") {
   if (kind === "configure_group") return validateGroupResultInput(input);
+  if (kind === "move_tabs") return validateMoveResultInput(input);
   const state = requireEnum(input.state, ACTION_RESULT_STATES, "state");
   const mutation = requireEnum(input.mutation, OPEN_TAB_MUTATIONS, "mutation");
   if ((state === "executed" || state === "partial") && mutation !== "created") {
@@ -673,4 +721,46 @@ function validateGroupResultInput(input) {
     fail("tabId/groupId/windowId", `must be omitted when state is "${state}"`);
   }
   return { state, mutation, code, detail, tabId, groupId, windowId, observed };
+}
+
+// The move-tabs counterpart. "executed" means the tabs were moved and the
+// group and every tab were observed afterwards (`mutation` "moved", with the
+// moved tab ids, the group's handle, the window, and the observed group);
+// "partial" means a move is known to have been made but a new group's
+// title/color update or the read-back did not complete (`mutation` "moved", the
+// window known, the group handle when known, and `tabIds` only the tabs that
+// were actually observed in the destination — null if none or unavailable, so
+// a known move is never taken to mean every tab was seen moving); "stale" and
+// "failed" carry no handles or observation, "stale" is always a certain no-op,
+// and a failed outcome whose effect is unknown has mutation "unknown".
+function validateMoveResultInput(input) {
+  const state = requireEnum(input.state, ACTION_RESULT_STATES, "state");
+  const mutation = requireEnum(input.mutation, ["none", "moved", "unknown"], "mutation");
+  if ((state === "executed" || state === "partial") && mutation !== "moved") fail("mutation", `must be "moved" when state is "${state}"`);
+  if (state === "stale" && mutation !== "none") fail("mutation", 'must be "none" when state is "stale"');
+  if (state === "failed" && mutation === "moved") fail("mutation", 'must be "none" or "unknown" when state is "failed"');
+  const code = state === "executed" ? null : requireNonEmptyString(input.code, "code", { maxLength: MAX_CODE_LENGTH });
+  const detail = optionalNullableString(input.detail, "detail", { maxLength: MAX_ACTION_DETAIL_LENGTH });
+  const groupId = optionalNullableHandle(input.groupId, "groupId");
+  const windowId = optionalNullableHandle(input.windowId, "windowId");
+  let tabIds = input.tabIds ?? null;
+  if (tabIds !== null) {
+    if (!Array.isArray(tabIds) || tabIds.length < 1 || tabIds.length > MAX_MOVE_TABS || !tabIds.every(isValidHandle)) {
+      fail("tabIds", `must list between 1 and ${MAX_MOVE_TABS} tab ids`);
+    }
+    tabIds = [...tabIds];
+  }
+  const observed = validateObservedGroup(input.observed ?? null);
+  if (state === "executed" && (observed === null || groupId === null || windowId === null || tabIds === null)) {
+    fail("observed", 'is required, with tabIds, groupId, and windowId, when state is "executed"');
+  }
+  // A partial outcome knows a move was made (`mutation` "moved") and its window;
+  // `tabIds` is only which tabs were *observed* in the destination — null when
+  // none were or observation was unavailable — so it is not required here.
+  if (state === "partial" && windowId === null) fail("windowId", 'is required when state is "partial"');
+  if (state !== "executed" && observed !== null) fail("observed", 'is only allowed when state is "executed"');
+  if ((state === "stale" || state === "failed") && (tabIds !== null || groupId !== null || windowId !== null)) {
+    fail("tabIds/groupId/windowId", `must be omitted when state is "${state}"`);
+  }
+  return { state, mutation, code, detail, tabIds, groupId, windowId, observed };
 }

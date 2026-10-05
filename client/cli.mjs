@@ -27,7 +27,7 @@
 //   BROWSER_TABS_AGENT_TOKEN             the external-agent credential, or:
 //   BROWSER_TABS_AGENT_CREDENTIAL_FILE   path to a file containing it,
 //                                        default ~/.browser-tabs/agent-token
-//   BROWSER_TABS_PROTOCOL_VERSION        default 4
+//   BROWSER_TABS_PROTOCOL_VERSION        default 5
 //
 // Exit code is 0 on success (result JSON on stdout), 1 on any failure
 // (message on stderr). The credential is never printed or logged.

@@ -520,6 +520,66 @@ real Firefox smoke (tab groups cleanly unsupported), and Terra re-review with
 no remaining blocker. See README.md's "Phase 2, Action 2: create, rename, or
 recolor a tab group" for the contract, UI, assumptions, and limitations.
 
+### Action 3 (move selected tabs into a group): complete
+
+Action 3 again reuses the earlier actions' decisions: the same owner-only
+preview → decide-by-id-alone → execute-once → recorded, audited result, in the
+same action store, state machine, and append-only audit log (`kind` is now
+`open_tab`, `configure_group`, or `move_tabs`; the audit still holds only fixed
+server enums, with `moved` added to the result `mutation` values). The owner
+selects 1–100 current, unpinned tabs in one window and moves them into one
+existing group in that window or one new group (optionally titled/colored).
+Renaming or recoloring a group stays Action 2's job; there is no archive or close
+(Action 4). What is specific to it:
+
+- **The preview binds the browser's own state for every tab.** The caller
+  supplies exact tab ids and a destination — never a session, window, or current
+  state. The service asks the extension (read-only `browser.inspect_move_target`,
+  no HTTP route) and binds the session from that answer plus each tab's window,
+  group membership, and pinned state (and an existing destination's window,
+  title, and color). Pinned tabs, tabs in two windows, a destination in another
+  window, missing handles, duplicates, out-of-bound lists, and a move that
+  changes nothing are refused up front. The stored binding is only that bound
+  state — tab ids and the group each is in, never a title or address — and each
+  tab's source group is shown in the preview; a source group emptied by the move
+  disappearing is the browser's own behavior, documented rather than reported as
+  a change.
+- **The extension revalidates every handle immediately before mutating**
+  (`browser.move_tabs`): session, request shape, each tab's window/membership/
+  pinned state, the destination group, then one `tabs.group` with the whole list
+  (existing: `{groupId, tabIds}`; new: `{tabIds, createProperties: {windowId}}`)
+  and, for a new group with a title/color, one `tabGroups.update`. Nothing is
+  retried, and the group and each tab are read back. The browser has no atomic
+  check-and-move, so that window is documented, not closed.
+- **Truthful about what is known.** If the one `tabs.group` call rejects, or a
+  new-group call resolves with no usable group id, the extension answers
+  `changed: null` and the action is `failed` with mutation `unknown` — never
+  `none` (it may have applied) and never `moved`. Once the call resolves with a
+  usable group a move is known, and a partial result's `tabIds` says only which
+  tabs were *observed* in the destination (null, or the ordered subset actually
+  seen); only a full ok result says every tab was.
+- **The service compares every returned handle with the binding.** An `ok` or
+  `partial` answer naming other tabs (a partial's ids must be null or an ordered
+  subset of the bound ones), another window, another group (for an existing
+  destination), or another session is recorded `failed`/`unknown`.
+- **Protocol bumped to 5** (a version-4 peer lacks the method), database schema to
+  5 (migration v5 widens `actions` again, keeping rows, bindings, ids, and the
+  audit log).
+
+Terra's first review found three issues, all fixed with regression coverage: an
+unknown effect was reported as "nothing changed" or "all moved" (now `changed:
+null` → `failed`/`unknown`, and partial ids name only the observed subset);
+display-only tab titles/addresses were persisted in move previews, which could
+make 50 pending previews too large to list (now omitted from the stored
+binding, with the maximum list tested under the response cap); and a per-list
+UI refresh left a stale move selection (now "Load tabs" clears selection and
+destination, while "Load groups" clears only the destination). The final gate
+passed `npm test` (690/690), a clean dependency audit, version/build/lifecycle
+checks, the real Chrome for Testing bridge smoke including Action 3, the real
+Firefox smoke (tab groups cleanly unsupported), and Terra re-review with no
+remaining blocker. See README.md's "Phase 2, Action 3: move selected tabs into
+a group" for the contract, UI, assumptions, and limitations.
+
 ## Later work
 
 These are intentionally outside the first two phases:
@@ -537,15 +597,15 @@ review.
 
 ## Current repository state
 
-Phase 2 Actions 1 and 2 are complete on top of the completed Phase 1 described
-below. Action 2's final gate passed 587/587 automated tests, a clean dependency
+Phase 2 Actions 1–3 are complete on top of the completed Phase 1 described
+below. Action 3's final gate passed 690/690 automated tests, a clean dependency
 audit, version/build/lifecycle checks, real Chrome and Firefox smokes, and
-independent Terra re-review after all four findings were fixed; see "Action 2"
+independent Terra re-review after all three findings were fixed; see "Action 3"
 above.
-These are the only two browser mutations in the repository; the Phase 1
+These are the only three browser mutations in the repository; the Phase 1
 statements below that no mutation exists describe Phase 1 as it was completed
-and are otherwise unchanged. `PROTOCOL_VERSION` is now `4` and the database
-schema version `4`.
+and are otherwise unchanged. `PROTOCOL_VERSION` is now `5` and the database
+schema version `5`.
 
 The repository contains a stabilized Manifest V3 inspector (Stage 0, below)
 and an implemented Stage 1 local bridge: a Node.js service (`service/`)

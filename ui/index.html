@@ -205,6 +205,46 @@
   </form>
   <p id="group-form-status" role="status" aria-live="polite"></p>
 
+  <h3 id="move-heading">Move tabs into a group</h3>
+  <p>
+    The same two steps for moving several tabs at once, in Chromium-family browsers only. Under "Windows, tabs,
+    and groups" above, tick <strong>Select for moving</strong> on 1 to 100 loaded, unpinned tabs that are all in
+    one window, then either press <strong>Move selected tabs here…</strong> on a loaded group in that same window,
+    or keep the default <strong>new group</strong> (optionally with a title and color below).
+    <strong>Preview</strong> records exactly which tabs, which group each is in now, and the destination; then
+    <strong>Apply</strong> on that preview moves them once, only if every tab and the destination are still as
+    previewed, or <strong>Reject</strong> discards it. A group left with no tabs is removed by the browser itself.
+    Renaming or recoloring an existing group is the form above, not this one.
+  </p>
+  <form id="move-form">
+    <p id="move-selection" role="status" aria-live="polite">No tabs selected.</p>
+    <p id="move-destination">Destination: a new group.</p>
+    <button type="button" id="move-new-button" disabled>Use a new group</button>
+    <button type="button" id="move-clear-button" disabled>Clear selection</button>
+    <div class="field">
+      <label for="move-title-input">Title for a new group</label>
+      <input type="text" id="move-title-input" name="title" autocomplete="off" spellcheck="false" maxlength="100" aria-describedby="move-title-help">
+      <p id="move-title-help">Up to 100 characters. Used only for a new group; leave empty for none.</p>
+    </div>
+    <div class="field">
+      <label for="move-color-select">Color for a new group</label>
+      <select id="move-color-select" name="color">
+        <option value="">The browser's choice</option>
+        <option value="grey">grey</option>
+        <option value="blue">blue</option>
+        <option value="red">red</option>
+        <option value="yellow">yellow</option>
+        <option value="green">green</option>
+        <option value="pink">pink</option>
+        <option value="purple">purple</option>
+        <option value="cyan">cyan</option>
+        <option value="orange">orange</option>
+      </select>
+    </div>
+    <button type="submit" id="move-preview-button" disabled>Preview move</button>
+  </form>
+  <p id="move-form-status" role="status" aria-live="polite"></p>
+
   <p id="action-decision-status" role="status" aria-live="polite"></p>
   <button type="button" id="refresh-actions-button" disabled>Refresh actions</button>
   <p id="actions-status" role="status" aria-live="polite"></p>

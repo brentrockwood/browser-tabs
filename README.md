@@ -125,10 +125,10 @@ reporting it at face value.
 ### Calling the API
 
 ```sh
-curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 4" http://127.0.0.1:8743/api/browser.list_windows
+curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 5" http://127.0.0.1:8743/api/browser.list_windows
 ```
 
-Returns `{"protocolVersion": 4, "requestId": "...", "result": {...}}`, where
+Returns `{"protocolVersion": 5, "requestId": "...", "result": {...}}`, where
 `result` is the same capture-provenance-wrapped object the extension's
 `runtime.onMessage` listener produces (see "Stage 2: the read API" below).
 `requestId` echoes an `X-Request-Id` header you send, or is generated if you
@@ -1256,7 +1256,7 @@ listing, and this script never logs the token itself:
 | `BROWSER_TABS_URL` | `http://127.0.0.1:8743` |
 | `BROWSER_TABS_AGENT_TOKEN` | _(unset; takes precedence over the file below)_ |
 | `BROWSER_TABS_AGENT_CREDENTIAL_FILE` | `~/.browser-tabs/agent-token` |
-| `BROWSER_TABS_PROTOCOL_VERSION` | `4` |
+| `BROWSER_TABS_PROTOCOL_VERSION` | `5` |
 
 Note this is the **agent** credential, read via a bounded `open`/`stat`/
 `read` sequence capped well below the file's expected size — never
@@ -2559,11 +2559,11 @@ group actions exactly as to tab actions.
 
 ### Protocol: version 4
 
-`PROTOCOL_VERSION` is `4`. A version-3 extension would answer
-`browser.configure_group` with a bare `unknown_method` and no `changed` flag,
-so the handshake refuses the mismatch (`unsupported_protocol_version`) rather
-than the service ever sending it a second mutating request. The review UI, the
-reference agent client, and every test client send version `4`.
+`PROTOCOL_VERSION` became `4` here (it is now `5`, see Action 3 below). A
+version-3 extension would answer `browser.configure_group` with a bare
+`unknown_method` and no `changed` flag, so the handshake refuses the mismatch
+(`unsupported_protocol_version`) rather than the service ever sending it a
+second mutating request.
 
 ### Storage and audit
 
@@ -2664,6 +2664,263 @@ content; and a preview left pending is refused as `stale_session` after the
 browser restart; a tab in a non-current second window staying in that window
 with its group; and a pinned tab refused at preview and left pinned and
 ungrouped. The complete smoke passed against the fixed revision.
+
+## Phase 2, Action 3: move selected tabs into a group
+
+The third action project.md lists: moving selected tabs into an existing or new
+group. It reuses Actions 1 and 2's contract unchanged — owner-only; a stored
+preview, then one terminal decision by id alone; execute exactly once; a
+recorded, audited result — and adds a third action kind, `move_tabs`, to the
+same store, state machine, and audit log. **Status: complete.** Terra's first
+review found three issues, all fixed with regression coverage: (1) a rejected
+`tabs.group`, or a new-group call resolving with no usable group id, was
+reported as "nothing changed" or as every tab moved, though its effect is
+unknown — now `changed: null` → `failed`/`unknown`, and a partial outcome claims
+only the tabs actually observed in the group; (2) previews persisted
+display-only tab titles and addresses, which made a full list of pending
+previews potentially too large to return — a stored move now keeps only the
+bound state, and the maximum 50 pending 100-tab previews list under the response
+cap; (3) the UI kept stale selections across per-list refreshes. The final gate
+passed `npm test` (690/690), `npm audit --omit=dev`, version/build/lifecycle
+checks, the real Chrome for Testing bridge smoke including Action 3, the real
+Firefox smoke (tab groups cleanly unsupported), and Terra re-review with no
+remaining blocker.
+
+The owner selects **1–100 current, unpinned tabs, all in one window**, and moves
+them either (a) into **one existing group in that same window** or (b) into
+**one newly created group** in that window, optionally with a bounded title
+and/or native color. Tabs may currently be ungrouped or in other groups. Renaming
+or recoloring an *existing* group stays Action 2's job (a move into an existing
+group never changes its title or color). There is no archive or close behavior
+(project.md's Action 4).
+
+### The two steps
+
+1. **Preview** — `POST /api/action.move_tabs.preview`. The body is the exact tab
+   ids and a destination, and nothing else (any other field, including a
+   session, window, or current state, is a `400`):
+
+   ```json
+   {"tabIds": [5, 6, 7], "destination": "existing", "groupId": 10}
+   {"tabIds": [5, 6, 7], "destination": "new", "title": "Reading", "color": "blue"}
+   ```
+
+   `tabIds` is 1 to 100 distinct non-negative integers (duplicates, a repeat,
+   other types, or more than 100 are `400`). `title` (new group only) is plain
+   text of at most 100 characters with no control characters (`""` is refused:
+   a new group has no title to clear); `color` is Chrome's native
+   `tabGroups.Color` enum. The service asks the extension (a **read-only**
+   `browser.inspect_move_target`, never reachable over HTTP) about those tabs and
+   the destination group. Its answer supplies the **`browserSessionId` the
+   preview is bound to** (a caller can never supply one) and, for every tab in
+   the order given, its window, the group it is in now (`-1` for none), and its
+   pinned state (the read-only answer also carries each tab's title and address,
+   which the service neither stores nor returns for a move); for an existing
+   destination, that group's window, title, and color. The preview binds only
+   that bound state — **tab ids and the group each is in, never a title or
+   address**. It is
+   refused up front, with nothing stored, for a **pinned tab**, **tabs in more
+   than one window**, a **destination group in another window** (each `409
+   conflict`), a **move into an existing group that every listed tab is
+   already in** (`400 validation_error` — at least one tab must not be), a
+   tab or group that no longer exists (`409 stale_handle`), and a browser with no
+   tab groups (`501 unsupported_feature`). Nothing is moved.
+   **The preview shows each tab's current group**, so the source memberships
+   that will be left are visible before you decide. A source group left with no
+   tabs is **removed by the browser itself**; that disappearance is not a separate
+   change the extension makes or reports.
+2. **Decide** — `POST /api/action.move_tabs.approve?id=<n>` or `.../reject?id=<n>`:
+   the id alone, no body and no other query parameter (a `400`), and only on an
+   action of this kind (another kind's id is a `404` that decides nothing).
+   Approve requires a connected extension (the preview is not consumed
+   otherwise), commits the decision with the same race-safe conditional
+   `UPDATE`, and only the winner sends one `browser.move_tabs` request built from
+   the **stored** binding.
+
+The three action routes are owner-only (`403 forbidden_scope` for the
+external-agent credential). `browser.move_tabs` and `browser.inspect_move_target`
+have no HTTP route (`404` for either credential), and the extension's
+`runtime.onMessage` listener answers both as `unknown_method` — they are
+dispatched only from the authenticated service connection.
+
+### Execution: revalidate, mutate once, observe
+
+In the extension, `moveTabs`:
+
+- checks `browserSessionId` (`stale_session`) and re-validates the whole request
+  with the same rules the preview used (`normalizeMoveConfig` in
+  `extension/protocol.js`, one definition shared by both sides), then
+  feature-detects `tabGroups` **and** `tabs.group` (a browser without them
+  answers `unsupported_feature` before anything is read or changed);
+- re-reads **every selected tab** and, for an existing destination, the group,
+  with no `await` between that read and the mutation. Each tab must still be in
+  the previewed window, in the group it was in at preview, and not pinned; the
+  group must still be in the previewed window with its previewed title and
+  color. A vanished handle is `stale_handle`; anything else that moved is
+  `state_mismatch`; either changes nothing;
+- calls `tabs.group` **exactly once with the whole list** — existing:
+  `{ groupId, tabIds }`; new: `{ tabIds, createProperties: { windowId } }` (the
+  previewed window is named explicitly, so no tab is moved to the browser's
+  current window) — and, for a new group with a title and/or color,
+  `tabGroups.update` once. Nothing is retried;
+- reports the destination group and **each moved tab as read back**
+  (`tabGroups.get` / `tabs.get`), not an echo of the request. Only a result in
+  which *every* bound tab was observed in the destination group in the previewed
+  window is `ok`; otherwise it is the partial outcome (below), which names only
+  the tabs that were actually seen there.
+
+What the extension can truthfully say about whether the browser changed:
+`changed: false` — refused or failed *before* the one `tabs.group` call, nothing
+changed; `changed: null` — the call was attempted but its effect is unknown (it
+rejected — which can follow the browser having applied the move — or a
+new-group call resolved with no usable group id); `changed: true` — the call
+resolved with a usable destination group, so a move is known. The result
+recorded on the action follows:
+
+| Action `state` | Meaning | `result.mutation` |
+| --- | --- | --- |
+| `executed` | the tabs were moved and the group and **every** bound tab were observed (`result.tabIds` = all of them, `groupId`, `windowId`, and `observed`: the group's window, title, color, collapsed) | `moved` |
+| `partial` | a move is **known** to have been made, but a new group's title/color update failed (`group_update_failed`), or the read-back failed or did not show every tab in the group (`observe_failed`). `windowId` is recorded and `groupId` when known; **`tabIds` says only which tabs were observed in the destination — `null` (none, or observation unavailable) or the ordered subset actually seen — never "all moved"** | `moved` |
+| `stale` | `stale_session`, `stale_handle`, or `state_mismatch`: what was previewed no longer holds; nothing moved | `none` |
+| `failed` | the extension refused or failed before the `tabs.group` call (`unsupported_feature`, `invalid_params`), or the request was never sent | `none` |
+| `failed` | the one `tabs.group` call's effect is unknown (`changed: null`: `group_failed`, `observe_failed`), or the request was sent but no usable answer came back (`request_timeout`, `disconnected` mid-request, `invalid_extension_response`) | `unknown` |
+| `rejected` | you rejected the preview; nothing moved (no result) | — |
+
+HTTP `200` once the decision committed; a decided action is never retried. The
+service validates the extension's answer like every other
+(`validateMethodResult`) and then **compares every handle in it with the stored
+binding**: an `ok` answer must name the same destination kind and window, an
+existing group's own id, and exactly the bound tabs in order, each observed in
+that window and in the destination group; a `partial` answer must name the bound
+window, an existing destination's own group id (only a new group's handle is
+newly assigned), and `tabIds` that is `null` or an ordered subset of the bound
+ids (no foreign tab, repeat, or reordering); a `changed: null` answer for the
+right session is `failed`/`unknown` with the extension's (clipped) code. Any
+mismatch, a different session, or an unusable answer is recorded as
+`failed`/`unknown` (`invalid_extension_response`), never as success, partial,
+or "nothing changed". Crash/restart
+reconciliation and `store.clear` refusal while an action is in flight apply to
+move actions exactly as to the other kinds.
+
+### Protocol: version 5
+
+`PROTOCOL_VERSION` is `5`. A version-4 extension would answer
+`browser.move_tabs` with a bare `unknown_method` and no `changed` flag, so the
+handshake refuses the mismatch (`unsupported_protocol_version`) rather than the
+service ever sending it a third mutating request. The review UI, the reference
+agent client, and every test client send version `5`.
+
+### Storage and audit
+
+Migration v5 (non-breaking, in its own transaction) rebuilds `actions` once more
+to allow the new kind — the same rebuild as v4, copying every column (`binding`
+included), carrying the AUTOINCREMENT counter over, recreating the index and
+immutability triggers, and leaving `action_audit` untouched. A move's binding
+(destination, window, every tab's id with the group it was in — **no tab title or
+address, whatever the input carried** — and either the destination group's bound
+title/color or the new group's requested title/color) and its result (`tabIds`,
+`groupId`, `windowId`, `observed`) are the existing JSON columns, wiped by
+`store.clear`. A binding is a few kilobytes at most, so the 50-pending bound
+keeps `store.actions.list` far under the response cap (a regression test lists 50
+pending 100-tab previews with the widest possible ids). The audit log is unchanged in shape
+and content: `kind` may now be `move_tabs`, a result's `mutation` may be `moved`,
+and nothing else — **no title, color, URL, handle, session id, or extension-
+supplied code/detail** — ever enters it.
+
+### In the review UI
+
+Under "Windows, tabs, and groups", every loaded tab row has a **Select tab N
+for moving** checkbox (a pinned tab's is disabled and says so), and every loaded
+group row has **Move selected tabs here…**. The "Move tabs into a group" form
+shows the selected tab ids and window as live status text, the destination
+(a new group by default, or the chosen existing group; **Use a new group**
+switches back), a labelled title and color for a new group, **Clear selection**,
+and **Preview move**. Selecting is bounded in the page itself (at most 100 tabs,
+all in one window; a violating tick is undone with a message), and nothing is
+sent until Preview. The stored preview appears in the same actions list with
+**Apply** / **Reject** (only while `previewed`), decided by id alone and reread
+from the service afterwards, with the same double-submit and stale-list guards;
+it lists every tab id with the group it is in now (no titles or addresses) and
+states that a group left empty is removed by the browser. A result shows whether a
+move was made and, separately, **"Observed in the group"**: the tabs actually seen
+there afterwards, or "none observed (or observation unavailable)". The selection
+and destination are dropped on Disconnect, on a stale or *replaced* browser
+session, and on every fresh "Load windows" (whose rows are rebuilt); a fresh
+**Load tabs** drops the whole selection and destination (those tab rows are being
+replaced) and a fresh **Load groups** drops only the destination (the ticked tabs
+survive, so "select tabs, then load groups" works), so ids cannot cross sessions
+or lists. Everything browser-derived is rendered with `textContent` only.
+
+### Limitations and assumptions
+
+- **Chromium-family only.** Firefox's package omits the `tabGroups` permission,
+  so every move request there answers `unsupported_feature` (no mutation); the
+  real Firefox regression smoke also passes, though it does not invoke a move.
+- The browser offers no atomic check-and-move: a user action between the
+  extension's re-read and `tabs.group` is not detectable. The window is a few
+  microtasks, not zero.
+- A `tabs.group` that rejects is **not** assumed to have changed nothing: it is
+  `changed: null` and recorded `failed`/`unknown`, as is a lost answer. After a
+  call that resolves, a move is known, but `tabs.group` on many tabs is one
+  browser call whose atomicity *inside* the browser is not claimed — the
+  read-back is what is reported, and a tab not seen in the group is `partial`
+  naming only the tabs that were seen. A `tabGroups.update` rejecting on a new
+  group is `partial` (the move stands, no tab claimed observed).
+- A tab already in an existing destination may be listed (at least one other
+  must not be); the browser may reorder it. The order of tabs inside the group is
+  neither requested nor reported.
+- Destination groups whose current title is longer than 100 characters or holds
+  control characters cannot be bound (the preview is refused), as in Action 2.
+- Previews have no wall-clock expiry; the only staleness boundary is the session
+  and the bound-state re-check. `collapsed` is observed but never changed.
+
+### Tests
+
+`test/move-tabs-extension.test.mjs`: `normalizeMoveConfig` (bounds 1–100,
+duplicates, memberships, the no-op rule, new vs existing fields) and the two
+methods' result validation (every non-`ok` `changed` shape), and the worker
+against a stateful mock browser — inspection (order, memberships, pinned,
+unsupported, invalid ids); a move into a new group (one `tabs.group` call with
+the whole list and the window, one update, each tab read back, an emptied source
+group disappearing) and into an existing group (never renamed), 100 tabs; stale
+session before any read; invalid parameters with no browser call; state
+mismatch for each changed tab/group property and for a pinned tab; stale
+handles; `tabs.group` rejecting or returning no usable group id (`changed:
+null`, even after the browser applied the move) with no retry and no read-back;
+the partial outcomes (update failed and read-back failed with `tabIds: null`, a
+tab or group not observed where expected reporting only the observed ordered
+subset) with no retry; `unsupported`; and routing (`runtime.onMessage` and `routeMessage` cannot reach
+either method). `test/move-tabs.test.mjs`: the store (binding, result shapes,
+append-only audit content, constraints against raw SQL, clear, reconciliation,
+pending bound, migration v5 over a real v4 database with a gapped id counter)
+and the HTTP routes (exact body, preview binding and order, every up-front
+refusal, owner-only/agent/no-route, id-only decisions, kind-bound routes,
+stale/partial/failed/unknown outcomes, `changed: null` → `failed`/`unknown`
+(never `none`/`moved`), partial ids `null` or an ordered subset, **every returned
+handle compared against the binding with a hostile extension**, bindings that
+drop tab titles/addresses, 50 pending 100-tab previews listing under the response
+cap, timeout and disconnect, clipping,
+concurrent decisions, audit content, `store.clear` during an in-flight approval,
+no logging of content) plus end-to-end tests through the **real** worker, service
+client, and service (new group, existing group, reject, refusals, an earlier
+session, every kind of change after the preview, unsupported, partial, agent).
+`test/ui.test.mjs` and `test/ui-lib.test.mjs` add static checks of the form and
+its selection rules; existing tests were adjusted only for protocol 5 / schema 5
+and the second color select.
+
+`npm run test:smoke:bridge` gained Step 2.10 (real Chrome for Testing, checked
+against `chrome.tabs`/`chrome.tabGroups`): agent refusal and no extension-level
+route; a preview moves nothing; Apply moves exactly the previewed tabs (an
+ungrouped tab, and a tab from another group) into an existing group leaving its
+title/color alone and the emptied source group gone; Apply on a new-group preview
+groups exactly the previewed tabs with the requested title/color in their window;
+repeats refused; Reject moves nothing; a pinned tab, tabs in two windows, a
+destination in another window, a no-op move, missing handles, a repeated tab, and
+a caller-supplied session are refused at preview; a tab ungrouped, or a destination
+renamed, after the preview is refused as `state_mismatch` with no change; audit
+has no content; and a preview left pending is refused as `stale_session` after
+the browser restart. The complete smoke passed against the fixed revision. The
+100-tab bound is covered by deterministic tests only.
 
 ## Local development
 

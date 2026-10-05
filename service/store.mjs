@@ -490,6 +490,56 @@ export const MIGRATIONS = [
       `);
     },
   },
+  {
+    // Phase 2 Action 3: a third action kind, `move_tabs`, which like
+    // `configure_group` keeps no URL and binds its exact tab list, destination,
+    // and bound state as JSON in `binding`. The same rebuild as v4, for the same
+    // reason (a CHECK cannot be widened in place), in its own transaction, with
+    // every column — `binding` included — copied, the AUTOINCREMENT counter
+    // carried over, the indexes and triggers recreated, and `action_audit`
+    // untouched. Not breaking: nothing is lost, so no backup copy is made.
+    version: 5,
+    breaking: false,
+    apply: (db) => {
+      db.exec(`
+        CREATE TABLE actions_v5 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL CHECK (kind IN ('open_tab','configure_group','move_tabs')),
+          url TEXT,
+          binding TEXT,
+          browser_session_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('previewed','approved','rejected','executed','partial','stale','failed')),
+          previewed_at INTEGER NOT NULL,
+          decided_at INTEGER,
+          completed_at INTEGER,
+          result TEXT,
+          CHECK (
+            (kind = 'open_tab' AND url IS NOT NULL AND binding IS NULL) OR
+            (kind IN ('configure_group','move_tabs') AND url IS NULL AND binding IS NOT NULL)
+          )
+        );
+        INSERT INTO actions_v5 (id, kind, url, binding, browser_session_id, state, previewed_at, decided_at, completed_at, result)
+          SELECT id, kind, url, binding, browser_session_id, state, previewed_at, decided_at, completed_at, result FROM actions;
+        DELETE FROM sqlite_sequence WHERE name = 'actions_v5';
+        INSERT INTO sqlite_sequence (name, seq) SELECT 'actions_v5', seq FROM sqlite_sequence WHERE name = 'actions';
+        DROP TABLE actions;
+        ALTER TABLE actions_v5 RENAME TO actions;
+        CREATE INDEX idx_actions_state ON actions(state);
+
+        CREATE TRIGGER actions_bound_fields_immutable
+        BEFORE UPDATE OF kind, url, binding, browser_session_id, previewed_at ON actions
+        BEGIN
+          SELECT RAISE(ABORT, 'a previewed action''s kind, url, binding, session, and timestamp are immutable');
+        END;
+        CREATE TRIGGER actions_terminal_state_immutable
+        BEFORE UPDATE OF state ON actions
+        WHEN OLD.state NOT IN ('previewed','approved')
+        BEGIN
+          SELECT RAISE(ABORT, 'a terminal action state cannot change');
+        END;
+      `);
+    },
+  },
 ];
 
 // Copies the database file aside before an incompatible migration is
@@ -1509,6 +1559,8 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
       tabId: data.tabId,
       // Only a group action's result carries a group handle.
       ...(data.groupId === undefined ? {} : { groupId: data.groupId }),
+      // Only a move-tabs action's result carries the moved tab ids (and no single tab id).
+      ...(data.tabIds === undefined ? {} : { tabIds: data.tabIds }),
       windowId: data.windowId,
       observed: data.observed,
     });

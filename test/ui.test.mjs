@@ -257,7 +257,8 @@ test("ui/index.html's tab-group form has labelled fields, a select of exactly th
   assert.match(indexHtmlSource, /<input type="text" id="group-title-input"[^>]*maxlength="100"[^>]*aria-describedby="group-title-help"/);
   assert.match(indexHtmlSource, /<label for="group-clear-title">/);
   assert.match(indexHtmlSource, /<label for="group-color-select">/);
-  const colors = [...indexHtmlSource.matchAll(/<option value="([a-z]+)">/g)].map((m) => m[1]);
+  const select = /<select id="group-color-select"[\s\S]*?<\/select>/.exec(indexHtmlSource)[0];
+  const colors = [...select.matchAll(/<option value="([a-z]+)">/g)].map((m) => m[1]);
   assert.deepEqual(colors, ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
   assert.match(indexHtmlSource, /<button type="submit" id="group-preview-button" disabled>Preview group change<\/button>/);
   assert.match(indexHtmlSource, /id="group-form-status" role="status" aria-live="polite"/);
@@ -281,10 +282,98 @@ test("ui/app.js sends a group preview with only the chosen operation, one handle
   assert.doesNotMatch(form, /sessionId|browserSessionId|windowId/, "the form never supplies a session or a window");
 });
 
+// ---- Phase 2 Action 3: the move-tabs form ----
+
+test("ui/index.html's move form has labelled fields, its own native-color select, live status text, and a Preview button disabled until connected", () => {
+  assert.match(indexHtmlSource, /<form id="move-form">/);
+  assert.match(indexHtmlSource, /<label for="move-title-input">/);
+  assert.match(indexHtmlSource, /<input type="text" id="move-title-input"[^>]*maxlength="100"[^>]*aria-describedby="move-title-help"/);
+  assert.match(indexHtmlSource, /<label for="move-color-select">/);
+  const select = /<select id="move-color-select"[\s\S]*?<\/select>/.exec(indexHtmlSource)[0];
+  assert.deepEqual([...select.matchAll(/<option value="([a-z]+)">/g)].map((m) => m[1]), ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
+  assert.match(indexHtmlSource, /<button type="submit" id="move-preview-button" disabled>Preview move<\/button>/);
+  assert.match(indexHtmlSource, /id="move-selection" role="status" aria-live="polite"/);
+  assert.match(indexHtmlSource, /id="move-form-status" role="status" aria-live="polite"/);
+  for (const id of ["move-preview-button", "move-new-button", "move-clear-button"]) assert.match(appJsSource, new RegExp(`"${id}"`));
+});
+
+test("ui/app.js sends a move preview with only tab ids and a destination, and decides by id alone", () => {
+  assert.match(appJsSource, /apiRequest\("\/api\/action\.move_tabs\.preview", \{ method: "POST", body \}\)/);
+  const decisions = [...appJsSource.matchAll(/apiRequest\(`\/api\/action\.move_tabs\.\$\{operation\}\?id=\$\{id\}`[^)]*\)/g)];
+  assert.equal(decisions.length, 1, "exactly one call site decides a move action");
+  assert.doesNotMatch(decisions[0][0], /body/);
+  assert.equal([...appJsSource.matchAll(/action\.move_tabs\./g)].length, 2, "only the preview and the id-only decision route are referenced");
+  assert.doesNotMatch(appJsSource, /browser\.move_tabs|browser\.inspect_move_target/, "the page never names the extension-level methods");
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- moving tabs into a group"), appJsSource.indexOf("// ---- collections ----"));
+  assert.ok(section.length > 500, "expected to locate the move section of app.js");
+  assert.doesNotMatch(section, /sessionId|browserSessionId/, "the form never supplies a session");
+  assert.match(section, /body = \{ tabIds: \[\.\.\.moveSelection\.keys\(\)\], destination:/);
+});
+
+test("ui/app.js bounds and scopes the tab selection, and drops it with every session or list it came from", () => {
+  assert.match(appJsSource, /const MAX_MOVE_TABS = 100;/);
+  assert.match(appJsSource, /moveSelection\.size >= MAX_MOVE_TABS/, "at most 100 tabs");
+  assert.match(appJsSource, /moveSelection\.values\(\)\.next\(\)\.value !== tab\.windowId/, "one window only");
+  assert.match(appJsSource, /selectBox\.disabled = Boolean\(t\.pinned\)/, "a pinned tab cannot be ticked");
+  // Dropped on: Disconnect (resetDisplayedData), stale or replaced session, and a fresh window load.
+  const reset = appJsSource.slice(appJsSource.indexOf("function resetDisplayedData"), appJsSource.indexOf('qs("auth-form")'));
+  assert.match(reset, /clearMoveSelection\(\)/);
+  const stale = appJsSource.slice(appJsSource.indexOf("function handleStaleBrowserSession"), appJsSource.indexOf("// ---- connection status"));
+  assert.match(stale, /clearMoveSelection\(\)/);
+  const remember = appJsSource.slice(appJsSource.indexOf("function rememberSessionFromWindowsResult"), appJsSource.indexOf("// True if `result` is the server's explicit"));
+  assert.match(remember, /clearMoveSelection\(\)/);
+  const load = appJsSource.slice(appJsSource.indexOf('qs("load-windows-button").addEventListener'));
+  assert.ok(load.indexOf("clearMoveSelection()") > 0 && load.indexOf("clearMoveSelection()") < load.indexOf("renderWindowRow(w)"), "cleared before the new rows render");
+});
+
+test("ui/app.js renders a move preview's tab text as text only, with each tab's current group visible", () => {
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- browser actions"), appJsSource.indexOf("// ---- tags ----"));
+  assert.match(section, /text: describeMoveBinding\(a\.binding\)/);
+  assert.match(section, /text: describeMoveTab\(tab\)/);
+  assert.match(section, /currently \$\{membership\}/);
+  assert.match(section, /a group left with no tabs is removed by the browser itself/);
+  assert.doesNotMatch(section, /\bhref\b|\bsrc\b|window\.open|\.innerHTML/);
+  // A stored move holds no tab title or address, so none is ever shown for one.
+  const describeTab = /function describeMoveTab\(t\) \{[\s\S]*?\n\}/.exec(appJsSource)[0];
+  assert.doesNotMatch(describeTab, /title|url/i);
+});
+
+test("ui/app.js distinguishes a known move from which tabs were observed, and an unknown effect from none", () => {
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- browser actions"), appJsSource.indexOf("// ---- tags ----"));
+  assert.match(section, /Observed in the group/);
+  assert.match(section, /none observed \(or observation unavailable\)/);
+  assert.match(section, /a move into the group was made \(see which tabs were observed there\)/);
+  assert.match(section, /unknown — the move may or may not have been applied/);
+  assert.doesNotMatch(section, /Moved tabs/, "the old label implied every selected tab was moved");
+  assert.match(section, /a\.state === "executed" \|\| a\.state === "partial"/, "observed ids are shown only when a move is known");
+});
+
+test("a fresh Load tabs drops the whole move selection and destination; a fresh Load groups drops only the destination", () => {
+  const tabsHandler = appJsSource.slice(appJsSource.indexOf("loadTabsButton.addEventListener"), appJsSource.indexOf("const loadGroupsButton"));
+  assert.match(tabsHandler, /clearMoveSelection\(\);\n\s+const bgen = /, "cleared before the request starts");
+  assert.ok(tabsHandler.indexOf("clearMoveSelection()") < tabsHandler.indexOf("apiRequest("), "and before the tab rows are replaced");
+  assert.doesNotMatch(tabsHandler, /clearMoveDestination/);
+  const groupsHandler = appJsSource.slice(appJsSource.indexOf("loadGroupsButton.addEventListener"), appJsSource.indexOf("return el(\"li\", {}, [renderWindowInfo(w)"));
+  assert.match(groupsHandler, /clearMoveDestination\(\);\n\s+const bgen = /, "cleared before the request starts");
+  assert.ok(groupsHandler.indexOf("clearMoveDestination()") < groupsHandler.indexOf("apiRequest("));
+  assert.doesNotMatch(groupsHandler, /clearMoveSelection/, "the ticked tabs survive loading groups");
+  // The two helpers do exactly what their names say.
+  const destination = /function clearMoveDestination\(\) \{[\s\S]*?\n\}/.exec(appJsSource)[0];
+  assert.match(destination, /moveDestination = null;/);
+  assert.doesNotMatch(destination, /moveSelection/);
+  const selection = /function clearMoveSelection\(\) \{[\s\S]*?\n\}/.exec(appJsSource)[0];
+  assert.match(selection, /moveSelection = new Map\(\);/);
+  assert.match(selection, /moveDestination = null;/);
+});
+
 test("ui/app.js drops the chosen group target when a fresh session replaces the known one, before rendering, and only then", () => {
   assert.match(appJsSource, /import \{[^}]*\bisReplacedSession\b[^}]*\} from "\.\/lib\.mjs";/);
   const remember = appJsSource.slice(appJsSource.indexOf("function rememberSessionFromWindowsResult"), appJsSource.indexOf("// True if `result` is the server's explicit"));
-  assert.match(remember, /if \(isReplacedSession\(state\.sessionId, result\.browserSessionId\)\) clearGroupTarget\(\);\n\s+state\.sessionId = result\.browserSessionId;/, "checked against the previous id, before it is overwritten");
+  assert.match(
+    remember,
+    /if \(isReplacedSession\(state\.sessionId, result\.browserSessionId\)\) \{\n\s+clearGroupTarget\(\);\n\s+clearMoveSelection\(\);\n\s+\}\n\s+state\.sessionId = result\.browserSessionId;/,
+    "checked against the previous id, before it is overwritten",
+  );
   assert.equal([...appJsSource.matchAll(/isReplacedSession\(/g)].length, 1, "one call site: no unconditional clearing on load");
   // rememberSessionFromWindowsResult runs before the window list is rendered.
   const load = appJsSource.slice(appJsSource.indexOf('qs("load-windows-button").addEventListener'));
