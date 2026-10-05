@@ -5,7 +5,7 @@
 // comes from service/store.mjs always using parameterized `?` placeholders,
 // never string concatenation — this module is the separate, additional
 // defense of rejecting malformed/oversized input outright.
-import { MAX_TEXT_CHARACTERS, isValidHandle, isValidTimestamp, validateMethodResult } from "../extension/protocol.js";
+import { MAX_TEXT_CHARACTERS, isValidHandle, isValidTimestamp, normalizeOpenUrl, validateMethodResult } from "../extension/protocol.js";
 import { STORE_ERROR_CODES, StoreError } from "./store-errors.mjs";
 
 // Captures persist exactly one Stage 2 result shape — a `browser.read_tab`
@@ -488,4 +488,87 @@ export function validateRetentionUpdateInput(input = {}) {
     fail("captureRetentionDays", "must be a positive integer (days) of at most 3650, or null to disable retention cleanup");
   }
   return { captureRetentionDays: value };
+}
+
+// ---- Phase 2 Action 1: open a URL in a new tab ----
+
+export const ACTION_KINDS = Object.freeze(["open_tab"]);
+// previewed -> approved | rejected; approved -> one of the four result
+// states. Every state after "previewed" other than "approved" is terminal.
+export const ACTION_STATES = Object.freeze(["previewed", "approved", "rejected", "executed", "partial", "stale", "failed"]);
+export const ACTION_RESULT_STATES = Object.freeze(["executed", "partial", "stale", "failed"]);
+// What the browser is known to have undergone: nothing, one new tab, or
+// unknown (the request was sent but its outcome never came back intact).
+export const ACTION_MUTATIONS = Object.freeze(["none", "created", "unknown"]);
+export const ACTION_AUDIT_EVENTS = Object.freeze(["preview", "approve", "reject", "result"]);
+// The recorded result of an action found still "approved" after a restart.
+export const ACTION_INTERRUPTED_CODE = "interrupted_by_restart";
+export const ACTION_INTERRUPTED_DETAIL =
+  "the service stopped after this action was approved and before its result was recorded; the browser may or may not have opened the tab";
+// Bounds: how many previews may await a decision at once, and how many audit
+// events the append-only log accepts before refusing *new* previews (the
+// decision and result events of an already-previewed action are always
+// recorded, so the log never has to drop an event for work in flight).
+export const MAX_PENDING_ACTIONS = 50;
+export const MAX_ACTION_AUDIT_EVENTS = 10_000;
+// The browser's observed state is stored clipped to these bounds: it is
+// untrusted browser content, and a result must be persistable after the tab
+// has already been opened.
+export const MAX_OBSERVED_TITLE_LENGTH = 500;
+export const MAX_OBSERVED_URL_LENGTH = 2_048;
+export const MAX_ACTION_DETAIL_LENGTH = 500;
+export const MAX_OBSERVED_STATUS_LENGTH = 50;
+
+export function clipText(value, maxLength) {
+  return typeof value === "string" && value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
+// A preview binds the exact normalized URL to the browser session it was
+// taken in (and, in the store, to its timestamp); see normalizeOpenUrl in
+// extension/protocol.js for what a URL must satisfy.
+export function validateActionPreviewInput(input = {}) {
+  const checked = normalizeOpenUrl(input.url);
+  if (!checked.valid) fail("url", checked.reason);
+  const browserSessionId = requireNonEmptyString(input.browserSessionId, "browserSessionId", { maxLength: MAX_SESSION_ID_LENGTH });
+  return { kind: "open_tab", url: checked.url, browserSessionId };
+}
+
+function validateObservedTab(value) {
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) fail("observed", "must be a plain object or null");
+  if (!Number.isSafeInteger(value.index) || value.index < 0) fail("observed.index", "must be a non-negative integer");
+  return {
+    index: value.index,
+    active: requireBoolean(value.active, "observed.active"),
+    status: requireNonEmptyString(value.status, "observed.status", { maxLength: MAX_OBSERVED_STATUS_LENGTH }),
+    title: optionalNullableString(value.title, "observed.title", { maxLength: MAX_OBSERVED_TITLE_LENGTH }),
+    url: optionalNullableString(value.url, "observed.url", { maxLength: MAX_OBSERVED_URL_LENGTH }),
+    pendingUrl: optionalNullableString(value.pendingUrl, "observed.pendingUrl", { maxLength: MAX_OBSERVED_URL_LENGTH }),
+  };
+}
+
+// The outcome of one approved action, as the service interpreted the
+// extension's answer. The combinations are checked, not trusted: "executed"
+// and "partial" mean a tab was created (and only "executed" observed it),
+// "stale" means nothing was.
+export function validateActionResultInput(input = {}) {
+  const state = requireEnum(input.state, ACTION_RESULT_STATES, "state");
+  const mutation = requireEnum(input.mutation, ACTION_MUTATIONS, "mutation");
+  if ((state === "executed" || state === "partial") && mutation !== "created") {
+    fail("mutation", `must be "created" when state is "${state}"`);
+  }
+  if (state === "stale" && mutation !== "none") fail("mutation", 'must be "none" when state is "stale"');
+  const code = state === "executed" ? null : requireNonEmptyString(input.code, "code", { maxLength: MAX_CODE_LENGTH });
+  const detail = optionalNullableString(input.detail, "detail", { maxLength: MAX_ACTION_DETAIL_LENGTH });
+  const tabId = optionalNullableHandle(input.tabId, "tabId");
+  const windowId = optionalNullableHandle(input.windowId, "windowId");
+  const observed = validateObservedTab(input.observed ?? null);
+  if (state === "executed" && (observed === null || tabId === null || windowId === null)) {
+    fail("observed", 'is required, with tabId and windowId, when state is "executed"');
+  }
+  if (state !== "executed" && observed !== null) fail("observed", 'is only allowed when state is "executed"');
+  if ((state === "stale" || state === "failed") && (tabId !== null || windowId !== null)) {
+    fail("tabId/windowId", `must be omitted when state is "${state}"`);
+  }
+  return { state, mutation, code, detail, tabId, windowId, observed };
 }

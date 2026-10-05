@@ -12,12 +12,21 @@ import {
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_MS,
   WS_MESSAGE_TYPES,
+  normalizeOpenUrl,
   validateMethodResult,
 } from "../extension/protocol.js";
 import { STORE_ERROR_CODES, StoreError } from "./store-errors.mjs";
-import { STORE_ERROR_STATUS, STORE_ROUTES } from "./store-routes.mjs";
+import { STORE_ERROR_STATUS, STORE_ROUTES, requireIdParam } from "./store-routes.mjs";
 import { UI_ROUTES, serveUiAsset } from "./ui.mjs";
-import { MAX_REQUEST_BODY_BYTES } from "./validation.mjs";
+import {
+  MAX_ACTION_DETAIL_LENGTH,
+  MAX_CODE_LENGTH,
+  MAX_OBSERVED_STATUS_LENGTH,
+  MAX_OBSERVED_TITLE_LENGTH,
+  MAX_OBSERVED_URL_LENGTH,
+  MAX_REQUEST_BODY_BYTES,
+  clipText,
+} from "./validation.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
@@ -107,6 +116,22 @@ const WORKFLOW_ROUTES = new Map([
     },
   ],
 ]);
+
+// Phase 2 Action 1: the owner-only routes for opening a URL in a new tab —
+// the two-step flow of a preview, then one decision by stored action id.
+// None of these (nor the extension's `browser.open_tab`, which is not in
+// API_ROUTES and so has no HTTP route at all) is in any AGENT_ALLOWED_* set,
+// and handleActionMethod additionally refuses every non-owner scope
+// explicitly. All are `POST` with the operation named by the route, never by
+// a body field.
+const ACTION_ROUTES = new Map([
+  ["action.open_tab.preview", { operation: "preview" }],
+  ["action.open_tab.approve", { operation: "approve" }],
+  ["action.open_tab.reject", { operation: "reject" }],
+]);
+// A preview body is one short URL (see MAX_OPEN_URL_LENGTH); anything near
+// the store routes' 8 MiB request bound is refused as oversized long before.
+const MAX_ACTION_REQUEST_BODY_BYTES = 16 * 1024;
 
 // Stage 4: the server-side allowlists an external-agent credential's scope
 // is restricted to (project.md Stage 4 remediation: "external-agent scope
@@ -384,6 +409,10 @@ export function createService({
       if (!socket) {
         const error = new Error("No extension connected");
         error.code = ERROR_CODES.DISCONNECTED;
+        // Nothing was sent, so nothing can have happened on the other side —
+        // unlike every other rejection below, where the request may have
+        // reached the extension. Phase 2 actions record the difference.
+        error.requestSent = false;
         reject(error);
         return;
       }
@@ -766,6 +795,203 @@ export function createService({
     }
   }
 
+  // Phase 2 Action 1, step one: records a preview and executes nothing. The
+  // body is exactly `{ "url": "<absolute http(s) URL>" }` — no other field
+  // (in particular no session id) is accepted. The URL is validated and
+  // normalized here, and the browser session it is bound to is learned from
+  // the extension itself (a `browser.get_capabilities` round trip), never
+  // from the caller.
+  async function previewOpenTab(req) {
+    const body = parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES));
+    const keys = Object.keys(body);
+    if (keys.length !== 1 || keys[0] !== "url") {
+      throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, 'body: must contain exactly one field, "url"');
+    }
+    const checked = normalizeOpenUrl(body.url);
+    if (!checked.valid) throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, `url: ${checked.reason}`);
+
+    const capabilities = await sendExtensionRequest("browser.get_capabilities", {});
+    let validation;
+    try {
+      validation = validateMethodResult("browser.get_capabilities", capabilities);
+    } catch (error) {
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!validation.valid || capabilities.status !== "ok") {
+      const error = new Error(validation.valid ? "the extension could not report its browser session" : validation.reason);
+      error.code = ERROR_CODES.INVALID_EXTENSION_RESPONSE;
+      throw error;
+    }
+    return store.createAction({ url: checked.url, browserSessionId: capabilities.browserSessionId });
+  }
+
+  // Interprets the extension's answer to one approved `browser.open_tab`
+  // into the outcome recorded on the action. Never throws: whatever
+  // happened, the approved action must end in a recorded result, because
+  // the decision is already committed and is never retried. `mutation`
+  // says what the browser is known to have undergone — "none" only when it
+  // is certain nothing was sent or created, "unknown" whenever the request
+  // may have been acted on but the answer was lost or unusable.
+  async function executeOpenTab(action) {
+    const failed = (mutation, code, detail) => ({
+      state: "failed",
+      mutation,
+      code,
+      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
+      tabId: null,
+      windowId: null,
+      observed: null,
+    });
+
+    let result;
+    try {
+      result = await sendExtensionRequest("browser.open_tab", { url: action.url, browserSessionId: action.browserSessionId });
+    } catch (error) {
+      const code = Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR;
+      return error?.requestSent === false
+        ? failed("none", code, "the request was never sent to the extension")
+        : failed("unknown", code, "the request was sent but no answer arrived; the browser may or may not have opened the tab");
+    }
+
+    let validation;
+    try {
+      validation = validateMethodResult("browser.open_tab", result);
+    } catch (error) {
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!validation.valid) return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
+
+    const detail = typeof result.detail === "string" ? clipText(result.detail, MAX_ACTION_DETAIL_LENGTH) : null;
+    if (!result.created) {
+      // The extension refused or failed without creating anything. A
+      // stale_session is the expected "the browser restarted since the
+      // preview" outcome, kept distinct from an ordinary failure.
+      const state = result.code === ERROR_CODES.STALE_SESSION ? "stale" : "failed";
+      return { state, mutation: "none", code: clipText(result.code, MAX_CODE_LENGTH), detail, tabId: null, windowId: null, observed: null };
+    }
+
+    // A tab was created. Its answer must still be about *this* preview.
+    if (result.browserSessionId !== action.browserSessionId || (result.status === "ok" && result.requestedUrl !== action.url)) {
+      return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview");
+    }
+    if (result.status !== "ok") {
+      return { state: "partial", mutation: "created", code: result.code, detail, tabId: result.tabId, windowId: result.windowId, observed: null };
+    }
+    const { tab } = result;
+    return {
+      state: "executed",
+      mutation: "created",
+      code: null,
+      detail: null,
+      tabId: tab.tabId,
+      windowId: tab.windowId,
+      observed: {
+        index: tab.index,
+        active: tab.active,
+        status: clipText(tab.status, MAX_OBSERVED_STATUS_LENGTH) || "unknown",
+        title: clipText(tab.title, MAX_OBSERVED_TITLE_LENGTH),
+        url: clipText(tab.url, MAX_OBSERVED_URL_LENGTH),
+        pendingUrl: clipText(result.pendingUrl, MAX_OBSERVED_URL_LENGTH),
+      },
+    };
+  }
+
+  // Phase 2 Action 1, step two: the one terminal decision on a stored
+  // preview, by id alone — no body and no other query parameter, so the
+  // caller cannot restate or alter what is being decided. A reject only
+  // records the decision. An approve first requires a connected extension
+  // (so a merely-unplugged browser does not consume the preview), then
+  // commits the decision — the race-safe single transition in
+  // store.decideAction, which only one of any number of concurrent
+  // approve/reject calls can win — and only the winner executes, exactly
+  // once, then records the result. The response is the action as finally
+  // recorded, HTTP 200 even if the outcome was `failed`, `stale`, or
+  // `partial`: the decision committed, and the record says what happened.
+  async function decideOpenTab(operation, req, url) {
+    if (hasRequestBodyFraming(req)) {
+      throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, "this route takes no request body; the action is identified by id alone");
+    }
+    for (const key of url.searchParams.keys()) {
+      if (key !== "id") throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, `${key}: unexpected query parameter; only "id" is accepted`);
+    }
+    const id = requireIdParam(url);
+    if (operation === "reject") return store.decideAction(id, "reject");
+
+    if (extensionSocket === null) {
+      const error = new Error("No extension connected");
+      error.code = ERROR_CODES.DISCONNECTED;
+      throw error;
+    }
+    const action = store.decideAction(id, "approve");
+    const outcome = await executeOpenTab(action);
+    try {
+      return store.recordActionResult(id, outcome);
+    } catch (error) {
+      // The interpreted outcome should always satisfy the store's own checks
+      // (executeOpenTab clips and normalizes everything). If it somehow does
+      // not, the approved action must still end in a recorded result rather
+      // than stay "approved" forever: record that the outcome is unknown.
+      if (!(error instanceof StoreError) || error.code !== STORE_ERROR_CODES.VALIDATION_ERROR) throw error;
+      return store.recordActionResult(id, {
+        state: "failed",
+        mutation: "unknown",
+        code: ERROR_CODES.INTERNAL_ERROR,
+        detail: "the outcome could not be recorded in full",
+        tabId: null,
+        windowId: null,
+        observed: null,
+      });
+    }
+  }
+
+  async function handleActionMethod(name, route, req, res, url) {
+    const requestId = requestIdFor(req);
+    const auth = authenticate(req);
+    if (!auth.ok) {
+      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
+      return;
+    }
+    // Owner-only by an explicit check, like owner.status and control/stop —
+    // not merely by being absent from the agent allowlists.
+    if (auth.scope !== "owner") {
+      respondJson(res, 403, forbiddenScopeResponse(requestId, name));
+      return;
+    }
+    if (!checkRateLimit()) {
+      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
+      return;
+    }
+    if (!store) {
+      respondJson(res, 503, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: "store_unavailable" } });
+      return;
+    }
+    if (req.method !== "POST") {
+      respondJson(res, 405, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        error: { code: "method_not_allowed", detail: `"${name}" expects POST` },
+      });
+      return;
+    }
+
+    try {
+      const result = route.operation === "preview" ? await previewOpenTab(req) : await decideOpenTab(route.operation, req, url);
+      respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result });
+    } catch (error) {
+      const known =
+        Object.hasOwn(STORE_ERROR_STATUS, error?.code) ||
+        Object.hasOwn(ERROR_STATUS, error?.code) ||
+        error?.code === ERROR_CODES.INVALID_EXTENSION_RESPONSE;
+      const code = known ? error.code : ERROR_CODES.INTERNAL_ERROR;
+      const status = STORE_ERROR_STATUS[code] ?? ERROR_STATUS[code] ?? (code === ERROR_CODES.INTERNAL_ERROR ? 500 : 502);
+      respondJson(res, status, {
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        error: { code, detail: error instanceof Error ? error.message : String(error) },
+      });
+    }
+  }
+
   // Stage 5 remediation: an extension-independent, authenticated,
   // protocol-versioned owner-scope probe. Unlike `browser.get_capabilities`
   // (which round-trips through the extension and therefore fails with
@@ -894,6 +1120,10 @@ export function createService({
       }
       if (WORKFLOW_ROUTES.has(name)) {
         handleWorkflowMethod(name, WORKFLOW_ROUTES.get(name), req, res, url);
+        return;
+      }
+      if (ACTION_ROUTES.has(name)) {
+        handleActionMethod(name, ACTION_ROUTES.get(name), req, res, url);
         return;
       }
       if (STORE_ROUTES.has(name)) {

@@ -47,6 +47,15 @@
 //        completion model, not timing, is what makes this deterministic),
 //        proving a stale, late-arriving `browser.list_windows` response
 //        can never repopulate the UI after Disconnect.
+//   2.8. Phase 2 Action 1 ("open a URL in a new tab"), driven through the
+//        real /ui/ page and checked against the browser's own tab list:
+//        a preview opens nothing; the agent credential is refused on every
+//        action route; Open opens exactly one tab for exactly the previewed
+//        URL and the recorded result matches that real tab; repeated
+//        decisions are refused; Reject opens nothing; the append-only audit
+//        log records the events without any URL. A further preview is left
+//        pending and, after the service and browser restarts below, must be
+//        refused as stale with no tab opened.
 //   3. The connection survives past the Manifest V3 service-worker idle
 //      window (default ~35s wait) thanks to the chosen Stage 1 checkpoint
 //      resolution: an authenticated ping/pong heartbeat no more than 20s
@@ -1255,6 +1264,243 @@ async function main() {
       await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(uiFixtureTab.id)})`).catch(() => {});
     }
 
+    // Step 2.8: Phase 2 Action 1 ("open a URL in a new tab"), through the
+    // real review UI in the real browser. Every claim below is checked
+    // against the *browser's own* tab list (chrome.tabs.query from the
+    // service worker), never only against what the service or the page says:
+    //   - a preview opens nothing;
+    //   - the external-agent credential cannot reach any action route;
+    //   - pressing Open on a preview opens exactly one tab, for exactly the
+    //     previewed URL, and the recorded result matches that real tab;
+    //   - a second approval of the same preview is refused and opens nothing;
+    //   - pressing Reject on another preview opens nothing, ever;
+    //   - the append-only audit log records preview/decision/result and holds
+    //     no URL;
+    //   - a third preview is left pending here and approved only *after* the
+    //     browser restart (Step 5), where it must be refused as stale and
+    //     open nothing — which also proves previews survive a service restart.
+    console.log("exercising Phase 2 Action 1 (preview, approve opens exactly one tab, reject opens none, audit log)...");
+    const OPEN_APPROVE_URL = `${fixtureUrl}?smoke-open=approve`;
+    const OPEN_REJECT_URL = `${fixtureUrl}?smoke-open=reject`;
+    const OPEN_STALE_URL = `${fixtureUrl}?smoke-open=stale`;
+    const countTabsAt = (url) =>
+      evaluate(
+        swCdp,
+        `chrome.tabs.query({}).then((tabs) => tabs.filter((t) => t.url === ${JSON.stringify(url)} || t.pendingUrl === ${JSON.stringify(url)}).length)`,
+      );
+
+    // The agent credential can neither preview nor decide, and the
+    // extension-level method has no HTTP route at all.
+    for (const [path, body, expectedStatus] of [
+      ["/api/action.open_tab.preview", { url: OPEN_APPROVE_URL }, 403],
+      ["/api/action.open_tab.approve?id=1", undefined, 403],
+      ["/api/action.open_tab.reject?id=1", undefined, 403],
+      ["/api/browser.open_tab", { url: OPEN_APPROVE_URL, browserSessionId: sessionId }, 404],
+    ]) {
+      const attempt = await serviceRequest(port, path, { method: "POST", token: agentToken, body });
+      if (attempt.status !== expectedStatus) {
+        fail(`[Phase 2 open_tab] agent credential POST ${path} expected HTTP ${expectedStatus}, got ${attempt.status} ${JSON.stringify(attempt.json)}`);
+        return;
+      }
+    }
+    if ((await countTabsAt(OPEN_APPROVE_URL)) !== 0) {
+      fail("[Phase 2 open_tab] a tab for the approve URL exists before any approval");
+      return;
+    }
+
+    const openUiUrl = `http://127.0.0.1:${port}/ui/`;
+    const openUiTab = await createAndWaitForTab(swCdp, openUiUrl);
+    const openUiTarget = await findPageTarget(cdpPort, openUiUrl);
+    const openUiCdp = await connectCdpForPage(openUiTarget.webSocketDebuggerUrl);
+    const tabsToCleanUp = [openUiTab.id];
+    try {
+      await evaluate(
+        openUiCdp,
+        `
+        (async () => {
+          const tokenInput = document.getElementById("token-input");
+          tokenInput.value = ${JSON.stringify(token)};
+          document.getElementById("connect-button").click();
+          const deadline = Date.now() + 8000;
+          while (Date.now() < deadline) {
+            const status = document.getElementById("auth-status").textContent;
+            if (status.includes("Connected")) return status;
+            if (status.includes("Could not connect")) throw new Error("UI reported a connect failure: " + status);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          throw new Error("timed out waiting for the UI to report Connected");
+        })()
+        `,
+      );
+
+      // Types an address into the page's own field and presses its own
+      // Preview button; resolves with the new preview row's action id once
+      // the row shows "awaiting your decision".
+      async function previewViaUi(url) {
+        return evaluate(
+          openUiCdp,
+          `
+          (async () => {
+            const url = ${JSON.stringify(url)};
+            document.getElementById("action-url-input").value = url;
+            document.getElementById("preview-button").click();
+            const deadline = Date.now() + 8000;
+            while (Date.now() < deadline) {
+              const row = [...document.querySelectorAll("#actions-list > li")].find(
+                (li) => li.textContent.includes(url) && li.textContent.includes("awaiting your decision"),
+              );
+              if (row) return Number(row.id.replace("action-", ""));
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            throw new Error("timed out waiting for a preview row for " + url + "; form status: " + document.getElementById("action-form-status").textContent);
+          })()
+          `,
+        );
+      }
+
+      // Presses one button on one preview row (located by its own id) and
+      // waits for the re-read row to show the expected recorded outcome.
+      async function decideViaUiRow(actionId, buttonLabel, expectedText) {
+        return evaluate(
+          openUiCdp,
+          `
+          (async () => {
+            const row = document.getElementById("action-" + ${JSON.stringify(actionId)});
+            if (!row) throw new Error("no row for action ${actionId}");
+            const button = [...row.querySelectorAll("button")].find((b) => b.textContent === ${JSON.stringify(buttonLabel)});
+            if (!button) throw new Error('no "${buttonLabel}" button on the row for action ${actionId}');
+            button.click();
+            const deadline = Date.now() + 8000;
+            while (Date.now() < deadline) {
+              const current = document.getElementById("action-" + ${JSON.stringify(actionId)});
+              if (current && current.textContent.includes(${JSON.stringify(expectedText)})) return current.textContent;
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            const last = document.getElementById("action-" + ${JSON.stringify(actionId)});
+            throw new Error("timed out waiting for the UI to show " + ${JSON.stringify(expectedText)} + "; decision status: " + document.getElementById("action-decision-status").textContent + "; row: " + (last ? last.textContent : "(row gone)"));
+          })()
+          `,
+        );
+      }
+
+      const listAction = async (id) => (await serviceRequest(port, `/api/store.actions.list?id=${id}`, { token })).json?.result?.items?.[0];
+
+      // --- Approve: exactly one tab, for exactly the previewed URL. ---
+      const approveId = await previewViaUi(OPEN_APPROVE_URL);
+      const previewed = await listAction(approveId);
+      if (previewed?.state !== "previewed" || previewed.url !== OPEN_APPROVE_URL || previewed.browserSessionId !== sessionId) {
+        fail(`[Phase 2 open_tab] the stored preview does not bind the exact URL and current session: ${JSON.stringify(previewed)}`);
+        return;
+      }
+      if ((await countTabsAt(OPEN_APPROVE_URL)) !== 0) {
+        fail("[Phase 2 open_tab] a preview opened a tab");
+        return;
+      }
+
+      await decideViaUiRow(approveId, "Open", "yes — one new tab was created");
+      const approved = await listAction(approveId);
+      if (approved?.state !== "executed" || approved.result?.mutation !== "created" || !Number.isInteger(approved.result?.tabId)) {
+        fail(`[Phase 2 open_tab] the approved action was not recorded as executed with a created tab: ${JSON.stringify(approved)}`);
+        return;
+      }
+      tabsToCleanUp.push(approved.result.tabId);
+      const realTab = await evaluate(swCdp, `chrome.tabs.get(${JSON.stringify(approved.result.tabId)})`);
+      if (!realTab || (realTab.url !== OPEN_APPROVE_URL && realTab.pendingUrl !== OPEN_APPROVE_URL)) {
+        fail(`[Phase 2 open_tab] the tab named in the result is not the previewed URL in the real browser: ${JSON.stringify(realTab)}`);
+        return;
+      }
+      if (approved.result.observed?.index !== realTab.index || approved.result.windowId !== realTab.windowId) {
+        fail(`[Phase 2 open_tab] the recorded observed state does not match the real tab: ${JSON.stringify({ approved, realTab })}`);
+        return;
+      }
+      if ((await countTabsAt(OPEN_APPROVE_URL)) !== 1) {
+        fail(`[Phase 2 open_tab] approval must open exactly one tab for the previewed URL, found ${await countTabsAt(OPEN_APPROVE_URL)}`);
+        return;
+      }
+
+      // A second approval (or a reject) of the same preview is refused and opens nothing.
+      for (const operation of ["approve", "reject"]) {
+        const again = await serviceRequest(port, `/api/action.open_tab.${operation}?id=${approveId}`, { method: "POST", token });
+        if (again.status !== 409) {
+          fail(`[Phase 2 open_tab] a repeated ${operation} of a decided action was not refused: ${again.status} ${JSON.stringify(again.json)}`);
+          return;
+        }
+      }
+      if ((await countTabsAt(OPEN_APPROVE_URL)) !== 1) {
+        fail("[Phase 2 open_tab] a repeated decision opened another tab");
+        return;
+      }
+
+      // --- Reject: nothing is ever opened. ---
+      const rejectId = await previewViaUi(OPEN_REJECT_URL);
+      await decideViaUiRow(rejectId, "Reject", "rejected — nothing was opened");
+      const rejected = await listAction(rejectId);
+      if (rejected?.state !== "rejected" || rejected.result !== null) {
+        fail(`[Phase 2 open_tab] the rejected action was not recorded as rejected without a result: ${JSON.stringify(rejected)}`);
+        return;
+      }
+      const lateApprove = await serviceRequest(port, `/api/action.open_tab.approve?id=${rejectId}`, { method: "POST", token });
+      await delay(500);
+      if (lateApprove.status !== 409 || (await countTabsAt(OPEN_REJECT_URL)) !== 0) {
+        fail(`[Phase 2 open_tab] a rejected preview was approvable or opened a tab: ${lateApprove.status} ${JSON.stringify(lateApprove.json)}`);
+        return;
+      }
+
+      // --- Audit: append-only record, no URL. ---
+      const auditResponse = await serviceRequest(port, "/api/store.actions.audit.list", { token });
+      const auditItems = auditResponse.json?.result?.items ?? [];
+      const eventsFor = (id) => auditItems.filter((e) => e.actionId === id).map((e) => e.event);
+      if (JSON.stringify(eventsFor(approveId)) !== JSON.stringify(["result", "approve", "preview"])) {
+        fail(`[Phase 2 open_tab] the approved action's audit events are wrong: ${JSON.stringify(eventsFor(approveId))}`);
+        return;
+      }
+      if (JSON.stringify(eventsFor(rejectId)) !== JSON.stringify(["reject", "preview"])) {
+        fail(`[Phase 2 open_tab] the rejected action's audit events are wrong: ${JSON.stringify(eventsFor(rejectId))}`);
+        return;
+      }
+      if (JSON.stringify(auditResponse.json).includes("smoke-open")) {
+        fail("[Phase 2 open_tab] the audit log contains a URL");
+        return;
+      }
+      const auditPageText = await evaluate(
+        openUiCdp,
+        `
+        (async () => {
+          document.getElementById("refresh-audit-button").click();
+          const deadline = Date.now() + 8000;
+          while (Date.now() < deadline) {
+            const text = document.getElementById("audit-list").textContent;
+            if (text.includes("result")) return text;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          throw new Error("the audit log never rendered in the UI");
+        })()
+        `,
+      );
+      if (!auditPageText.includes(`action #${approveId}`)) {
+        fail(`[Phase 2 open_tab] the UI's audit log does not show the approved action: ${auditPageText}`);
+        return;
+      }
+
+      console.log("Phase 2 Action 1 proof passed: a preview opened nothing; Open opened exactly one tab for the previewed URL; Reject opened none; repeats refused; audit recorded.");
+    } finally {
+      openUiCdp.close();
+      for (const tabId of tabsToCleanUp) await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(tabId)})`).catch(() => {});
+    }
+
+    // Left pending on purpose: approved after the service and browser
+    // restarts below, where the session it was bound to no longer exists.
+    const stalePreviewResponse = await serviceRequest(port, "/api/action.open_tab.preview", {
+      method: "POST",
+      token,
+      body: { url: OPEN_STALE_URL },
+    });
+    if (stalePreviewResponse.status !== 200 || stalePreviewResponse.json.result?.browserSessionId !== sessionId) {
+      fail(`[Phase 2 open_tab] could not preview the stale-session URL: ${stalePreviewResponse.status} ${JSON.stringify(stalePreviewResponse.json)}`);
+      return;
+    }
+    const staleActionId = stalePreviewResponse.json.result.id;
+
     // Detach from the service worker's own CDP target *before* the idle
     // wait, and do not reattach until a later step genuinely needs it
     // (Step 5's browser restart). A live DevTools Protocol session to a
@@ -1452,6 +1698,25 @@ async function main() {
       return;
     }
 
+    // Phase 2 Action 1, stale approval: the preview left pending in Step 2.8
+    // is bound to the pre-restart browser session. It survived a service
+    // restart (it is still stored), but approving it now must be refused by
+    // the extension as stale — and the real browser must have no tab for it.
+    const staleApproval = await serviceRequest(port, `/api/action.open_tab.approve?id=${staleActionId}`, { method: "POST", token });
+    const staleOutcome = staleApproval.json?.result;
+    if (staleApproval.status !== 200 || staleOutcome?.state !== "stale" || staleOutcome.result?.mutation !== "none") {
+      fail(`[Phase 2 open_tab] approving a pre-restart preview was not refused as stale: ${staleApproval.status} ${JSON.stringify(staleApproval.json)}`);
+      return;
+    }
+    const staleTabCount = await evaluate(
+      swCdp,
+      `chrome.tabs.query({}).then((tabs) => tabs.filter((t) => t.url === ${JSON.stringify(OPEN_STALE_URL)} || t.pendingUrl === ${JSON.stringify(OPEN_STALE_URL)}).length)`,
+    );
+    if (staleTabCount !== 0) {
+      fail(`[Phase 2 open_tab] a stale approval opened ${staleTabCount} tab(s)`);
+      return;
+    }
+
     // Step 6: confirm real Origin behavior from an actual (non-extension)
     // browser page — the browser sets this Origin header; nothing in this
     // script constructs or spoofs it. Only the browser *tab* is recreated
@@ -1510,6 +1775,10 @@ async function main() {
           "CDP, both decisions confirmed through the owner's own public HTTP API, no browser mutation, and a " +
           "real-browser connect/disconnect race leaving no stale list_windows response able to repopulate the UI " +
           "after Disconnect), " +
+          "Phase 2 Action 1 (the agent credential refused on every action route; a preview opening nothing; Open " +
+          "opening exactly one tab for exactly the previewed URL, matching the browser's own tab list; Reject " +
+          "opening none; repeated decisions refused; the append-only audit log recording preview/decision/result " +
+          "with no URL; and a pre-restart preview refused as stale after a service and browser restart with no tab opened), " +
           `survival past a ${IDLE_WAIT_MS}ms idle wait via the heartbeat, the durable reconnect alarm ` +
           "being registered with the expected schedule before a service restart, automatic reconnect after that " +
           "restart and after a full browser restart (neither requiring re-pairing), browserSessionId rotating " +

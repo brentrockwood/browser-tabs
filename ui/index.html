@@ -12,7 +12,8 @@
   <p>
     A review surface for this local service, not a second browser or a general agent console.
     Everything below reads and reviews what the browser and this service's own derived store already
-    hold; nothing here edits or mutates the browser itself.
+    hold, with one exception: the "Open a URL in a new tab" section, which can open one tab after you
+    preview and then explicitly approve it.
   </p>
 </header>
 
@@ -142,6 +143,40 @@
   <button type="button" id="refresh-proposals-button" disabled>Refresh proposals</button>
   <p id="proposals-status" role="status" aria-live="polite"></p>
   <ul id="proposals-list" class="plain-list"></ul>
+</section>
+
+<section id="actions-section" aria-labelledby="actions-heading">
+  <h2 id="actions-heading" tabindex="-1">Open a URL in a new tab</h2>
+  <p>
+    The only place this page can change the browser, and only in two steps. <strong>Preview</strong> records
+    exactly which address would be opened and for which browser session; nothing opens yet. Then
+    <strong>Open</strong> on that preview opens it, once, or <strong>Reject</strong> discards it. A preview can
+    be decided only once. If the browser has restarted since the preview, it is refused as stale and nothing
+    opens. Only absolute <code>http://</code> and <code>https://</code> addresses without a username or password
+    are accepted. The tab opens in front, in the browser's current window.
+  </p>
+  <form id="action-form">
+    <div class="field">
+      <label for="action-url-input">Address to open</label>
+      <input type="text" id="action-url-input" name="url" autocomplete="off" spellcheck="false" inputmode="url" maxlength="2048" required aria-describedby="action-url-help">
+      <p id="action-url-help">An absolute http:// or https:// address, up to 2048 characters.</p>
+    </div>
+    <button type="submit" id="preview-button" disabled>Preview</button>
+  </form>
+  <p id="action-form-status" role="status" aria-live="polite"></p>
+  <p id="action-decision-status" role="status" aria-live="polite"></p>
+  <button type="button" id="refresh-actions-button" disabled>Refresh actions</button>
+  <p id="actions-status" role="status" aria-live="polite"></p>
+  <ul id="actions-list" class="plain-list"></ul>
+
+  <h3 id="audit-heading">Action audit log</h3>
+  <p>
+    An append-only record of every preview, decision, and result. It holds no page titles, addresses, or text,
+    and it cannot be edited or deleted here or by "Clear all stored data".
+  </p>
+  <button type="button" id="refresh-audit-button" disabled>Refresh audit log</button>
+  <p id="audit-status" role="status" aria-live="polite"></p>
+  <ol id="audit-list" class="plain-list"></ol>
 </section>
 
 <section id="tags-section" aria-labelledby="tags-heading">

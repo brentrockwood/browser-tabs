@@ -17,7 +17,7 @@ import { createDecisionTracker, createGenerationCounter, createListVersionGuard 
 // Must match extension/protocol.js's PROTOCOL_VERSION. Duplicated here
 // (not imported) because this is a standalone static page with no build
 // step and no access to that module's path.
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 
 // Mirrors extension/protocol.js's ERROR_CODES.STALE_SESSION — the one
 // code this page must react to specially (see handleStaleBrowserSession
@@ -89,6 +89,15 @@ const proposalsListGuard = createListVersionGuard();
 // "Refresh proposals" button is disabled too, so a user-triggered refresh
 // can never race a decision's own refresh.
 let proposalDecisionsInFlight = 0;
+
+// The same three primitives, instantiated for browser actions (Phase 2):
+// each action decision's in-flight lifecycle outside any rendered row, a
+// version guard so an older list refresh cannot overwrite a newer one, and a
+// count of decisions mid-flight that disables manual refreshes while any is.
+const actionDecisions = createDecisionTracker();
+const actionsListGuard = createListVersionGuard();
+const auditListGuard = createListVersionGuard();
+let actionDecisionsInFlight = 0;
 
 function qs(id) {
   return document.getElementById(id);
@@ -264,6 +273,9 @@ const AUTH_GATED_BUTTON_IDS = [
   "refresh-captures-button",
   "refresh-summaries-button",
   "refresh-proposals-button",
+  "preview-button",
+  "refresh-actions-button",
+  "refresh-audit-button",
   "refresh-tags-button",
   "refresh-collections-button",
   "refresh-queue-button",
@@ -282,6 +294,9 @@ function resetDisplayedData() {
   clearChildren(qs("captures-table-body"));
   clearChildren(qs("summaries-list"));
   clearChildren(qs("proposals-list"));
+  clearChildren(qs("actions-list"));
+  clearChildren(qs("audit-list"));
+  for (const id of ["action-form-status", "action-decision-status", "actions-status", "audit-status"]) qs(id).textContent = "";
   clearChildren(qs("tags-list"));
   clearChildren(qs("collections-list"));
   clearChildren(qs("queue-list"));
@@ -970,6 +985,200 @@ qs("refresh-proposals-button").addEventListener("click", () => {
   refreshProposals().catch(() => {}); // status element already shows the error
 });
 
+// ---- browser actions: open a URL in a new tab (Phase 2 Action 1) ----
+
+// Page-side bounds for the two lists below, under the service's own caps
+// (and small enough that the list response stays well inside its size bound).
+const ACTIONS_LIMIT = 50;
+const AUDIT_LIMIT = 100;
+
+const ACTION_STATE_LABELS = {
+  previewed: "awaiting your decision — nothing has been opened",
+  approved: "approved — no result recorded yet",
+  rejected: "rejected — nothing was opened",
+  executed: "opened",
+  partial: "partly done — a tab was opened but could not be observed afterwards",
+  stale: "refused as stale — nothing was opened",
+  failed: "failed",
+};
+
+const ACTION_MUTATION_LABELS = {
+  created: "yes — one new tab was created",
+  none: "no — nothing was opened",
+  unknown: "unknown — the request may have been acted on, but no usable answer came back",
+};
+
+function setActionsRefreshDisabled(disabled) {
+  qs("refresh-actions-button").disabled = disabled;
+}
+
+// A stored action's address and observed tab text are untrusted (the address
+// came from whoever typed it; the observed title/URL came from the browser):
+// every one of them is rendered with textContent only, and the address is
+// never turned into a link or navigated to by this page.
+function renderActionItem(a) {
+  const urlId = `action-${a.id}-url`;
+  const li = el("li", { attrs: { id: `action-${a.id}`, tabindex: "-1" } });
+  li.appendChild(el("p", { text: `Action #${a.id} — open in a new tab — ${ACTION_STATE_LABELS[a.state] ?? a.state}` }));
+  li.appendChild(el("p", { text: `Address: ${a.url}`, attrs: { id: urlId } }));
+
+  const dl = el("dl");
+  dlEntry(dl, "Previewed at", formatTimestamp(a.previewedAt));
+  dlEntry(dl, "Browser session ID", a.browserSessionId);
+  if (a.decidedAt !== null) dlEntry(dl, "Decided at", formatTimestamp(a.decidedAt));
+  if (a.completedAt !== null) dlEntry(dl, "Completed at", formatTimestamp(a.completedAt));
+  if (a.result) {
+    const r = a.result;
+    dlEntry(dl, "Browser changed", ACTION_MUTATION_LABELS[r.mutation] ?? r.mutation);
+    if (r.code) dlEntry(dl, "Outcome code", r.code);
+    if (r.detail) dlEntry(dl, "Detail", r.detail);
+    if (r.tabId !== null) dlEntry(dl, "Tab / window", `tab ${r.tabId} in window ${r.windowId ?? "—"}`);
+    if (r.observed) {
+      dlEntry(dl, "Observed status", r.observed.status);
+      dlEntry(dl, "Observed title (untrusted browser text)", r.observed.title ?? "—");
+      dlEntry(dl, "Observed address (untrusted browser text)", r.observed.url ?? "—");
+      dlEntry(dl, "Observed pending address", r.observed.pendingUrl ?? "—");
+    }
+  }
+  li.appendChild(dl);
+
+  if (a.state === "previewed") {
+    const openButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode("Open")]);
+    const rejectButton = el("button", { attrs: { type: "button", "aria-describedby": urlId } }, [document.createTextNode("Reject")]);
+    li.appendChild(el("div", { className: "decision-buttons" }, [openButton, rejectButton]));
+    // A row rebuilt while its own decision is still in flight (any refresh
+    // can do this) must come back disabled, never offering a second submit.
+    if (actionDecisions.isSubmitting(a.id)) {
+      openButton.disabled = true;
+      rejectButton.disabled = true;
+    }
+    openButton.addEventListener("click", () => decideAction(a.id, "approve", [openButton, rejectButton]));
+    rejectButton.addEventListener("click", () => decideAction(a.id, "reject", [openButton, rejectButton]));
+  }
+  return li;
+}
+
+// One decision per click, by id alone (the request carries no address and no
+// body). Whatever happens — success, a refusal, or a network error whose
+// outcome is unknown — the page then rereads the list from the service
+// instead of guessing, so what is shown is always the recorded state.
+async function decideAction(id, operation, buttons) {
+  if (!actionDecisions.begin(id)) return; // already submitting
+  const gen = state.generation.snapshot();
+  for (const button of buttons) button.disabled = true;
+  actionDecisionsInFlight += 1;
+  setActionsRefreshDisabled(true);
+  const verb = operation === "approve" ? "Open" : "Reject";
+  setStatus(qs("action-decision-status"), `${verb} for action #${id}: submitting…`);
+  try {
+    const { result } = await apiRequest(`/api/action.open_tab.${operation}?id=${id}`, { method: "POST" });
+    if (!state.generation.isStale(gen)) {
+      setStatus(qs("action-decision-status"), `Action #${id}: ${ACTION_STATE_LABELS[result.state] ?? result.state}.`, result.state === "failed");
+    }
+  } catch (error) {
+    if (!state.generation.isStale(gen)) {
+      setStatus(qs("action-decision-status"), `${verb} for action #${id} did not complete: ${describeError(error)}. Reloading the list to show what was recorded.`, true);
+    }
+  }
+  // The list below is the authority; the tracker is released first so the
+  // rebuilt row offers buttons again only if the service still says previewed.
+  actionDecisions.reset(id);
+  try {
+    if (!state.generation.isStale(gen)) await refreshActions();
+  } catch {
+    // refreshActions has already put the failure in its own status element.
+  } finally {
+    actionDecisionsInFlight = Math.max(0, actionDecisionsInFlight - 1);
+    if (actionDecisionsInFlight === 0 && !state.generation.isStale(gen)) setActionsRefreshDisabled(false);
+  }
+}
+
+// Throws on failure (after updating the status text), like refreshProposals,
+// so decideAction's own reread can tell a failed reread from a successful one.
+async function refreshActions() {
+  const button = qs("refresh-actions-button");
+  const gen = state.generation.snapshot();
+  const token = actionsListGuard.start();
+  button.disabled = true;
+  setStatus(qs("actions-status"), "Loading…");
+  try {
+    const { result } = await apiRequest(`/api/store.actions.list?limit=${ACTIONS_LIMIT}`);
+    if (state.generation.isStale(gen) || !actionsListGuard.apply(token)) return;
+    const list = qs("actions-list");
+    clearChildren(list);
+    for (const action of result.items) list.appendChild(renderActionItem(action));
+    setStatus(qs("actions-status"), `Showing ${result.items.length} of ${result.total} action(s), newest first.`);
+  } catch (error) {
+    if (state.generation.isStale(gen)) return;
+    setStatus(qs("actions-status"), describeError(error), true);
+    throw error;
+  } finally {
+    if (!state.generation.isStale(gen) && actionDecisionsInFlight === 0) button.disabled = false;
+  }
+}
+qs("refresh-actions-button").addEventListener("click", () => {
+  refreshActions().catch(() => {}); // status element already shows the error
+});
+
+qs("action-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = qs("action-url-input");
+  const url = input.value.trim();
+  if (!url) return;
+  const button = qs("preview-button");
+  const gen = state.generation.snapshot();
+  button.disabled = true;
+  setStatus(qs("action-form-status"), "Creating preview…");
+  try {
+    const { result } = await apiRequest("/api/action.open_tab.preview", { method: "POST", body: { url } });
+    if (state.generation.isStale(gen)) return;
+    input.value = "";
+    setStatus(
+      qs("action-form-status"),
+      `Preview #${result.id} created. Nothing has been opened yet: review it below, then choose Open or Reject.`,
+    );
+    await refreshActions();
+    if (state.generation.isStale(gen)) return;
+    // Focus lands on the new preview's row (not on its Open button), so a
+    // keyboard or screen-reader user arrives at the preview to read it and a
+    // stray keypress cannot open anything.
+    qs(`action-${result.id}`)?.focus();
+  } catch (error) {
+    if (state.generation.isStale(gen)) return;
+    setStatus(qs("action-form-status"), `Could not create a preview: ${describeError(error)}`, true);
+  } finally {
+    if (!state.generation.isStale(gen)) button.disabled = false;
+  }
+});
+
+function renderAuditEntry(e) {
+  return el("li", {
+    text: `#${e.id} — ${formatTimestamp(e.occurredAt)} — action #${e.actionId} — ${e.event} — ${JSON.stringify(e.detail)}`,
+  });
+}
+
+async function refreshAudit() {
+  const button = qs("refresh-audit-button");
+  const gen = state.generation.snapshot();
+  const token = auditListGuard.start();
+  button.disabled = true;
+  setStatus(qs("audit-status"), "Loading…");
+  try {
+    const { result } = await apiRequest(`/api/store.actions.audit.list?limit=${AUDIT_LIMIT}`);
+    if (state.generation.isStale(gen) || !auditListGuard.apply(token)) return;
+    const list = qs("audit-list");
+    clearChildren(list);
+    for (const entry of result.items) list.appendChild(renderAuditEntry(entry));
+    setStatus(qs("audit-status"), `Showing ${result.items.length} of ${result.total} event(s), newest first.`);
+  } catch (error) {
+    if (state.generation.isStale(gen)) return;
+    setStatus(qs("audit-status"), describeError(error), true);
+  } finally {
+    if (!state.generation.isStale(gen)) button.disabled = false;
+  }
+}
+qs("refresh-audit-button").addEventListener("click", refreshAudit);
+
 // ---- tags ----
 
 function renderTagItem(t) {
@@ -1143,7 +1352,15 @@ qs("clear-all-button").addEventListener("click", async () => {
     const { result } = await apiRequest("/api/store.clear", { method: "POST" });
     if (state.generation.isStale(gen)) return;
     setStatus(qs("danger-status"), `Cleared. Removed ${result.removedBackupCount} backup file(s).`);
-    await Promise.all([refreshCaptures(), refreshSummaries(), refreshProposals().catch(() => {}), refreshTags(), refreshCollections(), refreshQueue()]);
+    await Promise.all([
+      refreshCaptures(),
+      refreshSummaries(),
+      refreshProposals().catch(() => {}),
+      refreshActions().catch(() => {}),
+      refreshTags(),
+      refreshCollections(),
+      refreshQueue(),
+    ]);
     if (state.generation.isStale(gen)) return;
     qs("detail-section").hidden = true;
     state.detailSession = null;

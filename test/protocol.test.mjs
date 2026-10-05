@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   ALLOWED_RESULT_STATUSES,
   ERROR_CODES,
+  MAX_OPEN_URL_LENGTH,
   MAX_TEXT_CHARACTERS,
   PROTOCOL_VERSION,
   RESULT_SCHEMA_VERSION,
@@ -14,6 +15,7 @@ import {
   isValidSessionId,
   isValidTimestamp,
   normalizeHistoryEntry,
+  normalizeOpenUrl,
   normalizeTab,
   normalizeTabGroup,
   normalizeWindow,
@@ -457,6 +459,131 @@ test("validateMethodResult checks get_capabilities-specific fields", () => {
   );
   assert.equal(validateMethodResult("browser.get_capabilities", { ...ok, maxTextCharacters: 0 }).valid, false);
   assert.equal(validateMethodResult("browser.get_capabilities", { ...ok, maxHistoryResults: -1 }).valid, false);
+});
+
+// --- Phase 2 Action 1: browser.open_tab -----------------------------------
+
+test("the protocol version was bumped for the first mutating method", () => {
+  assert.equal(PROTOCOL_VERSION, 3);
+});
+
+test("normalizeOpenUrl accepts absolute http(s) URLs and returns the WHATWG-normalized form", () => {
+  assert.deepEqual(normalizeOpenUrl("https://example.com"), { valid: true, url: "https://example.com/" });
+  assert.deepEqual(normalizeOpenUrl("HTTP://Example.COM:80/a/../b?q=1#frag"), { valid: true, url: "http://example.com/b?q=1#frag" });
+  assert.deepEqual(normalizeOpenUrl("https://example.com/a b".replace(" ", "%20")), { valid: true, url: "https://example.com/a%20b" });
+  assert.equal(normalizeOpenUrl("https://münchen.example/").url, "https://xn--mnchen-3ya.example/");
+});
+
+test("normalizeOpenUrl is idempotent: a normalized URL normalizes to itself", () => {
+  const first = normalizeOpenUrl("HTTPS://Example.com:443/a/./b?x=1");
+  assert.equal(normalizeOpenUrl(first.url).url, first.url);
+});
+
+test("normalizeOpenUrl rejects every non-http(s) scheme", () => {
+  for (const url of [
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "file:///etc/passwd",
+    "chrome://settings",
+    "chrome-extension://abc/page.html",
+    "about:blank",
+    "ftp://example.com/",
+    "blob:https://example.com/uuid",
+    "view-source:https://example.com/",
+    "ws://example.com/",
+  ]) {
+    assert.equal(normalizeOpenUrl(url).valid, false, `${url} must be rejected`);
+  }
+});
+
+test("normalizeOpenUrl rejects relative, scheme-relative, and scheme-less input", () => {
+  for (const url of ["example.com", "/path", "//example.com/", "http:example.com", "https:/example.com", "http:\\\\example.com", "?q=1"]) {
+    assert.equal(normalizeOpenUrl(url).valid, false, `${JSON.stringify(url)} must be rejected`);
+  }
+});
+
+test("normalizeOpenUrl rejects embedded credentials", () => {
+  for (const url of ["https://user@example.com/", "https://user:pass@example.com/", "http://:pass@example.com/"]) {
+    const result = normalizeOpenUrl(url);
+    assert.equal(result.valid, false, `${url} must be rejected`);
+    assert.match(result.reason, /credentials/);
+  }
+});
+
+test("normalizeOpenUrl rejects whitespace and control characters rather than letting the parser strip them", () => {
+  for (const url of [" https://example.com/", "https://example.com/ ", "https://exa mple.com/", "https://example.com/\n", "https://example.com/\tx", "https://example.com/\u0000", "https://example.com/\u007f", "https://example.com/\u0085"]) {
+    assert.equal(normalizeOpenUrl(url).valid, false, `${JSON.stringify(url)} must be rejected`);
+  }
+});
+
+test("normalizeOpenUrl rejects non-strings, empty input, and an empty host", () => {
+  for (const value of [undefined, null, 5, {}, [], true, "", "https://", "https://:443/"]) {
+    assert.equal(normalizeOpenUrl(value).valid, false, `${JSON.stringify(value)} must be rejected`);
+  }
+});
+
+test("normalizeOpenUrl bounds the URL both before and after normalization", () => {
+  const prefix = "https://example.com/";
+  const atLimit = prefix + "a".repeat(MAX_OPEN_URL_LENGTH - prefix.length);
+  assert.equal(normalizeOpenUrl(atLimit).valid, true);
+  assert.equal(normalizeOpenUrl(atLimit + "a").valid, false, "raw input over the bound is rejected");
+  // Percent-encoding can grow a URL: this is within the bound as typed and over it once normalized.
+  const grows = prefix + "é".repeat(Math.floor((MAX_OPEN_URL_LENGTH - prefix.length) / 2));
+  assert.ok(grows.length <= MAX_OPEN_URL_LENGTH);
+  assert.equal(normalizeOpenUrl(grows).valid, false, "normalized length over the bound is rejected");
+});
+
+function openTabTab(overrides = {}) {
+  return { tabId: 12, windowId: 3, index: 4, active: true, pinned: false, audible: false, discarded: false, status: "loading", title: null, url: null, ...overrides };
+}
+
+function openTabResult(overrides = {}) {
+  return {
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    browserSessionId: "s",
+    sourceOperation: "browser.open_tab",
+    capturedAt: Date.now(),
+    status: "ok",
+    created: true,
+    requestedUrl: "https://example.com/",
+    tab: openTabTab(),
+    pendingUrl: "https://example.com/",
+    ...overrides,
+  };
+}
+
+test("validateMethodResult accepts a fully observed browser.open_tab result and checks its fields", () => {
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult()).valid, true);
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ pendingUrl: null })).valid, true);
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ created: false })).valid, false, "an ok result must say a tab was created");
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ created: undefined })).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ requestedUrl: "" })).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ tab: undefined })).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ tab: openTabTab({ tabId: -1 }) })).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ tab: openTabTab({ active: "yes" }) })).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", openTabResult({ pendingUrl: 5 })).valid, false);
+});
+
+test("validateMethodResult requires every non-ok browser.open_tab result to state consistently whether a tab was created", () => {
+  const refusal = { ...openTabResult({ status: "error", code: "stale_session", created: false }), tab: undefined, requestedUrl: undefined, pendingUrl: undefined };
+  assert.equal(validateMethodResult("browser.open_tab", refusal).valid, true);
+  assert.equal(validateMethodResult("browser.open_tab", { ...refusal, created: undefined }).valid, false, "a legacy peer's bare error has no created flag");
+  assert.equal(validateMethodResult("browser.open_tab", { ...refusal, created: true }).valid, false, "an error claiming a tab was created, other than the partial outcome, is invalid");
+  assert.equal(validateMethodResult("browser.open_tab", { ...refusal, created: "no" }).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", { ...refusal, status: "incomplete" }).valid, false, "incomplete always means a tab was created");
+
+  const partial = { ...refusal, status: "incomplete", code: ERROR_CODES.OBSERVE_FAILED, created: true, tabId: 12, windowId: 3 };
+  assert.equal(validateMethodResult("browser.open_tab", partial).valid, true);
+  assert.equal(validateMethodResult("browser.open_tab", { ...partial, tabId: null, windowId: null }).valid, true, "tabs.create may return no usable handles");
+  assert.equal(validateMethodResult("browser.open_tab", { ...partial, tabId: "12" }).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", { ...partial, tabId: undefined }).valid, false);
+  assert.equal(validateMethodResult("browser.open_tab", { ...partial, code: "something_else" }).valid, false, "only observe_failed is the partial outcome");
+  assert.equal(validateMethodResult("browser.open_tab", { ...partial, status: "error" }).valid, false, "a created tab is never an ordinary error");
+});
+
+test("validateMethodResult never lets another method's non-ok result be held to the open_tab created rule", () => {
+  const readFailure = { schemaVersion: RESULT_SCHEMA_VERSION, browserSessionId: "s", sourceOperation: "browser.read_tab", capturedAt: 1, status: "error", code: "stale_handle" };
+  assert.equal(validateMethodResult("browser.read_tab", readFailure).valid, true);
 });
 
 test("validateMethodResult never crashes or false-rejects for a method name that collides with an Object.prototype member", () => {

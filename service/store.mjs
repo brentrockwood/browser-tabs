@@ -13,7 +13,12 @@ import { dirname, join } from "node:path";
 import { ALLOWED_RESULT_STATUSES } from "../extension/protocol.js";
 import { STORE_ERROR_CODES, StoreError, toStoreError } from "./store-errors.mjs";
 import {
+  ACTION_INTERRUPTED_CODE,
+  ACTION_INTERRUPTED_DETAIL,
+  ACTION_STATES,
   CREATOR_TYPES,
+  MAX_ACTION_AUDIT_EVENTS,
+  MAX_PENDING_ACTIONS,
   MAX_STATE_LENGTH,
   PROPOSAL_KINDS,
   PROPOSAL_STATES,
@@ -24,6 +29,8 @@ import {
   optionalFilterPositiveInteger,
   optionalFilterString,
   requireRecordFilterPairOrNeither,
+  validateActionPreviewInput,
+  validateActionResultInput,
   validateCaptureInput,
   validateCaptureReadInput,
   validateCollectionCreateInput,
@@ -358,6 +365,74 @@ export const MIGRATIONS = [
         ALTER TABLE captures ADD COLUMN detail TEXT;
         ALTER TABLE proposals ADD COLUMN decided_by_creator_type TEXT CHECK (decided_by_creator_type IN ('user','client','agent'));
         ALTER TABLE proposals ADD COLUMN decided_by_creator_name TEXT;
+      `);
+    },
+  },
+  {
+    // Phase 2 Action 1: browser actions and their audit log. Purely additive
+    // (two new tables), so not breaking and no backup is taken.
+    //
+    // `actions` holds each previewed operation — the exact normalized URL,
+    // the browser session it was previewed in, and when — and walks one
+    // state machine, enforced by the store's conditional UPDATEs and, as a
+    // backstop, by the triggers below: what a preview bound can never be
+    // rewritten, and a terminal state can never change. It also holds the
+    // observed result (untrusted browser content, clipped), so
+    // `store.clear` deletes it like any other retained browser content.
+    //
+    // `action_audit` is append-only, enforced by triggers: no UPDATE and no
+    // DELETE, ever, including from `store.clear` (it carries no browser
+    // content — see appendActionAudit in openStore for what an event holds).
+    // `action_id` is deliberately not a foreign key, so clearing the
+    // action records never touches, or is blocked by, the audit trail.
+    version: 3,
+    breaking: false,
+    apply: (db) => {
+      db.exec(`
+        CREATE TABLE actions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL CHECK (kind IN ('open_tab')),
+          url TEXT NOT NULL,
+          browser_session_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('previewed','approved','rejected','executed','partial','stale','failed')),
+          previewed_at INTEGER NOT NULL,
+          decided_at INTEGER,
+          completed_at INTEGER,
+          result TEXT
+        );
+        CREATE INDEX idx_actions_state ON actions(state);
+
+        CREATE TRIGGER actions_bound_fields_immutable
+        BEFORE UPDATE OF kind, url, browser_session_id, previewed_at ON actions
+        BEGIN
+          SELECT RAISE(ABORT, 'a previewed action''s kind, url, session, and timestamp are immutable');
+        END;
+        CREATE TRIGGER actions_terminal_state_immutable
+        BEFORE UPDATE OF state ON actions
+        WHEN OLD.state NOT IN ('previewed','approved')
+        BEGIN
+          SELECT RAISE(ABORT, 'a terminal action state cannot change');
+        END;
+
+        CREATE TABLE action_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          action_id INTEGER NOT NULL,
+          event TEXT NOT NULL CHECK (event IN ('preview','approve','reject','result')),
+          occurred_at INTEGER NOT NULL,
+          detail TEXT NOT NULL
+        );
+        CREATE INDEX idx_action_audit_action ON action_audit(action_id);
+
+        CREATE TRIGGER action_audit_no_update
+        BEFORE UPDATE ON action_audit
+        BEGIN
+          SELECT RAISE(ABORT, 'the action audit log is append-only');
+        END;
+        CREATE TRIGGER action_audit_no_delete
+        BEFORE DELETE ON action_audit
+        BEGIN
+          SELECT RAISE(ABORT, 'the action audit log is append-only');
+        END;
       `);
     },
   },
@@ -1267,6 +1342,179 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
     });
   }
 
+  // ---- actions (Phase 2 Action 1) ----
+
+  function rowToAction(row) {
+    return {
+      id: row.id,
+      kind: row.kind,
+      url: row.url,
+      browserSessionId: row.browser_session_id,
+      state: row.state,
+      previewedAt: row.previewed_at,
+      decidedAt: row.decided_at,
+      completedAt: row.completed_at,
+      result: row.result === null ? null : JSON.parse(row.result),
+    };
+  }
+
+  // The audit log's only writer. Every event is written in the same
+  // transaction as the state change it records, so the log and the action
+  // can never disagree about whether something happened. An event carries
+  // the action id, an event name, a timestamp, and server-controlled enum
+  // values only (the action kind, the decision, the result state and
+  // mutation) — each chosen or validated against a fixed set by this
+  // service. Nothing the extension (or any caller) supplies is ever copied
+  // into it: not the URL or a hash of it, not a session id, title, handle,
+  // code, or detail. The action record holds those, clipped, and is cleared
+  // by `store.clear`; the audit log is not.
+  function appendActionAudit(actionId, event, occurredAt, detail) {
+    db.prepare("INSERT INTO action_audit (action_id, event, occurred_at, detail) VALUES (?, ?, ?, ?)").run(
+      actionId,
+      event,
+      occurredAt,
+      JSON.stringify(detail),
+    );
+  }
+
+  // Records a preview: the exact normalized URL, the browser session it was
+  // taken in, and the time. Nothing is executed. Refused (never by evicting
+  // anything) when too many previews already await a decision or the audit
+  // log is full.
+  function createAction(input) {
+    const data = validateActionPreviewInput(input);
+    return runInTransaction(db, () => {
+      const pending = db.prepare("SELECT COUNT(*) AS count FROM actions WHERE state = 'previewed'").get().count;
+      if (pending >= MAX_PENDING_ACTIONS) {
+        throw new StoreError(STORE_ERROR_CODES.LIMIT_REACHED, `${pending} previews already await a decision; approve or reject some first`);
+      }
+      const auditCount = db.prepare("SELECT COUNT(*) AS count FROM action_audit").get().count;
+      if (auditCount >= MAX_ACTION_AUDIT_EVENTS) {
+        throw new StoreError(STORE_ERROR_CODES.LIMIT_REACHED, "the action audit log is full; no new action can be previewed");
+      }
+      const now = nowMs();
+      const result = db
+        .prepare("INSERT INTO actions (kind, url, browser_session_id, state, previewed_at) VALUES (?, ?, ?, 'previewed', ?)")
+        .run(data.kind, data.url, data.browserSessionId, now);
+      const id = Number(result.lastInsertRowid);
+      appendActionAudit(id, "preview", now, { kind: data.kind });
+      return rowToAction(db.prepare("SELECT * FROM actions WHERE id = ?").get(id));
+    });
+  }
+
+  // The single terminal decision on a preview. `decision` is "approve" or
+  // "reject"; it is made by id alone — nothing about the operation can be
+  // supplied here, so what is approved is exactly what was previewed. The
+  // transition is one conditional UPDATE (`... AND state = 'previewed'`)
+  // inside an immediate transaction, so of any number of concurrent or
+  // repeated decisions exactly one changes a row; every other gets CONFLICT
+  // and must not execute anything. The returned record is what the caller
+  // executes from.
+  function decideAction(id, decision) {
+    if (decision !== "approve" && decision !== "reject") {
+      throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, 'decision: must be "approve" or "reject"');
+    }
+    if (!Number.isSafeInteger(id) || id <= 0) throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, "id: must be a positive integer");
+    return runInTransaction(db, () => {
+      const now = nowMs();
+      const toState = decision === "approve" ? "approved" : "rejected";
+      const { changes } = db.prepare("UPDATE actions SET state = ?, decided_at = ? WHERE id = ? AND state = 'previewed'").run(toState, now, id);
+      if (changes !== 1) {
+        const existing = db.prepare("SELECT state FROM actions WHERE id = ?").get(id);
+        if (!existing) throw new StoreError(STORE_ERROR_CODES.NOT_FOUND, `action ${id} not found`);
+        throw new StoreError(STORE_ERROR_CODES.CONFLICT, `action ${id} has already been decided (state: ${existing.state})`);
+      }
+      appendActionAudit(id, decision, now, { decision });
+      return rowToAction(db.prepare("SELECT * FROM actions WHERE id = ?").get(id));
+    });
+  }
+
+  // Completes an approved action with its outcome. Only an "approved" action
+  // can be completed, and only once (the same conditional-UPDATE pattern as
+  // decideAction); the result and its audit event commit together.
+  function recordActionResult(id, input) {
+    const data = validateActionResultInput(input);
+    if (!Number.isSafeInteger(id) || id <= 0) throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, "id: must be a positive integer");
+    return runInTransaction(db, () => completeApprovedAction(id, data));
+  }
+
+  // The one place an approved action becomes terminal: the conditional
+  // UPDATE and its audit event. Must run inside a transaction. Shared by
+  // recordActionResult and reconcileInterruptedActions below.
+  function completeApprovedAction(id, data) {
+    const now = nowMs();
+    const stored = JSON.stringify({
+      mutation: data.mutation,
+      code: data.code,
+      detail: data.detail,
+      tabId: data.tabId,
+      windowId: data.windowId,
+      observed: data.observed,
+    });
+    const { changes } = db
+      .prepare("UPDATE actions SET state = ?, completed_at = ?, result = ? WHERE id = ? AND state = 'approved'")
+      .run(data.state, now, stored, id);
+    if (changes !== 1) {
+      const existing = db.prepare("SELECT state FROM actions WHERE id = ?").get(id);
+      if (!existing) throw new StoreError(STORE_ERROR_CODES.NOT_FOUND, `action ${id} not found`);
+      throw new StoreError(STORE_ERROR_CODES.CONFLICT, `action ${id} is not awaiting a result (state: ${existing.state})`);
+    }
+    appendActionAudit(id, "result", now, { state: data.state, mutation: data.mutation });
+    return rowToAction(db.prepare("SELECT * FROM actions WHERE id = ?").get(id));
+  }
+
+  // Crash/restart reconciliation. An action is "approved" only between the
+  // committed decision and its recorded result, so one found in that state
+  // when the service starts was interrupted: the request may or may not have
+  // reached the browser. Each becomes terminal `failed`, mutation "unknown",
+  // with a stable code and an audit result event — never left approved
+  // forever, which would also block `store.clear`.
+  //
+  // MUST only be called by the one service that owns this database — the one
+  // holding the data-directory lock (service/cli.mjs's service.lock) — before
+  // it serves any request. It cannot tell an interrupted action from one
+  // another process is executing right now, and opening a store deliberately
+  // does not call it; the lock is what makes "no other process" true.
+  function reconcileInterruptedActions() {
+    return runInTransaction(db, () => {
+      const ids = db.prepare("SELECT id FROM actions WHERE state = 'approved' ORDER BY id").all().map((row) => row.id);
+      for (const id of ids) {
+        completeApprovedAction(
+          id,
+          validateActionResultInput({
+            state: "failed",
+            mutation: "unknown",
+            code: ACTION_INTERRUPTED_CODE,
+            detail: ACTION_INTERRUPTED_DETAIL,
+          }),
+        );
+      }
+      return { reconciledCount: ids.length };
+    });
+  }
+
+  function listActions({ limit, offset, id, state } = {}) {
+    const bounds = validateLimitOffset({ limit, offset });
+    const { where, params } = buildWhere([
+      ["id", optionalFilterPositiveInteger(id, "id")],
+      ["state", optionalFilterEnum(state, ACTION_STATES, "state")],
+    ]);
+    const items = db.prepare(`SELECT * FROM actions ${where} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, bounds.limit, bounds.offset).map(rowToAction);
+    const total = db.prepare(`SELECT COUNT(*) AS count FROM actions ${where}`).get(...params).count;
+    return { items, total };
+  }
+
+  function listActionAudit({ limit, offset, actionId } = {}) {
+    const bounds = validateLimitOffset({ limit, offset });
+    const { where, params } = buildWhere([["action_id", optionalFilterPositiveInteger(actionId, "actionId")]]);
+    const items = db
+      .prepare(`SELECT * FROM action_audit ${where} ORDER BY id DESC LIMIT ? OFFSET ?`)
+      .all(...params, bounds.limit, bounds.offset)
+      .map((row) => ({ id: row.id, actionId: row.action_id, event: row.event, occurredAt: row.occurred_at, detail: JSON.parse(row.detail) }));
+    const total = db.prepare(`SELECT COUNT(*) AS count FROM action_audit ${where}`).get(...params).count;
+    return { items, total };
+  }
+
   // ---- retention ----
 
   function getRetentionSettingsRaw() {
@@ -1383,6 +1631,21 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
   // on deleteCapture above.
   function clearAll() {
     const deletedCounts = runInTransaction(db, () => {
+      // Refused, with nothing deleted, while any action is approved but not
+      // yet completed: its request may be in flight to the browser, and
+      // deleting its record would orphan the result that is about to be
+      // recorded. Both orderings are safe: a clear that commits first deletes
+      // the preview, so a later approve is NOT_FOUND and mutates nothing; an
+      // approve that commits first makes this clear a CONFLICT until the
+      // result is terminal. (This runs under BEGIN IMMEDIATE, so it and
+      // decideAction/recordActionResult cannot interleave.)
+      const inFlight = db.prepare("SELECT COUNT(*) AS count FROM actions WHERE state = 'approved'").get().count;
+      if (inFlight > 0) {
+        throw new StoreError(
+          STORE_ERROR_CODES.CONFLICT,
+          `${inFlight} browser action(s) are approved and still awaiting their result; nothing was cleared. Try again once they complete.`,
+        );
+      }
       const order = [
         "queue_items",
         "tag_assignments",
@@ -1394,6 +1657,11 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
         "tags",
         "collections",
         "captures",
+        // Phase 2: action records hold the observed tab's untrusted title/
+        // URL, so they are cleared with the rest. The audit log
+        // (action_audit) is append-only and holds no browser content, so it
+        // is deliberately not here.
+        "actions",
       ];
       const counts = {};
       for (const table of order) {
@@ -1455,6 +1723,12 @@ export async function openStore({ dataDir, log = () => {}, captureDependentChunk
     listProposals,
     updateProposalState,
     deleteProposal,
+    createAction,
+    decideAction,
+    recordActionResult,
+    reconcileInterruptedActions,
+    listActions,
+    listActionAudit,
     getRetentionSettings,
     updateRetentionSettings,
     runRetentionCleanup,

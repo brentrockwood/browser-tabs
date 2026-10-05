@@ -58,7 +58,19 @@ export const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 // envelope, not a bare array/value) and handle-consuming methods now
 // require a caller-supplied `browserSessionId`, neither of which an old
 // (version-1) client or extension could produce or understand correctly.
-export const PROTOCOL_VERSION = 2;
+//
+// Bumped to 3 for Phase 2 Action 1 (`browser.open_tab`): the first request
+// the service sends the extension that *mutates* the browser. A version-2
+// extension must never be paired with a service that expects the strict
+// session-revalidating, create-then-observe contract below (it would answer
+// `unknown_method`, with no `created` field), so the handshake refuses the
+// mismatch outright with `unsupported_protocol_version`.
+export const PROTOCOL_VERSION = 3;
+
+// Phase 2 Action 1: the longest URL (raw input, and again after
+// normalization) the open-tab action accepts. Bounds the preview, the stored
+// action record, and the `tabs.create` argument.
+export const MAX_OPEN_URL_LENGTH = 2_048;
 
 // Single source of truth for the Stage 1 fixed loopback port: both the
 // extension's WebSocket target (extension/service-client.js) and the
@@ -153,6 +165,11 @@ export const ERROR_CODES = Object.freeze({
   TAB_GROUPS_QUERY_FAILED: "tab_groups_query_failed",
   HISTORY_QUERY_FAILED: "history_query_failed",
   PAGINATION_LIMIT_REACHED: "pagination_limit_reached",
+  // Phase 2 Action 1: `tabs.create` itself rejected (no tab was created), and
+  // the partial outcome where it succeeded but the follow-up `tabs.get`
+  // observation did not (a tab *was* created; its final state is unknown).
+  OPEN_TAB_FAILED: "open_tab_failed",
+  OBSERVE_FAILED: "observe_failed",
   RATE_LIMITED: "rate_limited",
   RESPONSE_TOO_LARGE: "response_too_large",
   // The extension's own response failed the service boundary's envelope/
@@ -218,6 +235,32 @@ export function isValidTimestamp(value) {
   return Number.isFinite(value) && value >= 0;
 }
 
+// Phase 2 Action 1: the one place a URL to open is validated and normalized,
+// shared by the service (preview) and the extension (re-checked before
+// `tabs.create`). Accepts only an absolute, bounded `http(s)://` URL with no
+// embedded credentials and returns the WHATWG-normalized form — the exact
+// string the preview shows, the approval binds, and the browser is asked to
+// open. Whitespace and control characters are rejected rather than left for
+// the URL parser to silently strip or re-encode, and any other scheme
+// (`javascript:`, `data:`, `file:`, `chrome:`, ...) is refused outright.
+export function normalizeOpenUrl(value) {
+  const invalid = (reason) => ({ valid: false, reason });
+  if (typeof value !== "string" || value.length === 0) return invalid("url must be a non-empty string");
+  if (value.length > MAX_OPEN_URL_LENGTH) return invalid(`url must be at most ${MAX_OPEN_URL_LENGTH} characters`);
+  if (/[\u0000- \u007f-\u009f]/.test(value)) return invalid("url must not contain whitespace or control characters");
+  if (!/^https?:\/\//i.test(value)) return invalid("url must be an absolute http:// or https:// URL");
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return invalid("url is not a valid absolute URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return invalid("url scheme must be http or https");
+  if (parsed.username !== "" || parsed.password !== "") return invalid("url must not contain credentials");
+  if (parsed.href.length > MAX_OPEN_URL_LENGTH) return invalid(`normalized url must be at most ${MAX_OPEN_URL_LENGTH} characters`);
+  return { valid: true, url: parsed.href };
+}
+
 // Every status a `browser.*` result's envelope may carry. "incomplete" is
 // used only by `browser.query_history`, when its explicit scan ceiling
 // (MAX_HISTORY_SCAN) is reached before a full page can be determined — see
@@ -254,7 +297,7 @@ function isValidWindowRecord(value) {
 }
 
 // Mirrors normalizeTab's output shape.
-function isValidTabRecord(value) {
+export function isValidTabRecord(value) {
   return (
     value !== null &&
     typeof value === "object" &&
@@ -371,6 +414,14 @@ const OK_SHAPE_VALIDATORS = {
     return result.returnedCount === result.entries.length;
   },
 
+  // Phase 2 Action 1: a fully observed open. `tab` is the browser's own
+  // `tabs.get` answer after the one `tabs.create`, not an echo of the request.
+  "browser.open_tab": (result) =>
+    result.created === true &&
+    isNonEmptyString(result.requestedUrl) &&
+    isValidTabRecord(result.tab) &&
+    isNullableString(result.pendingUrl),
+
   "browser.get_capabilities": (result) =>
     result.protocolVersion === PROTOCOL_VERSION &&
     typeof result.tabGroups === "boolean" &&
@@ -427,7 +478,26 @@ export function validateMethodResult(method, result) {
   if (!isNonEmptyString(result.code)) {
     return { valid: false, reason: `a "${result.status}" result must carry a non-empty "code"` };
   }
+  if (method === "browser.open_tab" && !isValidOpenTabNonOkShape(result)) {
+    return { valid: false, reason: `a "${result.status}" result for "${method}" must state whether a tab was created, consistently` };
+  }
   return { valid: true };
+}
+
+// A non-"ok" `browser.open_tab` result must say whether the browser was
+// mutated. Every refusal or failure is `created: false`; the one partial
+// outcome — `tabs.create` succeeded but the `tabs.get` observation did not —
+// is `status: "incomplete"`, `created: true`, and carries whatever handles
+// `tabs.create` returned (null if it returned none).
+function isValidOpenTabNonOkShape(result) {
+  if (result.created === false) return result.status !== "incomplete";
+  return (
+    result.created === true &&
+    result.status === "incomplete" &&
+    result.code === ERROR_CODES.OBSERVE_FAILED &&
+    (result.tabId === null || isValidHandle(result.tabId)) &&
+    (result.windowId === null || isValidHandle(result.windowId))
+  );
 }
 
 export function normalizeWindow(window) {

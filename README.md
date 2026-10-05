@@ -12,6 +12,9 @@ A deterministic, local-first browser adapter for inspecting open browser windows
 - Report capabilities so a client does not infer browser features from brand.
 
 The extension never rearranges, closes, creates, or navigates tabs in this phase.
+(Phase 2 adds exactly one owner-approved exception, opening a URL in a new tab:
+see "Phase 2, Action 1: open a URL in a new tab" below. Nothing else changes
+in what the read API, an external agent, or the review UI's other sections can do.)
 
 `browser.read_tab` returns the document body's rendered text (`innerText`) in
 document order, normalizes CRLF to LF, and caps `text` at 500,000 characters.
@@ -122,10 +125,10 @@ reporting it at face value.
 ### Calling the API
 
 ```sh
-curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 2" http://127.0.0.1:8743/api/browser.list_windows
+curl -H "Authorization: Bearer <token>" -H "X-Protocol-Version: 3" http://127.0.0.1:8743/api/browser.list_windows
 ```
 
-Returns `{"protocolVersion": 2, "requestId": "...", "result": {...}}`, where
+Returns `{"protocolVersion": 3, "requestId": "...", "result": {...}}`, where
 `result` is the same capture-provenance-wrapped object the extension's
 `runtime.onMessage` listener produces (see "Stage 2: the read API" below).
 `requestId` echoes an `X-Request-Id` header you send, or is generated if you
@@ -364,8 +367,8 @@ Stage 2 extends the Stage 1 bridge's one route (`browser.list_windows`) into
 a complete, bounded read API: windows, tabs, tab groups (where supported),
 page-text snapshots, and browsing history, plus a capability-discovery
 route. It reuses Stage 1's authenticated HTTP API and extension WebSocket
-transport, but is a **breaking protocol change** (`PROTOCOL_VERSION` is now
-`2`): every result is a validated capture-provenance envelope rather than a
+transport, but is a **breaking protocol change** (`PROTOCOL_VERSION` became
+`2` here, and is `3` as of Phase 2 — see "Phase 2, Action 1" below): every result is a validated capture-provenance envelope rather than a
 bare value, and handle-consuming routes now require a caller-supplied
 session id. A protocol-1 client or extension cannot interoperate with this
 revision.
@@ -913,7 +916,7 @@ dependents are actually gone.
 | `store.queue.create` / `.list` / `.update` / `.delete` | POST/GET/PATCH/DELETE | |
 | `store.proposals.create` / `.list` / `.update` / `.delete` | POST/GET/PATCH/DELETE | `.update` only accepts `pending`→`accepted`\|`rejected`, and requires `creatorType`/`creatorName` (see "Decision provenance") |
 | `store.retention.get` / `.update` / `.cleanup` | GET/PATCH/POST | |
-| `store.clear` | POST | returns `removedBackupCount` (a bounded count, never the removed-filename list) |
+| `store.clear` | POST | returns `removedBackupCount` (a bounded count, never the removed-filename list); `409 conflict`, deleting nothing, while a Phase 2 browser action is approved and awaiting its result |
 
 Failure modes beyond Stage 1/2's existing ones (missing/invalid credential,
 wrong protocol version, rate limit): `400 validation_error`/`malformed_body`
@@ -1253,7 +1256,7 @@ listing, and this script never logs the token itself:
 | `BROWSER_TABS_URL` | `http://127.0.0.1:8743` |
 | `BROWSER_TABS_AGENT_TOKEN` | _(unset; takes precedence over the file below)_ |
 | `BROWSER_TABS_AGENT_CREDENTIAL_FILE` | `~/.browser-tabs/agent-token` |
-| `BROWSER_TABS_PROTOCOL_VERSION` | `2` |
+| `BROWSER_TABS_PROTOCOL_VERSION` | `3` |
 
 Note this is the **agent** credential, read via a bounded `open`/`stat`/
 `read` sequence capped well below the file's expected size — never
@@ -1948,7 +1951,7 @@ compatibility) unrelated to what actually changed:
 | Field | Where | Bump when |
 | --- | --- | --- |
 | Product version | `package.json`, both extension manifests | Any release; purely informational otherwise. |
-| `PROTOCOL_VERSION` (`extension/protocol.js`) | Every request/response envelope, both the HTTP API and the extension↔service WebSocket | A breaking wire-format or session/handle-requirement change — see its own doc comment for the Stage 2 precedent. Old and new major versions must never be silently treated as compatible. |
+| `PROTOCOL_VERSION` (`extension/protocol.js`) | Every request/response envelope, both the HTTP API and the extension↔service WebSocket | A breaking wire-format or session/handle-requirement change — see its own doc comment for the Stage 2 precedent (2) and the Phase 2 precedent (3: the first request that mutates the browser, so an extension that predates its strict contract can never be paired with a service that sends it). Old and new major versions must never be silently treated as compatible. |
 | `RESULT_SCHEMA_VERSION` (`extension/protocol.js`) | Every `browser.*` result's capture-provenance envelope | The envelope's own shape changes within the same `PROTOCOL_VERSION` major version (unknown fields are otherwise tolerated — see project.md's protocol rules). |
 | DB schema version | `service/store.mjs`'s `MIGRATIONS`, highest `version` | Any change to the derived store's schema — always as a new, forward-only, numbered migration (never an edit to an already-shipped one); see "Migrations and backups" above. A `breaking: true` migration backs up the database first. |
 
@@ -2149,6 +2152,297 @@ the database file first, under the same data directory, before touching it.
 No other local state exists: the service binds only to loopback, writes
 nothing outside `~/.browser-tabs` (or `BROWSER_TABS_DATA_DIR`, if set), and
 this project makes no other network or remote calls.
+
+## Phase 2, Action 1: open a URL in a new tab
+
+Phase 2 begins with the one browser mutation project.md lists first: opening a
+URL in a new tab. Only the **owner** can do it, in two explicit steps, and
+nothing about the operation can change between them. **Status: complete.** The
+final gate passed 478/478 automated tests, a clean dependency audit, the real
+Chrome for Testing bridge smoke, and independent Terra review after the
+clear/restart, audit-content, and single-service race findings were fixed.
+
+### The two steps
+
+1. **Preview** — `POST /api/action.open_tab.preview` with the body
+   `{"url": "<absolute http(s) URL>"}` and *no other field*. The service
+   validates and normalizes the URL, asks the extension for its current
+   `browserSessionId` (the caller can never supply one), and stores a preview
+   binding **the exact normalized URL, that session, and the preview time**.
+   Nothing is opened. The response is the stored action (`state:
+   "previewed"`).
+2. **Decide** — `POST /api/action.open_tab.approve?id=<n>` or
+   `POST /api/action.open_tab.reject?id=<n>`: the action is identified by its
+   stored id **alone**. These routes take no request body and no other query
+   parameter (either is a `400`), so a caller cannot restate or alter what is
+   being decided. A preview takes exactly one terminal decision:
+   `previewed → approved | rejected`, and an approved action is then completed
+   exactly once with its result.
+
+`GET /api/store.actions.list` (filters `id`, `state`; `limit`/`offset`, max
+200) and `GET /api/store.actions.audit.list` (filters `actionId`; same
+paging) are the read views. There is no route that updates or deletes an
+action or an audit event, and none that executes anything but an approved,
+stored preview. All five routes — and the extension method behind them — are
+**owner-only**: the external-agent credential gets `403 forbidden_scope` from
+each (an explicit check, not only absence from the agent allowlist), and
+`browser.open_tab` has no HTTP route at all (`404` for either credential).
+The extension WebSocket accepts only the owner credential, and the extension's
+`runtime.onMessage` listener cannot invoke `browser.open_tab` either (it is
+dispatched only from the authenticated service connection).
+
+### What a URL must be
+
+An absolute `http://` or `https://` URL of at most 2,048 characters (both as
+typed and after normalization — percent-encoding can grow it). Whitespace and
+control characters are rejected rather than silently stripped. Every other
+scheme (`javascript:`, `data:`, `file:`, `chrome:`, `chrome-extension:`,
+`about:`, `blob:`, `view-source:`, ...), relative or scheme-less input, and any
+URL with a username or password is refused with `400 validation_error`. The
+stored, previewed, and opened URL is the WHATWG-normalized form (lower-cased
+host, default port dropped, dot segments resolved, IDN as punycode): what you
+are shown is exactly what is opened. `normalizeOpenUrl` in
+`extension/protocol.js` is the single definition; the service uses it at
+preview and the extension re-checks it (and that the URL is already
+normalized) before opening anything.
+
+### Execution: one `tabs.create`, then observe
+
+Approve first requires a connected extension (otherwise `503 disconnected` and
+the preview is **not** consumed). It then commits the decision — a single
+conditional `UPDATE ... WHERE state = 'previewed'` inside an immediate
+transaction, so of any number of concurrent or repeated approve/reject calls
+exactly one wins and every other gets `409 conflict` and executes nothing — and
+only the winner sends one `browser.open_tab` request (`url`,
+`browserSessionId`: the stored values, never anything from the approve
+request). In the extension, `openTab`:
+
+- checks the supplied `browserSessionId` against its current session **inside
+  the operation, with no `await` between that check and `tabs.create`**; a
+  mismatch (the browser restarted since the preview) returns `stale_session`
+  with `created: false` and touches nothing;
+- re-validates the URL and calls `tabs.create({ url, active: true })` **at most
+  once, never retried** (the tab opens in front, in the browser's current
+  window);
+- does not trust the create response as the outcome: it re-reads the new tab
+  with `tabs.get` and reports that observed state (`tab`, plus `pendingUrl`,
+  since a still-loading tab's `url` is empty) — which may differ from the
+  request, e.g. after a redirect.
+
+The result recorded on the action says exactly what happened, always with
+HTTP `200` once the decision committed:
+
+| Action `state` | Meaning | `result.mutation` |
+| --- | --- | --- |
+| `executed` | one tab created and observed (`result.observed` holds its index/status/title/URL, clipped) | `created` |
+| `partial` | `tabs.create` succeeded but `tabs.get` did not (`observe_failed`): a tab **was** opened, its final state is unknown | `created` |
+| `stale` | the extension's session differs from the preview's; nothing opened | `none` |
+| `failed` | the extension refused or failed without creating a tab (`open_tab_failed`, `invalid_params`), or the request was never sent (`disconnected` before sending) | `none` |
+| `failed` | the request was sent but no usable answer came back (`request_timeout`, `disconnected` mid-request, `invalid_extension_response`, an answer for a different URL/session) | `unknown` |
+| `rejected` | you rejected the preview; nothing opened (no result) | — |
+
+`previewed` (awaiting a decision) and `approved` (decision committed, no
+result yet) are the only non-terminal states. A decided action is never
+retried — a new preview is the only way to try again — because retrying a
+`partial` or `unknown` outcome could open a second tab.
+
+**Interrupted actions are reconciled on restart.** If the service dies between
+committing an approval and recording its result, the action is persisted as
+`approved`. On the next `npm run service -- start`, right after the service
+binds its port and before it handles any request, every action still
+`approved` becomes terminal `failed` with `mutation: "unknown"`, code
+`interrupted_by_restart`, a fixed detail ("the browser may or may not have
+opened the tab"), a `completedAt`, and an audit `result` event (so its trail
+is `preview`, `approve`, `result`). This relies on **one service process per
+data directory, which `start` enforces** with an exclusive lock file,
+`service.lock` (see "Single service per data directory" below), taken before
+anything is opened, reconciled, or listened on — so a different
+`BROWSER_TABS_PORT` cannot bypass it. Reconciliation cannot tell a dead
+service's action from one another process is executing at that moment, so it
+is deliberately *not* done when a store is merely opened (tests, tools, a
+second process reading the database) — only by the service that holds the
+lock. If it fails, the service logs that and still starts; the action stays
+`approved` until a later start reconciles it.
+
+**`store.clear` and in-flight actions.** `store.clear` is refused with `409
+conflict`, deleting nothing, while any action is `approved` and awaiting its
+result (its mutation request may be in flight, and deleting the record would
+orphan the result about to be recorded). The check runs in the same immediate
+transaction as the clear, so there are exactly two orderings: a clear that
+commits first deletes the preview, and a later approval is a `404` that sends
+nothing to the browser and records no event; an approval that commits first
+makes the clear a `409` until its result is terminal.
+
+### Protocol: version 3, strict validation
+
+`PROTOCOL_VERSION` is `3`. `browser.open_tab` is the first extension request
+that mutates the browser, and a version-2 extension does not know its
+contract (it would answer `unknown_method` with no `created` flag), so the
+handshake refuses a version mismatch instead of the service ever sending a
+mutating request to a peer that does not implement it. The service validates
+the extension's `browser.open_tab` answer like every other (`validateMethodResult`):
+an `ok` result must carry `created: true`, the requested URL, and a valid
+observed tab record; every non-`ok` result must state `created` consistently
+(`false` for any refusal or failure; `true` only for the `incomplete`/
+`observe_failed` partial outcome). An answer that fails validation, names a
+different session or URL than the stored preview, or is for another method is
+recorded as `failed` with `mutation: "unknown"` — never forwarded as success.
+The review UI and the reference agent client send version `3`.
+
+### The audit log
+
+`action_audit` (migration v3, non-breaking) is **append-only, enforced by
+SQLite triggers**: no `UPDATE` and no `DELETE`, even through raw SQL, and
+the store exposes no function that could. Each event — `preview`, `approve` |
+`reject`, `result` — is written in the *same transaction* as the state change
+it records. An event holds only: the action id, an event name, a timestamp,
+and a `detail` made of **server-controlled enum values and nothing else**:
+the action kind (`open_tab`) for a preview, the decision (`approve`/`reject`)
+for a decision, and the result `state` and `mutation` for a result. Those
+values are chosen or validated against fixed sets by the service, so nothing
+a caller or a compromised extension supplies can reach the log: **no URL (not
+even a hash), session id, title, tab/window handle, error code, or detail
+text** — the action record keeps those (clipped), and the audit log never
+sees them. Unlike the `actions` table, which stores the URL and the observed
+tab's (untrusted, clipped) title/URL and is wiped by `store.clear`, the audit
+log is deliberately retained by `store.clear` and by retention cleanup.
+`action_id` is not a foreign key, so clearing never touches the log.
+
+Bounds: at most 50 previews await a decision at once (`409 limit_reached`);
+once the log holds 10,000 events new previews are refused (`limit_reached`)
+rather than any event ever being dropped — the decision and result events of
+an already-previewed action are always recorded. Observed text is stored
+clipped (title 500, URL/pending URL 2,048, detail 500 characters); a preview
+request body over 16 KiB is `413`; lists are paged (max 200).
+
+### Single service per data directory
+
+`npm run service -- start` takes an exclusive lock, `service.lock` in the data
+directory (created with the `wx` flag, so only one creator can win; it holds
+the owner's pid), **before** it opens the store, reconciles, cleans up state
+files, or listens. It does not depend on the port, so starting a second
+service on the same data directory with a different `BROWSER_TABS_PORT` is
+refused (exit code 1, naming the owner's pid) without touching the database or
+any in-flight action. A lock whose pid is dead, empty, or unreadable (the
+owner was killed) is stale and is reclaimed — serialized by a second `wx`
+file so two starters cannot delete each other's fresh lock. A graceful stop,
+or a start that fails after taking the lock, removes the lock, and only ever
+this process's own. If a *different, live* process happens to have reused a
+dead owner's pid, starts are refused until you delete `service.lock` by hand
+(the message says so). This is a small local guard, not a distributed lock.
+
+### Limitations of this personal tool
+
+Deliberately not solved here; each is a known edge of a single-user, local-only
+tool:
+
+- **One service process per data directory**, enforced by the lock above.
+  Anything else reading the database (tests, tools) must not call
+  reconciliation, and nothing coordinates two data directories.
+- **The audit log is finite.** At 10,000 events it refuses new previews rather
+  than drop or rotate anything; continuing means starting with a fresh data
+  directory, or archiving the old database by hand. There is no rotation or
+  export tooling.
+- **The audit log is append-only by convention and triggers, not tamper-
+  evident.** There are no signatures, hash chains, or external anchoring;
+  anyone who can edit the database file (or drop the triggers) can alter it.
+  It proves nothing against a malicious local user.
+- **Previews have no wall-clock expiry.** A preview stays decidable until it is
+  decided; the only staleness boundary is the browser session (a restart makes
+  it `stale`).
+- **A crash or lost answer can leave an outcome of `failed` with `mutation:
+  "unknown"`** — the service cannot know whether the browser opened the tab,
+  and never retries.
+
+### In the review UI
+
+The "Open a URL in a new tab" section has a labelled address field and a
+**Preview** button. Each stored preview shows its normalized address, session,
+and time, with **Open** and **Reject** buttons only while it is `previewed`;
+after any decision (or any error, including a network failure whose outcome is
+unknown) the list is re-read from the service rather than guessed, so what is
+shown is always the recorded state, including `stale`, `partial`, and
+`failed` outcomes and whether the browser changed ("yes — one new tab was
+created" / "no" / "unknown"). Races are handled with the same primitives as
+the proposals list: a decision is ignored while already submitting
+(`createDecisionTracker`), a row rebuilt mid-decision comes back disabled,
+an older list response cannot overwrite a newer one (`createListVersionGuard`),
+and Disconnect invalidates everything in flight. Addresses and observed text
+are rendered with `textContent` only — never a link, never navigated to by the
+page — under the unchanged restrictive CSP (no inline script/style). Open and
+Reject name the address they act on via `aria-describedby`; status text is a
+polite live region; after Preview, focus moves to the new preview's row (not
+its Open button), so a stray keypress cannot open anything. A separate
+"Action audit log" list shows the events.
+
+### Not added
+
+No other browser mutation; no arbitrary navigation, page evaluation, cookie
+export, or debugger access; no way for an agent to propose-and-execute (an
+agent's `browser_action` proposal is still only a recorded suggestion);
+no editing of a preview (a different URL is a new preview); no expiry on a
+preview (a preview taken before a browser restart is refused as stale; one
+taken in the current session stays valid until decided); no retry; no choice
+of window, position, or whether the tab is focused (it opens in front in the
+current window).
+
+### Tests
+
+`test/actions.test.mjs`: the action store (state machine, single decision,
+two connections racing for one preview, result consistency and bounds, audit
+ordering/content/bounds/persistence across restart, trigger-enforced
+append-only and immutability against raw SQL, `store.clear` semantics, the
+pending and audit-full limits); the HTTP routes (strict body/query validation,
+every unsafe scheme and credential form, `413`, disconnected preview/approve,
+no/wrong/agent credential on every route, `404` for every non-existent
+mutation route, method restrictions, approve/reject/stale/partial/failed/
+unknown outcomes and unusable extension answers, timeout and mid-request
+disconnect, clipping, and concurrent approve/reject storms asserting exactly
+one decision and at most one execution; `store.clear` refused during an
+in-flight approval held open by a delayed extension, clear-before-approve, and
+concurrent clear/approve rounds each ending in one of the two safe orderings
+with no orphan; the audit table having no URL-derived column or key); the
+crash/restart reconciliation (real store close/reopen, idempotence, untouched
+neighbours, and a real service process killed with SIGKILL mid-approval and
+restarted); the service lock (a second service on the same data directory and
+a different port refused without reconciling a live approved action, a
+simultaneous-start race with one winner, stale/empty/garbage lock recovery, own
+lock removed on stop and on a failed start); the audit log's content-free
+shape even against a hostile extension's codes, details, titles, URLs, and
+handles; and end-to-end tests through the
+**real** extension worker, service client, and service (approve opens exactly
+one tab and reports the observed tab; reject opens none; a preview from an
+earlier session is refused as stale; `tabs.get` failing is `partial`; the
+agent credential cannot open a tab). `test/protocol.test.mjs` covers
+`normalizeOpenUrl` and the `browser.open_tab` result validation;
+`test/service-worker.test.mjs` covers `openTab` and the routing split (the
+read-only `routeMessage`/`runtime.onMessage` cannot open a tab);
+`test/ui.test.mjs` adds static checks of the new section (labelling, no
+inline script/style/handler, decide-by-id-only, text-only rendering, race
+guards, and that the page's protocol version matches the service's).
+
+`npm run test:smoke:bridge` gained Step 2.8, which drives the real `/ui/`
+page in a real Chrome for Testing and checks every claim against the
+browser's own tab list (`chrome.tabs.query`): the agent credential is refused
+on every action route; a preview opens nothing; Open opens exactly one tab
+for exactly the previewed URL, matching the recorded result; repeated
+decisions are refused; Reject opens none; the audit log records
+preview/decision/result with no URL; and a preview left pending is, after the
+service and browser restarts later in that script, refused as `stale` with no
+tab opened.
+
+### Verification status
+
+The final Action 1 gate passed 478/478 automated tests, `npm audit --omit=dev`,
+version and extension-build checks, the service lifecycle check, and the full
+real Chrome for Testing bridge smoke. That smoke proved preview-without-
+mutation, exact one-tab creation after approval, rejection without mutation,
+repeat-decision refusal, content-free audit events, and stale-session refusal
+after browser restart. Independent Terra review passed after findings around
+`store.clear` races, interrupted-action reconciliation, audit content, and
+single-service ownership were fixed. The Firefox smoke was not extended for
+this mutation checkpoint; Firefox packaging builds under protocol version 3,
+but the recorded real-browser mutation proof is Chrome.
 
 ## Local development
 

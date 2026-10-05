@@ -186,3 +186,65 @@ test("ui/styles.css parses as plain CSS text (sanity check that it is not accide
   assert.doesNotMatch(stylesCssSource, /<script/i);
   assert.doesNotMatch(stylesCssSource, /<\/html>/i);
 });
+
+test("ui/app.js sends the same protocol version the service requires", () => {
+  // The page duplicates the constant (it has no build step and cannot import
+  // extension/protocol.js), so a protocol bump must reach it too: a stale
+  // value would make every authenticated call fail with
+  // unsupported_protocol_version.
+  const match = /^const PROTOCOL_VERSION = (\d+);$/m.exec(appJsSource);
+  assert.ok(match, "expected a literal `const PROTOCOL_VERSION = <n>;` in ui/app.js");
+  assert.equal(Number(match[1]), PROTOCOL_VERSION);
+});
+
+// ---- Phase 2 Action 1: the open-a-URL-in-a-new-tab section ----
+
+test("ui/index.html's actions section has a labelled address field, a Preview button, and no inline script/style/handler", () => {
+  assert.match(indexHtmlSource, /<section id="actions-section" aria-labelledby="actions-heading">/);
+  assert.match(indexHtmlSource, /<label for="action-url-input">/);
+  assert.match(indexHtmlSource, /<input type="text" id="action-url-input"[^>]*maxlength="2048"[^>]*aria-describedby="action-url-help"/);
+  assert.match(indexHtmlSource, /<p id="action-url-help">/);
+  assert.match(indexHtmlSource, /<button type="submit" id="preview-button" disabled>Preview<\/button>/);
+  // Open and Reject exist only on rendered previews (see app.js), never as
+  // static buttons that could act without a stored preview.
+  assert.doesNotMatch(indexHtmlSource, /id="open-button"|id="approve-button"|id="reject-button"/);
+  // Status text is announced politely.
+  for (const id of ["action-form-status", "action-decision-status", "actions-status", "audit-status"]) {
+    assert.match(indexHtmlSource, new RegExp(`id="${id}" role="status" aria-live="polite"`));
+  }
+});
+
+test("ui/app.js decides an action by id alone: no body and no address on approve/reject, and the address only ever goes to preview", () => {
+  const approveRejectCalls = [...appJsSource.matchAll(/apiRequest\(`\/api\/action\.open_tab\.\$\{operation\}\?id=\$\{id\}`[^)]*\)/g)];
+  assert.equal(approveRejectCalls.length, 1, "exactly one call site decides an action");
+  assert.doesNotMatch(approveRejectCalls[0][0], /body/, "the decision request must carry no body");
+  assert.match(appJsSource, /apiRequest\("\/api\/action\.open_tab\.preview", \{ method: "POST", body: \{ url \} \}\)/);
+  assert.equal([...appJsSource.matchAll(/action\.open_tab\./g)].length, 2, "only the preview and the id-only decision route are referenced");
+  assert.doesNotMatch(appJsSource, /browser\.open_tab/, "the page never names the extension-level method");
+});
+
+test("ui/app.js renders an action's address and observed text as text only, never as a link or navigation", () => {
+  const section = appJsSource.slice(appJsSource.indexOf("// ---- browser actions"), appJsSource.indexOf("// ---- tags ----"));
+  assert.ok(section.length > 500, "expected to locate the actions section of app.js");
+  assert.doesNotMatch(section, /createElement\(\s*["']a["']/, "no anchor elements");
+  assert.doesNotMatch(section, /\bel\(\s*["']a["']/, "no anchor elements via the el() helper");
+  assert.doesNotMatch(section, /\bhref\b|\bsrc\b|window\.open|location\s*=|location\.href|\.navigate/, "the page must never navigate to or open an action's address");
+  assert.doesNotMatch(section, /setAttribute\([^)]*\b(?:a\.url|r\.observed|\.title)\b/, "untrusted text is never placed in an attribute");
+  assert.match(section, /text: `Address: \$\{a\.url\}`/);
+});
+
+test("ui/app.js guards action decisions against double submits and stale list refreshes, and keeps them accessible", () => {
+  assert.match(appJsSource, /const actionDecisions = createDecisionTracker\(\)/);
+  assert.match(appJsSource, /const actionsListGuard = createListVersionGuard\(\)/);
+  assert.match(appJsSource, /if \(!actionDecisions\.begin\(id\)\) return;/, "a second click while submitting is ignored");
+  assert.match(appJsSource, /actionsListGuard\.apply\(token\)/, "an older list response never overwrites a newer one");
+  assert.match(appJsSource, /actionDecisions\.isSubmitting\(a\.id\)/, "a row rebuilt mid-decision comes back disabled");
+  // Every Open/Reject button names the address it acts on, via aria-describedby
+  // pointing at the row's own address paragraph (never untrusted text in an attribute).
+  assert.match(appJsSource, /"aria-describedby": urlId/);
+  assert.match(appJsSource, /attrs: \{ id: urlId \}/);
+  // The new controls are disabled until the owner token is accepted.
+  for (const id of ["preview-button", "refresh-actions-button", "refresh-audit-button"]) {
+    assert.match(appJsSource, new RegExp(`"${id}"`));
+  }
+});

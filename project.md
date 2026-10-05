@@ -398,15 +398,76 @@ Candidate order:
 
 Implementation checklist:
 
-- [ ] Define preconditions, preview data, approval state, and result data for
+- [x] Define preconditions, preview data, approval state, and result data for
   the first action.
-- [ ] Require an explicit user decision immediately before execution.
-- [ ] Revalidate browser-session and tab handles after approval.
-- [ ] Report partial failure and the exact observed final state.
-- [ ] Keep an append-only local action audit record.
-- [ ] Add one action at a time with browser integration tests.
-- [ ] Do not add arbitrary navigation, page evaluation, cookie export, or
+- [x] Require an explicit user decision immediately before execution.
+- [x] Revalidate browser-session and tab handles after approval.
+- [x] Report partial failure and the exact observed final state.
+- [x] Keep an append-only local action audit record.
+- [x] Add one action at a time with browser integration tests.
+- [x] Do not add arbitrary navigation, page evaluation, cookie export, or
   debugger access as shortcuts.
+
+### Action 1 (open a URL in a new tab): complete
+
+Action 1 is covered by unit, integration, process-restart, and end-to-end
+tests. The real Chrome for Testing bridge smoke verified preview, approval,
+rejection, exact one-tab creation, stale-session refusal, and audit recording.
+Independent Terra review passed after clear/restart, audit-content, and
+single-service race findings were remediated. Firefox packaging still builds
+with protocol version 3; this mutation checkpoint's required real-browser
+proof used Chrome. The decisions later actions should reuse rather than
+reinvent:
+
+- **Preview, then one terminal decision by stored id alone.** Preview binds
+  the exact normalized URL, the browser session learned from the extension
+  (never from the caller), and a timestamp. Approve/reject take only the
+  action id — no body, no other parameter. The decision is one conditional
+  `UPDATE ... WHERE state = 'previewed'`, so of any number of concurrent
+  decisions exactly one wins and only an approval's winner executes.
+- **Owner-only.** The agent credential is refused on every action route and
+  the extension method has no HTTP route; the extension dispatches the
+  mutating method only from the authenticated service connection, never from
+  `runtime.onMessage`.
+- **The extension revalidates.** `browser.open_tab` re-checks the session
+  inside the operation with no `await` before the single `tabs.create`
+  (stale = no mutation), re-validates the URL, and reports the tab as read
+  back with `tabs.get`; create-succeeded-but-reread-failed is the explicit
+  `incomplete`/`observe_failed` partial outcome. A decided action is never
+  retried.
+- **Protocol bumped to 3.** The first mutating request must not be sendable
+  to a peer that predates its contract; every non-`ok` result must state
+  `created` consistently.
+- **Append-only audit.** `action_audit` (migration v3, trigger-enforced, no
+  update/delete route or function) records preview/decision/result in the same
+  transaction as each state change, holds only server-controlled enum values
+  (kind, decision, result state/mutation) — never a URL, hash, session id,
+  handle, or any extension-supplied code/detail, so even a compromised
+  extension cannot put content in it — and is bounded (it refuses new
+  previews when full rather than dropping events). The `actions` table, which
+  does hold the URL and the observed untrusted tab text, is cleared by
+  `store.clear`; the audit log is not.
+- **Honest outcomes.** `executed`, `partial`, `stale`, and `failed` with
+  `mutation` `none` or `unknown` (request sent, answer lost or unusable).
+- **In-flight safety.** `store.clear` is refused (409, nothing deleted) while
+  any action is `approved` and awaiting its result; a clear that commits first
+  makes a later approval a 404 that mutates nothing. An action found
+  `approved` at service start (the service died mid-execution) is reconciled
+  to terminal `failed`/`unknown` (`interrupted_by_restart`) with an audit
+  result event. Reconciliation runs only in the service that holds the
+  data-directory lock (`service.lock`, exclusive `wx` creation with the
+  owner's pid, taken by `start` before anything is opened, reconciled, or
+  listened on, so a different port cannot bypass it; stale locks of dead
+  owners are reclaimed), never on a bare store open.
+- **Personal-tool limitations (accepted, documented in README):** one service
+  process per data directory; the 10,000-event audit log is finite and
+  continuing means a fresh data directory or manual archival; the audit log
+  is not cryptographically tamper-evident; previews have no wall-clock expiry
+  (a browser-session restart is the staleness boundary); a crash or lost
+  answer may end as `failed` with an unknown mutation.
+
+See README.md's "Phase 2, Action 1: open a URL in a new tab" for the full
+contract, the UI behavior, and the verification status to update.
 
 ## Later work
 
@@ -424,6 +485,14 @@ Each should begin with a concrete user need and its own privacy and threat
 review.
 
 ## Current repository state
+
+Phase 2 Action 1 (open a URL in a new tab) is complete on top of the completed
+Phase 1 described below. Its final gate passed 478/478 automated tests, a clean
+audit, the real Chrome for Testing bridge smoke, and independent Terra review;
+see "Action 1 (open a URL in a new tab)" under Phase 2 above. It is the only browser mutation in the repository; the
+Phase 1 statements below that no mutation exists describe Phase 1 as it was
+completed and are otherwise unchanged. `PROTOCOL_VERSION` is now `3` and the
+database schema version `3`.
 
 The repository contains a stabilized Manifest V3 inspector (Stage 0, below)
 and an implemented Stage 1 local bridge: a Node.js service (`service/`)

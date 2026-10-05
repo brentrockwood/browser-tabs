@@ -17,6 +17,7 @@
 import http from "node:http";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { createService } from "./server.mjs";
 import { getDataDir, loadOrCreateAgentCredential, loadOrCreateCredential } from "./credential.mjs";
@@ -124,25 +125,135 @@ async function cleanupStateFiles() {
   await rm(portPath, { force: true });
 }
 
+// One service process per data directory, enforced (not merely assumed):
+// startup reconciliation of interrupted browser actions (store.mjs's
+// reconcileInterruptedActions) is only correct if no other service could be
+// executing one. The port cannot provide that — a different
+// BROWSER_TABS_PORT would bypass it — so `start` first takes an exclusive
+// lock file in the data directory, created with the `wx` flag (atomic: only
+// one creator wins) and holding the owner's pid. Nothing is opened,
+// reconciled, or listened on before it is held.
+//
+// A leftover lock whose pid is dead (the owner was killed) is stale and is
+// reclaimed; a live pid refuses the start. Reclaiming is serialized by a
+// second `wx` file, so two starters racing over the same stale lock cannot
+// each delete the other's fresh one. Only the lock this process wrote is
+// ever removed. A live-but-unrelated process that reused a dead owner's pid
+// would block starts until `service.lock` is deleted by hand (the refusal
+// message says so) — the safe direction for a personal tool.
+const lockPath = join(dataDir, "service.lock");
+const reclaimPath = `${lockPath}.reclaim`;
+
+function pidIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM"; // exists, owned by someone else
+  }
+}
+
+async function tryCreateExclusive(path) {
+  try {
+    await writeFile(path, String(process.pid), { flag: "wx", mode: 0o600 });
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+// The pid recorded in a lock file: a positive integer, 0 if the file is empty
+// (its creator may be mid-write), -1 if it holds anything else (never a live
+// owner), or null if the file does not exist.
+async function readLockPid(path) {
+  try {
+    const value = Number((await readFile(path, "utf8")).trim());
+    return Number.isInteger(value) && value >= 0 ? value : -1;
+  } catch (error) {
+    return error.code === "ENOENT" ? null : -1;
+  }
+}
+
+// Returns `{ ok: true }` once this process holds the lock, or `{ ok: false,
+// pid }` naming the live process that does.
+async function acquireServiceLock() {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (await tryCreateExclusive(lockPath)) return { ok: true };
+
+    const owner = await readLockPid(lockPath);
+    if (owner === null) continue; // vanished between our create and read: try again
+    if (owner > 0 && pidIsAlive(owner)) return { ok: false, pid: owner };
+    if (owner === 0 && attempt < 10) {
+      await delay(50); // empty: its creator may be between create and write
+      continue;
+    }
+
+    // Stale (dead pid, or empty for good): reclaim under the reclaim mutex.
+    if (await tryCreateExclusive(reclaimPath)) {
+      try {
+        if ((await readLockPid(lockPath)) === owner) await rm(lockPath, { force: true });
+      } finally {
+        await rm(reclaimPath, { force: true });
+      }
+    } else {
+      await delay(50); // another starter is reclaiming
+      const reclaimer = await readLockPid(reclaimPath);
+      if (reclaimer !== null && reclaimer !== 0 && !(reclaimer > 0 && pidIsAlive(reclaimer))) {
+        await rm(reclaimPath, { force: true }); // its reclaimer died mid-reclaim
+      }
+    }
+  }
+  throw new Error(`could not acquire ${lockPath}`);
+}
+
+// Removes the lock only if it is this process's own.
+async function releaseServiceLock() {
+  if ((await readLockPid(lockPath)) === process.pid) await rm(lockPath, { force: true });
+}
+
 async function cmdStart() {
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
 
-  const port = Number(process.env.BROWSER_TABS_PORT) || DEFAULT_PORT;
-
-  const existingPort = await readNumberFile(portPath);
-  if (existingPort) {
-    try {
-      await httpGetOurHealth(existingPort);
-      console.log(`Service already running on port ${existingPort}. Use "status" or "stop".`);
-      return;
-    } catch {
-      console.log(
-        `Found a stale port file for ${existingPort} (nothing responded there, or it is not this project's ` +
-          "service); starting fresh.",
-      );
-      await cleanupStateFiles();
-    }
+  // The lock comes first, before anything else is checked, opened, cleaned
+  // up, reconciled, or listened on.
+  const lock = await acquireServiceLock();
+  if (!lock.ok) {
+    console.error(
+      `Another Browser Tabs service (pid ${lock.pid}) holds ${lockPath}: only one service may run per data directory, ` +
+        "whatever port it uses. Stop it first (`stop` on its port), or, if that process is not a Browser Tabs service, " +
+        "delete the lock file.",
+    );
+    process.exitCode = 1;
+    return;
   }
+  try {
+    const existingPort = await readNumberFile(portPath);
+    if (existingPort) {
+      try {
+        await httpGetOurHealth(existingPort);
+        // A service answering without holding the lock (e.g. one started
+        // before locking existed): leave it alone, and do not start a second.
+        console.log(`Service already running on port ${existingPort}. Use "status" or "stop".`);
+        await releaseServiceLock();
+        return;
+      } catch {
+        console.log(
+          `Found a stale port file for ${existingPort} (nothing responded there, or it is not this project's ` +
+            "service); starting fresh.",
+        );
+        await cleanupStateFiles();
+      }
+    }
+    await runService();
+  } catch (error) {
+    await releaseServiceLock(); // a failed start must not leave its own lock behind
+    throw error;
+  }
+}
+
+async function runService() {
+  const port = Number(process.env.BROWSER_TABS_PORT) || DEFAULT_PORT;
 
   const { token, created } = await loadOrCreateCredential(dataDir);
   // Stage 4: a distinct, separately-stored credential for external-agent
@@ -204,6 +315,7 @@ async function cmdStart() {
     await service.close();
     store?.close();
     await cleanupStateFiles();
+    await releaseServiceLock();
     process.exit(0);
   };
 
@@ -217,6 +329,26 @@ async function cmdStart() {
     onControlStop: shutdown,
   });
   const address = await service.listen();
+
+  // Phase 2 crash/restart reconciliation. Holding the data-directory lock
+  // (acquireServiceLock, taken before anything else in `start`) is this
+  // process's proof that no other service uses this database — whatever port
+  // it listens on — so any action still "approved" belongs to a service that
+  // died mid-execution, never to a live one. This
+  // runs synchronously right after the bind, before any request is handled,
+  // so it cannot touch an action this process approves. A failure is logged
+  // and does not stop the service (the action then simply stays approved,
+  // and `store.clear` keeps refusing until a later start reconciles it).
+  if (store) {
+    try {
+      const { reconciledCount } = store.reconcileInterruptedActions();
+      if (reconciledCount > 0) {
+        console.log(`[store] marked ${reconciledCount} interrupted browser action(s) as failed with an unknown outcome.`);
+      }
+    } catch (error) {
+      console.log(`[store] could not reconcile interrupted browser actions: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   await writeFile(portPath, String(address.port), "utf8");
   await writeFile(pidPath, String(process.pid), "utf8");

@@ -21,6 +21,10 @@ export const STORE_ERROR_CODES = Object.freeze({
   // A uniqueness constraint (tag name, collection name, ordered-membership
   // position) was violated.
   CONFLICT: "conflict",
+  // A bounded, append-only collection (the action audit log, or the set of
+  // previews awaiting a decision) is full, so a new entry is refused rather
+  // than an old one ever being dropped.
+  LIMIT_REACHED: "limit_reached",
   // The request body exceeded the store's bounded-request-size limit.
   PAYLOAD_TOO_LARGE: "payload_too_large",
   // The request body was not valid JSON, or was valid JSON but not a plain

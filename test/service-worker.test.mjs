@@ -7,6 +7,8 @@ import {
   MAX_TAB_GROUPS_RETURNED,
   MAX_TABS_RETURNED,
   MAX_WINDOWS_RETURNED,
+  PROTOCOL_VERSION,
+  validateMethodResult,
 } from "../extension/protocol.js";
 
 // service-worker.js resolves its browser API binding (globalThis.chrome) at
@@ -889,7 +891,7 @@ test("getCapabilities reports feature presence without requiring brand inference
   assert.equal(result.scripting, true);
   assert.equal(typeof result.maxTextCharacters, "number");
   assert.equal(typeof result.maxHistoryResults, "number");
-  assert.equal(result.protocolVersion, 2);
+  assert.equal(result.protocolVersion, PROTOCOL_VERSION);
 });
 
 test("readTab, listWindows, and listTabs from the same module instance share one browserSessionId", async () => {
@@ -1008,4 +1010,213 @@ test("the registered onMessage listener returns a stable error for a malformed o
   const emptyResult = await listener({});
   assert.equal(emptyResult.status, "error");
   assert.equal(emptyResult.code, "unknown_method");
+});
+
+// --- Phase 2 Action 1: openTab -------------------------------------------
+
+const OPEN_URL = "https://example.com/page";
+
+// A browser whose tabs.create/tabs.get are recorded, so a test can assert
+// exactly how many times the browser was asked to mutate.
+function recordingTabs({ create, get } = {}) {
+  const calls = { create: [], get: [] };
+  return {
+    calls,
+    tabs: {
+      create: async (properties) => {
+        calls.create.push(properties);
+        return create ? create(properties) : { id: 41, windowId: 7 };
+      },
+      get: async (id) => {
+        calls.get.push(id);
+        return get ? get(id) : { id, windowId: 7, index: 2, active: true, status: "loading", title: "", url: "", pendingUrl: OPEN_URL };
+      },
+    },
+  };
+}
+
+test("openTab creates exactly one tab, then reports the tab read back with tabs.get, not the create response", async () => {
+  const { tabs, calls } = recordingTabs();
+  const mod = await loadServiceWorker({ tabs });
+  const result = await mod.openTab(OPEN_URL, await sessionIdOf(mod));
+
+  assertEnvelope(result, { sourceOperation: "browser.open_tab", status: "ok" });
+  assert.deepEqual(calls.create, [{ url: OPEN_URL, active: true }]);
+  assert.deepEqual(calls.get, [41]);
+  assert.equal(result.created, true);
+  assert.equal(result.requestedUrl, OPEN_URL);
+  assert.deepEqual(result.tab, {
+    tabId: 41,
+    windowId: 7,
+    index: 2,
+    active: true,
+    pinned: false,
+    audible: false,
+    discarded: false,
+    status: "loading",
+    title: "",
+    url: "",
+  });
+  assert.equal(result.pendingUrl, OPEN_URL);
+  assert.equal(validateMethodResult("browser.open_tab", result).valid, true);
+});
+
+test("openTab reports the browser's observed state even when it differs from the request (e.g. a redirect)", async () => {
+  const { tabs } = recordingTabs({
+    get: (id) => ({ id, windowId: 7, index: 0, active: false, status: "complete", title: "Landed", url: "https://example.org/landed" }),
+  });
+  const mod = await loadServiceWorker({ tabs });
+  const result = await mod.openTab(OPEN_URL, await sessionIdOf(mod));
+  assert.equal(result.status, "ok");
+  assert.equal(result.requestedUrl, OPEN_URL);
+  assert.equal(result.tab.url, "https://example.org/landed");
+  assert.equal(result.tab.active, false);
+  assert.equal(result.pendingUrl, null);
+});
+
+test("openTab refuses a stale or missing browserSessionId inside the operation, without touching the browser", async () => {
+  const { tabs, calls } = recordingTabs();
+  const mod = await loadServiceWorker({ tabs });
+  for (const session of ["not-the-current-session", "", undefined, null, 5]) {
+    const result = await mod.openTab(OPEN_URL, session);
+    assertEnvelope(result, { sourceOperation: "browser.open_tab", status: "error" });
+    assert.equal(result.code, ERROR_CODES.STALE_SESSION);
+    assert.equal(result.created, false);
+    assert.equal(validateMethodResult("browser.open_tab", result).valid, true);
+  }
+  assert.deepEqual(calls.create, [], "a stale preview must never reach tabs.create");
+  assert.deepEqual(calls.get, []);
+});
+
+test("openTab re-validates the URL itself and never calls tabs.create for an unsafe or non-normalized one", async () => {
+  const { tabs, calls } = recordingTabs();
+  const mod = await loadServiceWorker({ tabs });
+  const session = await sessionIdOf(mod);
+  for (const url of [
+    "javascript:alert(1)",
+    "data:text/html,hi",
+    "file:///etc/passwd",
+    "chrome://settings",
+    "https://user:pass@example.com/",
+    "example.com",
+    "https://example.com/ with space",
+    "https://EXAMPLE.com",
+    "https://example.com/a/../b",
+    `https://example.com/${"a".repeat(3000)}`,
+    undefined,
+    null,
+    42,
+  ]) {
+    const result = await mod.openTab(url, session);
+    assert.equal(result.status, "error", `${String(url).slice(0, 40)} must be refused`);
+    assert.equal(result.code, ERROR_CODES.INVALID_PARAMS);
+    assert.equal(result.created, false);
+  }
+  assert.deepEqual(calls.create, []);
+});
+
+test("openTab checks the session before the URL, so a stale preview with a bad URL is reported as stale", async () => {
+  const { tabs } = recordingTabs();
+  const mod = await loadServiceWorker({ tabs });
+  const result = await mod.openTab("javascript:alert(1)", "old-session");
+  assert.equal(result.code, ERROR_CODES.STALE_SESSION);
+});
+
+test("openTab reports open_tab_failed with created:false when tabs.create rejects, and never retries", async () => {
+  const { tabs, calls } = recordingTabs({
+    create: () => {
+      throw new Error("No window with id: 9");
+    },
+  });
+  const mod = await loadServiceWorker({ tabs });
+  const result = await mod.openTab(OPEN_URL, await sessionIdOf(mod));
+  assertEnvelope(result, { sourceOperation: "browser.open_tab", status: "error" });
+  assert.equal(result.code, ERROR_CODES.OPEN_TAB_FAILED);
+  assert.equal(result.detail, "No window with id: 9");
+  assert.equal(result.created, false);
+  assert.equal(calls.create.length, 1, "tabs.create is attempted exactly once");
+  assert.deepEqual(calls.get, []);
+  assert.equal(validateMethodResult("browser.open_tab", result).valid, true);
+});
+
+test("openTab returns the explicit partial outcome when tabs.create succeeds but tabs.get fails, without creating a second tab", async () => {
+  const { tabs, calls } = recordingTabs({
+    get: () => {
+      throw new Error("No tab with id: 41");
+    },
+  });
+  const mod = await loadServiceWorker({ tabs });
+  const result = await mod.openTab(OPEN_URL, await sessionIdOf(mod));
+  assertEnvelope(result, { sourceOperation: "browser.open_tab", status: "incomplete" });
+  assert.equal(result.code, ERROR_CODES.OBSERVE_FAILED);
+  assert.equal(result.created, true);
+  assert.equal(result.tabId, 41);
+  assert.equal(result.windowId, 7);
+  assert.equal(result.detail, "No tab with id: 41");
+  assert.equal(calls.create.length, 1);
+  assert.equal(validateMethodResult("browser.open_tab", result).valid, true);
+});
+
+test("openTab treats a tabs.get answer for a different tab, or a malformed one, as the partial outcome", async () => {
+  for (const get of [
+    () => ({ id: 99, windowId: 7, index: 0, active: true, status: "complete" }),
+    () => undefined,
+    (id) => ({ id }), // no windowId/index: not a valid tab record
+  ]) {
+    const { tabs } = recordingTabs({ get });
+    const mod = await loadServiceWorker({ tabs });
+    const result = await mod.openTab(OPEN_URL, await sessionIdOf(mod));
+    assert.equal(result.status, "incomplete");
+    assert.equal(result.code, ERROR_CODES.OBSERVE_FAILED);
+    assert.equal(result.created, true);
+    assert.equal(result.tabId, 41);
+  }
+});
+
+test("openTab returns the partial outcome with null handles when tabs.create returns no usable tab id, and does not call tabs.get", async () => {
+  const { tabs, calls } = recordingTabs({ create: () => ({}) });
+  const mod = await loadServiceWorker({ tabs });
+  const result = await mod.openTab(OPEN_URL, await sessionIdOf(mod));
+  assert.equal(result.status, "incomplete");
+  assert.equal(result.created, true);
+  assert.equal(result.tabId, null);
+  assert.equal(result.windowId, null);
+  assert.deepEqual(calls.get, []);
+  assert.equal(validateMethodResult("browser.open_tab", result).valid, true);
+});
+
+test("two concurrent openTab calls each create their own single tab (the extension never dedupes; the service guarantees one approval)", async () => {
+  let nextId = 100;
+  const { tabs, calls } = recordingTabs({ create: () => ({ id: nextId++, windowId: 7 }) });
+  const mod = await loadServiceWorker({ tabs });
+  const session = await sessionIdOf(mod);
+  const [a, b] = await Promise.all([mod.openTab(OPEN_URL, session), mod.openTab(OPEN_URL, session)]);
+  assert.equal(calls.create.length, 2);
+  assert.notEqual(a.tab.tabId, b.tab.tabId);
+});
+
+test("routeServiceMessage routes browser.open_tab with its url and browserSessionId", async () => {
+  const { tabs, calls } = recordingTabs();
+  const mod = await loadServiceWorker({ tabs });
+  const result = await mod.routeServiceMessage({ method: "browser.open_tab", url: OPEN_URL, browserSessionId: await sessionIdOf(mod) });
+  assert.equal(result.status, "ok");
+  assert.equal(calls.create.length, 1);
+});
+
+test("routeServiceMessage still routes every read-only method", async () => {
+  const mod = await loadServiceWorker({});
+  const result = await mod.routeServiceMessage({ method: "browser.get_capabilities" });
+  assert.equal(result.status, "ok");
+});
+
+test("the read-only routeMessage and the runtime.onMessage listener cannot open a tab: browser.open_tab is an unknown method there", async () => {
+  const { tabs, calls } = recordingTabs();
+  const { listener, mod } = await setupListener({ tabs });
+  const session = await sessionIdOf(mod);
+  const message = { method: "browser.open_tab", url: OPEN_URL, browserSessionId: session };
+  for (const result of [await listener(message), await mod.routeMessage(message)]) {
+    assert.equal(result.status, "error");
+    assert.equal(result.code, "unknown_method");
+  }
+  assert.deepEqual(calls.create, []);
 });

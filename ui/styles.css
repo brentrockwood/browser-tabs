@@ -159,3 +159,10 @@ td {
 .decision-buttons button {
   margin-right: 0.5rem;
 }
+
+/* A stored address or audit detail can be one long unbroken string. */
+#actions-list p,
+#actions-list dd,
+#audit-list li {
+  overflow-wrap: anywhere;
+}

@@ -12,8 +12,10 @@ import {
   compareHistoryEntries,
   isValidHandle,
   isValidSessionId,
+  isValidTabRecord,
   isValidTimestamp,
   normalizeHistoryEntry,
+  normalizeOpenUrl,
   normalizeTab,
   normalizeTabGroup,
   normalizeWindow,
@@ -437,9 +439,80 @@ export async function getCapabilities() {
   };
 }
 
+// Phase 2 Action 1: opens `url` in one new tab — the extension's only
+// browser mutation. The service sends this only after the owner approved a
+// stored preview; this function still trusts nothing it was sent:
+//
+// - `callerSessionId` must be the current browser session, checked here, with
+//   no `await` between that check and `tabs.create`, so a preview taken
+//   before a browser restart can never open anything (`stale_session`,
+//   `created: false`, no mutation).
+// - `url` is re-validated with the same rules the preview used and must
+//   already be in normalized form, so the tab opened is exactly the URL the
+//   owner was shown.
+// - `tabs.create` is called at most once and never retried. Its result is
+//   not trusted as the outcome: the new tab is re-read with `tabs.get` and
+//   that is what is reported. If the create succeeded but the re-read did
+//   not, the result is the explicit partial outcome (`incomplete`,
+//   `observe_failed`, `created: true`) rather than a failure — retrying would
+//   open a second tab.
+export async function openTab(url, callerSessionId) {
+  await sessionReady;
+  const op = "browser.open_tab";
+  const refuse = (result) => ({ ...result, created: false });
+
+  const sessionError = checkSession(op, callerSessionId);
+  if (sessionError) return refuse(sessionError);
+
+  const checked = normalizeOpenUrl(url);
+  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
+  if (checked.url !== url) {
+    return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, "url must already be in normalized form"));
+  }
+
+  let created;
+  try {
+    created = await browserApi.tabs.create({ url, active: true });
+  } catch (error) {
+    return refuse(errorResult(op, ERROR_CODES.OPEN_TAB_FAILED, errMsg(error)));
+  }
+
+  const tabId = isValidHandle(created?.id) ? created.id : null;
+  const windowId = isValidHandle(created?.windowId) ? created.windowId : null;
+  const partial = (detail) => ({
+    ...envelope(op, "incomplete"),
+    code: ERROR_CODES.OBSERVE_FAILED,
+    detail,
+    created: true,
+    tabId,
+    windowId,
+  });
+  if (tabId === null) return partial("tabs.create returned no usable tab id, so the new tab could not be observed");
+
+  let observed;
+  try {
+    observed = await browserApi.tabs.get(tabId);
+  } catch (error) {
+    return partial(errMsg(error));
+  }
+  const tab = normalizeTab(observed ?? {});
+  if (tab.tabId !== tabId || !isValidTabRecord(tab)) {
+    return partial("tabs.get did not return the tab that was just created");
+  }
+
+  return {
+    ...envelope(op, "ok"),
+    created: true,
+    requestedUrl: url,
+    tab,
+    pendingUrl: typeof observed.pendingUrl === "string" ? observed.pendingUrl : null,
+  };
+}
+
 // Shared by the extension's own runtime.onMessage listener and by requests
 // forwarded over the service WebSocket, so both entry points dispatch
-// identically.
+// identically — for read-only methods. Browser mutations are deliberately not
+// here: see routeServiceMessage.
 export async function routeMessage(message) {
   switch (message?.method) {
     case "browser.list_windows":
@@ -468,6 +541,16 @@ export async function routeMessage(message) {
   }
 }
 
+// The service WebSocket's dispatcher: everything routeMessage handles, plus
+// the mutating `browser.open_tab`. Only requests from the authenticated
+// service reach it; `runtime.onMessage` below uses the read-only
+// routeMessage, so extension pages and other message senders cannot open
+// tabs.
+export async function routeServiceMessage(message) {
+  if (message?.method === "browser.open_tab") return openTab(message.url, message.browserSessionId);
+  return routeMessage(message);
+}
+
 browserApi.runtime.onMessage.addListener((message) => routeMessage(message));
 
 // Only wired up when the real `storage` permission/API is present (absent
@@ -476,7 +559,7 @@ browserApi.runtime.onMessage.addListener((message) => routeMessage(message));
 if (browserApi.storage?.local) {
   const serviceClient = createServiceClient({
     storage: browserApi.storage.local,
-    routeMessage,
+    routeMessage: routeServiceMessage,
     alarms: browserApi.alarms,
     // Used only if routeMessage itself rejects (a product bug, not an
     // expected outcome) — see service-client.js's catch handler — so that

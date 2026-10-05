@@ -15,7 +15,7 @@ function queryParam(url, name) {
 // A query-string id is always required to be a positive integer; an absent
 // or empty value is rejected the same explicit way (never coerced to 0 or
 // silently ignored).
-function requireIdParam(url, name = "id") {
+export function requireIdParam(url, name = "id") {
   const raw = queryParam(url, name);
   const value = raw === undefined || raw === "" ? NaN : Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -214,6 +214,28 @@ export const STORE_ROUTES = new Map([
   ],
   ["store.proposals.delete", { httpMethod: "DELETE", run: ({ store, url }) => store.deleteProposal(requireIdParam(url)) }],
 
+  // Phase 2 Action 1: read-only views of the action records and their
+  // append-only audit log. Deliberately no create/update/delete route here —
+  // actions are created, decided, and completed only through the
+  // `action.open_tab.*` routes in service/server.mjs, and the audit log has
+  // no mutation route at all. Owner-only like every route outside the agent
+  // allowlist.
+  [
+    "store.actions.list",
+    {
+      httpMethod: "GET",
+      run: ({ store, url }) =>
+        store.listActions({ ...listQuery(url), id: optionalIntParam(url, "id"), state: optionalStringParam(url, "state") }),
+    },
+  ],
+  [
+    "store.actions.audit.list",
+    {
+      httpMethod: "GET",
+      run: ({ store, url }) => store.listActionAudit({ ...listQuery(url), actionId: optionalIntParam(url, "actionId") }),
+    },
+  ],
+
   ["store.retention.get", { httpMethod: "GET", run: ({ store }) => store.getRetentionSettings() }],
   ["store.retention.update", { httpMethod: "PATCH", run: ({ store, body }) => store.updateRetentionSettings(body) }],
   ["store.retention.cleanup", { httpMethod: "POST", run: ({ store }) => store.runRetentionCleanup() }],
@@ -232,6 +254,7 @@ export const STORE_ERROR_STATUS = Object.freeze({
   [STORE_ERROR_CODES.SOURCE_NOT_FOUND]: 422,
   [STORE_ERROR_CODES.HAS_DEPENDENTS]: 409,
   [STORE_ERROR_CODES.CONFLICT]: 409,
+  [STORE_ERROR_CODES.LIMIT_REACHED]: 409,
   [STORE_ERROR_CODES.PAYLOAD_TOO_LARGE]: 413,
   [STORE_ERROR_CODES.DB_ERROR]: 500,
 });
