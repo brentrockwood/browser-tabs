@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Browser Tabs — Review</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+<header>
+  <h1>Browser Tabs — local review</h1>
+  <p>
+    A review surface for this local service, not a second browser or a general agent console.
+    Everything below reads and reviews what the browser and this service's own derived store already
+    hold; nothing here edits or mutates the browser itself.
+  </p>
+</header>
+
+<div id="status-banner" role="status" aria-live="polite"></div>
+
+<main>
+
+<section id="connection-section" aria-labelledby="connection-heading">
+  <h2 id="connection-heading">Connection state</h2>
+  <dl>
+    <dt>Service</dt>
+    <dd id="service-state">unknown</dd>
+    <dt>Extension</dt>
+    <dd id="extension-state">unknown</dd>
+    <dt>Derived store</dt>
+    <dd id="store-state">unknown</dd>
+  </dl>
+</section>
+
+<section id="auth-section" aria-labelledby="auth-heading">
+  <h2 id="auth-heading">Owner token</h2>
+  <p>
+    Paste the service's <strong>owner</strong> pairing token (shown once by <code>npm run service -- start</code>,
+    or re-displayed with <code>npm run service -- show-token</code>). It is kept only in this page's memory for
+    as long as this page stays open — never written to the URL, local storage, session storage, or any log — and is
+    discarded on reload or when you disconnect below.
+  </p>
+  <p>
+    A separate, more restricted <strong>external-agent</strong> token (Stage 4) is <em>not</em> sufficient here: it
+    cannot read or decide proposals, delete records, or clear stored data, and this page will not work correctly
+    with it. Use the owner token.
+  </p>
+  <form id="auth-form">
+    <div class="field">
+      <label for="token-input">Owner token</label>
+      <input type="password" id="token-input" name="token" autocomplete="off" spellcheck="false" required>
+    </div>
+    <button type="submit" id="connect-button">Connect</button>
+    <button type="button" id="disconnect-button" disabled>Disconnect</button>
+  </form>
+  <p id="auth-status" role="status" aria-live="polite">Not connected.</p>
+</section>
+
+<section id="inspector-section" aria-labelledby="inspector-heading">
+  <h2 id="inspector-heading">Windows, tabs, and groups</h2>
+  <p>Nothing here is fetched automatically; each list is loaded only when you ask for it.</p>
+  <button type="button" id="load-windows-button" disabled>Load windows</button>
+  <p id="inspector-status" role="status" aria-live="polite"></p>
+  <ul id="windows-list" class="plain-list"></ul>
+</section>
+
+<section id="history-section" aria-labelledby="history-heading">
+  <h2 id="history-heading">Browsing history</h2>
+  <form id="history-form">
+    <div class="field">
+      <label for="history-start">Start</label>
+      <input type="datetime-local" id="history-start" name="start">
+    </div>
+    <div class="field">
+      <label for="history-end">End</label>
+      <input type="datetime-local" id="history-end" name="end">
+    </div>
+    <div class="field">
+      <label for="history-max-results">Max results per page</label>
+      <input type="number" id="history-max-results" name="maxResults" min="1" max="500" value="50">
+    </div>
+    <button type="submit" id="load-history-button" disabled>Load history</button>
+  </form>
+  <p id="history-status" role="status" aria-live="polite"></p>
+  <ol id="history-list" class="plain-list"></ol>
+  <button type="button" id="history-next-button" hidden>Load next page</button>
+</section>
+
+<section id="captures-section" aria-labelledby="captures-heading">
+  <h2 id="captures-heading">Captures</h2>
+  <button type="button" id="refresh-captures-button" disabled>Refresh captures</button>
+  <p id="captures-status" role="status" aria-live="polite"></p>
+  <table id="captures-table">
+    <caption class="visually-hidden">Stored captures</caption>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">URL / title</th>
+        <th scope="col">Status</th>
+        <th scope="col">Captured at</th>
+        <th scope="col">Text length</th>
+        <th scope="col">Truncated</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="captures-table-body"></tbody>
+  </table>
+</section>
+
+<section id="detail-section" aria-labelledby="detail-heading" hidden>
+  <h2 id="detail-heading" tabindex="-1">Capture detail</h2>
+  <dl id="detail-metadata"></dl>
+  <div class="detail-columns">
+    <div>
+      <h3>Captured source text (bounded)</h3>
+      <pre id="detail-text" tabindex="0"></pre>
+      <button type="button" id="detail-load-more-button" hidden>Load more text</button>
+      <p id="detail-text-status" role="status" aria-live="polite"></p>
+    </div>
+    <div>
+      <h3>Summaries citing this capture</h3>
+      <ul id="detail-summaries-list" class="plain-list"></ul>
+      <h3>Proposals citing this capture</h3>
+      <ul id="detail-proposals-list" class="plain-list"></ul>
+    </div>
+  </div>
+</section>
+
+<section id="summaries-section" aria-labelledby="summaries-heading">
+  <h2 id="summaries-heading">Summaries</h2>
+  <button type="button" id="refresh-summaries-button" disabled>Refresh summaries</button>
+  <p id="summaries-status" role="status" aria-live="polite"></p>
+  <ul id="summaries-list" class="plain-list"></ul>
+</section>
+
+<section id="proposals-section" aria-labelledby="proposals-heading">
+  <h2 id="proposals-heading" tabindex="-1">Proposals</h2>
+  <p>
+    A proposal is a caller's suggestion, never an applied change. Accepting or rejecting only records your
+    decision here; it never itself creates a tag, collection, or queue change.
+  </p>
+  <button type="button" id="refresh-proposals-button" disabled>Refresh proposals</button>
+  <p id="proposals-status" role="status" aria-live="polite"></p>
+  <ul id="proposals-list" class="plain-list"></ul>
+</section>
+
+<section id="tags-section" aria-labelledby="tags-heading">
+  <h2 id="tags-heading">Tags</h2>
+  <button type="button" id="refresh-tags-button" disabled>Refresh tags</button>
+  <p id="tags-status" role="status" aria-live="polite"></p>
+  <ul id="tags-list" class="plain-list"></ul>
+</section>
+
+<section id="collections-section" aria-labelledby="collections-heading">
+  <h2 id="collections-heading">Collections</h2>
+  <button type="button" id="refresh-collections-button" disabled>Refresh collections</button>
+  <p id="collections-status" role="status" aria-live="polite"></p>
+  <ul id="collections-list" class="plain-list"></ul>
+</section>
+
+<section id="queue-section" aria-labelledby="queue-heading">
+  <h2 id="queue-heading">Queue</h2>
+  <button type="button" id="refresh-queue-button" disabled>Refresh queue</button>
+  <p id="queue-status" role="status" aria-live="polite"></p>
+  <ul id="queue-list" class="plain-list"></ul>
+</section>
+
+<section id="danger-section" aria-labelledby="danger-heading">
+  <h2 id="danger-heading">Clear stored data</h2>
+  <p>Permanently erases every capture and derived record from this service's own database and backup files.</p>
+  <button type="button" id="clear-all-button" disabled>Clear all stored data</button>
+  <p id="danger-status" role="status" aria-live="polite"></p>
+</section>
+
+</main>
+
+<script type="module" src="/ui/app.js"></script>
+</body>
+</html>

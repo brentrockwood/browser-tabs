@@ -133,6 +133,13 @@ export const ERROR_CODES = Object.freeze({
   // service/server.mjs's AGENT_ALLOWED_* allowlists.
   FORBIDDEN_SCOPE: "forbidden_scope",
   ORIGIN_REJECTED: "origin_rejected",
+  // Stage 5 remediation: the request's Host header did not match this
+  // loopback service's own canonical `127.0.0.1:<actual listening port>`
+  // (service/server.mjs's checkHost) — defense against DNS rebinding and
+  // similar Host-header-confusion attacks, since loopback binding alone
+  // does not stop a browser page on an attacker-controlled hostname that
+  // merely *resolves* to 127.0.0.1 from issuing a same-"IP" request here.
+  INVALID_HOST: "invalid_host",
   AUTH_TIMEOUT: "auth_timeout",
   DISCONNECTED: "disconnected",
   REQUEST_TIMEOUT: "request_timeout",

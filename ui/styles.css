@@ -1,0 +1,161 @@
+/* Stage 5 local review UI. Plain CSS, no framework, no build step. */
+
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  line-height: 1.4;
+  margin: 0;
+  padding: 0 1rem 3rem;
+  max-width: 70rem;
+}
+
+header {
+  padding: 1rem 0;
+}
+
+h1 {
+  font-size: 1.4rem;
+}
+
+h2 {
+  font-size: 1.15rem;
+  border-bottom: 1px solid currentColor;
+  padding-bottom: 0.25rem;
+}
+
+h3 {
+  font-size: 1rem;
+}
+
+section {
+  margin: 1.5rem 0;
+  padding: 1rem;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+}
+
+code,
+pre {
+  font-family: ui-monospace, "Courier New", monospace;
+}
+
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 24rem;
+  overflow-y: auto;
+  border: 1px solid currentColor;
+  padding: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+}
+
+dt {
+  font-weight: bold;
+}
+
+dd {
+  margin: 0;
+}
+
+.field {
+  margin-bottom: 0.5rem;
+}
+
+.field label {
+  display: block;
+  font-weight: bold;
+  margin-bottom: 0.15rem;
+}
+
+input,
+button {
+  font-size: 1rem;
+  padding: 0.3rem 0.5rem;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Never remove the focus indicator: visible keyboard focus is a hard
+   requirement here, not a cosmetic choice. */
+:focus-visible {
+  outline: 3px solid #0b63d6;
+  outline-offset: 2px;
+}
+
+.plain-list {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+}
+
+.plain-list > li {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.plain-list ul.plain-list {
+  margin-left: 1rem;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  border: 1px solid currentColor;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.detail-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 55rem) {
+  .detail-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.error-text {
+  font-weight: bold;
+}
+
+.decision-buttons button {
+  margin-right: 0.5rem;
+}

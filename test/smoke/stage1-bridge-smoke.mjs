@@ -28,6 +28,25 @@
 //        `"pending"`, no collection exists, and the captured tab itself
 //        was never closed, navigated, or grouped — no browser or
 //        collection mutation occurred anywhere in this step.
+//   2.7. Stage 5 local review UI: seeds one fresh capture/summary and two
+//        fresh pending proposals through the scoped agent credential (same
+//        pattern as 2.6), then opens the real /ui/ page in the browser and
+//        drives it via CDP (Runtime.evaluate setting the token field's
+//        value and calling .click() on the real buttons — the same
+//        technique this harness already uses for every other browser
+//        action): fills in the owner token and connects (via the
+//        extension-independent `owner.status` probe, not
+//        `browser.get_capabilities`), loads the Proposals section, and
+//        accepts one proposal and rejects the other through the UI's own
+//        Accept/Reject buttons. Both decisions are confirmed through the
+//        OWNER's own public HTTP API (a real re-read, not merely trusting
+//        what the page renders), and the seeded tab is confirmed never
+//        closed, navigated, or grouped. Finally, a deterministic
+//        connect/disconnect race: "Load windows" and "Disconnect" are
+//        clicked back-to-back synchronously (JavaScript's run-to-
+//        completion model, not timing, is what makes this deterministic),
+//        proving a stale, late-arriving `browser.list_windows` response
+//        can never repopulate the UI after Disconnect.
 //   3. The connection survives past the Manifest V3 service-worker idle
 //      window (default ~35s wait) thanks to the chosen Stage 1 checkpoint
 //      resolution: an authenticated ping/pong heartbeat no more than 20s
@@ -1024,6 +1043,218 @@ async function main() {
       await closeFixtureServer(maliciousFixtureServer);
     }
 
+    // Step 2.7: the Stage 5 local review UI, driven in the real browser via
+    // CDP. Seeds a fresh capture/summary and two fresh pending proposals
+    // through the scoped agent credential (never the owner token, and
+    // never a direct store call), each tagged with a unique rationale
+    // marker so the browser-side DOM search below never depends on list
+    // ordering.
+    console.log("exercising the Stage 5 local review UI (connect, load proposals, accept/reject, confirmed re-read)...");
+    const uiFixtureTab = await createAndWaitForTab(swCdp, fixtureUrl);
+    const uiCaptureResponse = await serviceRequest(
+      port,
+      `/api/workflow.capture_tab?tabId=${uiFixtureTab.id}&browserSessionId=${sessionId}`,
+      { method: "POST", token: agentToken },
+    );
+    if (uiCaptureResponse.status !== 200 || uiCaptureResponse.json.result?.status !== "ok") {
+      fail(`[Stage 5 UI] workflow.capture_tab (seeding) did not return an ok capture: ${uiCaptureResponse.status} ${JSON.stringify(uiCaptureResponse.json)}`);
+      return;
+    }
+    const uiCaptureId = uiCaptureResponse.json.result.id;
+    const uiSummaryResponse = await serviceRequest(port, "/api/store.summaries.create", {
+      method: "POST",
+      token: agentToken,
+      body: { text: "Stage 5 UI smoke-test summary.", sourceCaptureIds: [uiCaptureId] },
+    });
+    if (uiSummaryResponse.status !== 200) {
+      fail(`[Stage 5 UI] store.summaries.create (seeding) failed: ${uiSummaryResponse.status} ${JSON.stringify(uiSummaryResponse.json)}`);
+      return;
+    }
+    const uiSummaryId = uiSummaryResponse.json.result.id;
+
+    const UI_ACCEPT_MARKER = "stage5-ui-smoke-accept-marker";
+    const UI_REJECT_MARKER = "stage5-ui-smoke-reject-marker";
+    async function createUiProposal(marker) {
+      const response = await serviceRequest(port, "/api/store.proposals.create", {
+        method: "POST",
+        token: agentToken,
+        body: {
+          kind: "tag",
+          rationale: marker,
+          payload: { note: marker },
+          sourceCaptureIds: [uiCaptureId],
+          sourceSummaryIds: [uiSummaryId],
+        },
+      });
+      if (response.status !== 200 || response.json.result?.state !== "pending") {
+        throw new Error(
+          `store.proposals.create (seeding "${marker}") did not create a pending proposal: ${response.status} ${JSON.stringify(response.json)}`,
+        );
+      }
+      return response.json.result.id;
+    }
+    const acceptProposalId = await createUiProposal(UI_ACCEPT_MARKER);
+    const rejectProposalId = await createUiProposal(UI_REJECT_MARKER);
+
+    const uiPageUrl = `http://127.0.0.1:${port}/ui/`;
+    const uiTab = await createAndWaitForTab(swCdp, uiPageUrl);
+    const uiPageTarget = await findPageTarget(cdpPort, uiPageUrl);
+    const uiPageCdp = await connectCdpForPage(uiPageTarget.webSocketDebuggerUrl);
+    try {
+      await evaluate(
+        uiPageCdp,
+        `
+        (async () => {
+          const tokenInput = document.getElementById("token-input");
+          tokenInput.value = ${JSON.stringify(token)};
+          tokenInput.dispatchEvent(new Event("input", { bubbles: true }));
+          document.getElementById("connect-button").click();
+          const deadline = Date.now() + 8000;
+          while (Date.now() < deadline) {
+            const status = document.getElementById("auth-status").textContent;
+            if (status.includes("Connected")) return status;
+            if (status.includes("Could not connect")) throw new Error("UI reported a connect failure: " + status);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          throw new Error("timed out waiting for the UI to report Connected; last status: " + document.getElementById("auth-status").textContent);
+        })()
+        `,
+      );
+
+      // Decides one pending proposal through the UI's own Accept/Reject
+      // button, located by a unique rationale marker (never by DOM
+      // position — refreshing the list re-renders every row). The second
+      // wait loop only succeeds once the row's rendered text shows the
+      // *decided* state, which the UI only ever shows after re-fetching
+      // from the service post-decision (project.md: "re-read from service
+      // and render confirmed state") — so this exercises that re-read for
+      // real, not merely an optimistic local update.
+      async function decideViaUi(marker, buttonLabel, expectedStateText) {
+        return evaluate(
+          uiPageCdp,
+          `
+          (async () => {
+            const marker = ${JSON.stringify(marker)};
+            const buttonLabel = ${JSON.stringify(buttonLabel)};
+            const expectedStateText = ${JSON.stringify(expectedStateText)};
+            document.getElementById("refresh-proposals-button").click();
+
+            function findRow() {
+              return [...document.querySelectorAll("#proposals-list > li")].find((li) => li.textContent.includes(marker));
+            }
+
+            let row;
+            let deadline = Date.now() + 8000;
+            while (Date.now() < deadline) {
+              row = findRow();
+              if (row) break;
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            if (!row) throw new Error("never found a proposal row for marker " + marker);
+
+            const button = [...row.querySelectorAll("button")].find((b) => b.textContent === buttonLabel);
+            if (!button) throw new Error('no "' + buttonLabel + '" button found for marker ' + marker);
+            button.click();
+
+            deadline = Date.now() + 8000;
+            while (Date.now() < deadline) {
+              row = findRow();
+              if (row && row.textContent.includes(expectedStateText)) return row.textContent;
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            throw new Error(
+              "timed out waiting for the UI to show the decided state for marker " + marker +
+              "; last row text: " + (row ? row.textContent : "(row disappeared)"),
+            );
+          })()
+          `,
+        );
+      }
+
+      await decideViaUi(UI_ACCEPT_MARKER, "Accept", "state: accepted");
+      await decideViaUi(UI_REJECT_MARKER, "Reject", "state: rejected");
+
+      // Final-state proof, entirely through the OWNER's own public HTTP
+      // API — never trusting what the page itself rendered.
+      const acceptedCheck = await serviceRequest(port, `/api/store.proposals.list?id=${acceptProposalId}`, { token });
+      const acceptedItem = acceptedCheck.json?.result?.items?.[0];
+      if (acceptedCheck.status !== 200 || acceptedItem?.state !== "accepted" || acceptedItem?.decidedByCreatorType !== "user") {
+        fail(`[Stage 5 UI] accepted proposal was not recorded as expected per the owner's own view: ${acceptedCheck.status} ${JSON.stringify(acceptedCheck.json)}`);
+        return;
+      }
+      const rejectedCheck = await serviceRequest(port, `/api/store.proposals.list?id=${rejectProposalId}`, { token });
+      const rejectedItem = rejectedCheck.json?.result?.items?.[0];
+      if (rejectedCheck.status !== 200 || rejectedItem?.state !== "rejected" || rejectedItem?.decidedByCreatorType !== "user") {
+        fail(`[Stage 5 UI] rejected proposal was not recorded as expected per the owner's own view: ${rejectedCheck.status} ${JSON.stringify(rejectedCheck.json)}`);
+        return;
+      }
+
+      // No browser mutation: the seeded tab must still exist, at the same URL.
+      const stillOpenUiTab = await evaluate(swCdp, `chrome.tabs.get(${JSON.stringify(uiFixtureTab.id)})`);
+      if (!stillOpenUiTab || stillOpenUiTab.url !== fixtureUrl) {
+        fail(`[Stage 5 UI] the seeded tab was mutated by the UI flow: ${JSON.stringify(stillOpenUiTab)}`);
+        return;
+      }
+
+      console.log("Stage 5 local review UI proof passed: connect, accept, and reject all behaved as expected, confirmed via the owner's own re-read.");
+
+      // Stage 5 remediation: a real-browser connect/disconnect race check.
+      // "Load windows" and "Disconnect" are clicked back-to-back,
+      // synchronously, in the same browser task — JavaScript's run-to-
+      // completion model guarantees Disconnect's own (synchronous) state
+      // teardown (bumping browserGeneration, clearing the windows list)
+      // happens before the "Load windows" fetch's response can ever be
+      // applied, so this deterministically exercises the generation guard
+      // rather than depending on network timing. A real network round trip
+      // still happens (this is the real service over real loopback, not a
+      // mock), and this test waits for it to actually land before
+      // asserting it was discarded, so a passing result is not merely
+      // "checked too early to see the bug."
+      const raceOutcome = await evaluate(
+        uiPageCdp,
+        `
+        (async () => {
+          document.getElementById("load-windows-button").click();
+          document.getElementById("disconnect-button").click();
+          const deadline = Date.now() + 5000;
+          while (Date.now() < deadline) {
+            if (document.getElementById("auth-status").textContent.includes("Disconnected")) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          // Give the now-superseded load-windows response a real chance to
+          // land and attempt to repopulate the list.
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          return {
+            authStatus: document.getElementById("auth-status").textContent,
+            windowsListChildren: document.getElementById("windows-list").childElementCount,
+            disconnectButtonDisabled: document.getElementById("disconnect-button").disabled,
+          };
+        })()
+        `,
+      );
+      if (!raceOutcome.authStatus.includes("Disconnected")) {
+        fail(`[Stage 5 UI race] expected auth-status to report Disconnected: ${JSON.stringify(raceOutcome)}`);
+        return;
+      }
+      if (raceOutcome.windowsListChildren !== 0) {
+        fail(
+          `[Stage 5 UI race] a stale, late-arriving browser.list_windows response repopulated the windows list after Disconnect: ${JSON.stringify(raceOutcome)}`,
+        );
+        return;
+      }
+      if (!raceOutcome.disconnectButtonDisabled) {
+        fail(`[Stage 5 UI race] disconnect-button should be disabled once already disconnected: ${JSON.stringify(raceOutcome)}`);
+        return;
+      }
+      console.log(
+        "Stage 5 connect/disconnect race check passed: a stale in-flight browser.list_windows response never repopulated the UI after Disconnect.",
+      );
+    } finally {
+      uiPageCdp.close();
+      await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(uiTab.id)})`).catch(() => {});
+      await evaluate(swCdp, `chrome.tabs.remove(${JSON.stringify(uiFixtureTab.id)})`).catch(() => {});
+    }
+
     // Detach from the service worker's own CDP target *before* the idle
     // wait, and do not reattach until a later step genuinely needs it
     // (Step 5's browser restart). A live DevTools Protocol session to a
@@ -1274,6 +1505,11 @@ async function main() {
           "a real page with an embedded adversarial instruction, a summary and a pending collection proposal with " +
           "a self-approval-shaped payload, the agent explicitly forbidden from deciding its own proposal, and " +
           "no collection or browser mutation per the owner's own public HTTP API), " +
+          "the Stage 5 local review UI (connecting with the owner token via the extension-independent owner.status " +
+          "probe, accepting one and rejecting another pending proposal through the UI's own buttons driven via " +
+          "CDP, both decisions confirmed through the owner's own public HTTP API, no browser mutation, and a " +
+          "real-browser connect/disconnect race leaving no stale list_windows response able to repopulate the UI " +
+          "after Disconnect), " +
           `survival past a ${IDLE_WAIT_MS}ms idle wait via the heartbeat, the durable reconnect alarm ` +
           "being registered with the expected schedule before a service restart, automatic reconnect after that " +
           "restart and after a full browser restart (neither requiring re-pairing), browserSessionId rotating " +

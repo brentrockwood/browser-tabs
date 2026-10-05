@@ -1354,6 +1354,413 @@ and the expanded real Chrome for Testing bridge smoke passes, including
 the adversarial-page workflow described above. The Stage 4 checklist in
 project.md is complete after independent review and remediation.
 
+## Stage 5: the local review UI
+
+Stage 5 adds a small, dependency-free static web page the service hosts
+for itself: a review surface, not a second browser or a general agent
+console. It is served from the same loopback HTTP server as every other
+route, under five exact, fixed paths (`/ui/`, `/ui/index.html`,
+`/ui/app.js`, `/ui/lib.mjs`, `/ui/styles.css`) — `service/ui.mjs` reads the
+four checked-in files (`ui/index.html`, `ui/app.js`, `ui/lib.mjs`,
+`ui/styles.css`) once at module load and serves them from an explicit
+`Map` of exact path -> fixed file, never a generic static-file server that
+walks a caller-supplied path off disk. There is no dynamic path segment
+anywhere in that table, so there is no path-traversal surface to sanitize
+against: a request for anything else — including `/ui/..%2fserver.mjs`-
+style attempts — simply has no entry and falls through to the server's
+existing `404 not_found` handling, exactly like an unknown `/api/` method
+(`test/ui.test.mjs` exercises this directly). `ui/app.js` is loaded as a
+native ES module (`<script type="module">` — a language feature, not a
+framework or build step) so it can `import` the small, pure, DOM-free
+race-prevention helpers in `ui/lib.mjs`; see "Race prevention" below.
+
+### Remediation round (Terra findings)
+
+An independent (Terra) review of the first Stage 5 implementation found
+seven concrete issues, all addressed in this revision:
+
+1. **No Host-header defense.** Loopback binding alone does not stop a
+   page served from an attacker-controlled DNS name that *resolves* to
+   `127.0.0.1` from causing a victim's own browser to issue a
+   same-"IP" request here — the browser sets `Host` from the
+   navigated-to hostname, not the resolved IP (the same point
+   project.md's trust model already makes about the extension
+   WebSocket's Origin check: "loopback alone is not authentication").
+   See "Host-header defense" below.
+2. **The Connect flow depended on the extension being connected, and did
+   not actually distinguish an owner token from an agent one.**
+   `browser.get_capabilities` round-trips through the extension (failing
+   with `disconnected` whenever it is not connected) and is agent-allowed
+   too, so an agent token could "connect" to this owner-only review
+   surface. See "Owner token" below and the new `owner.status` route.
+3. **`browserSessionId` could be adopted from the wrong place, and a
+   stale session was not handled explicitly.** See "Browser sessions"
+   below.
+4. **Async races**: a slow-to-resolve request could mutate the page after
+   Disconnect, after a different capture was selected, or after a newer
+   list refresh had already rendered. See "Race prevention" below.
+5. **Proposal decisions** had no dedicated in-flight/committed tracking
+   outside the row being decided, and did not distinguish a failed PATCH
+   (retryable) from a successful PATCH whose confirmation re-read then
+   failed (never retryable — the decision is already recorded). See
+   "Proposals" in "What the page shows and does" below.
+6. **Tag assignments had no view at all** — only the tag record itself,
+   never which captures/summaries it had actually been assigned to, or by
+   whom. See "What the page shows and does" below.
+7. **Accessibility gaps**: dynamically created per-row status elements
+   were not ARIA live regions, and no focus was ever moved when the
+   capture-detail panel appeared or the proposals list re-rendered. See
+   "Accessibility" below.
+
+### Host-header defense
+
+Every response this service can produce for a plain HTTP request —
+serving a UI asset, answering `/health`, or dispatching an authenticated
+`/api/`/`/control/` route — is preceded by `service/server.mjs`'s
+`checkHost`, which accepts **only** a `Host` header of exactly
+`127.0.0.1:<port>`, where `<port>` is the literal port *this connection*
+is actually being served on (`req.socket.localPort` — not a configured or
+remembered value, so this is automatically correct for an ephemeral
+`port: 0` test listener too). A non-loopback hostname (including
+`localhost`, deliberately — it is a different name that merely usually
+resolves to loopback, not loopback itself), a mismatched port, a missing
+`Host` header, or anything else not matching that exact pattern is
+rejected with `421 invalid_host` — a status distinct from every other 4xx
+this service returns — before the UI, `/health`, or any `/api/`/
+`/control/` route is ever reached. The same check runs first on the
+extension WebSocket's upgrade request too, ahead of (and independent of)
+the existing `chrome-extension://` Origin check. `test/host-defense.test.mjs`
+drives raw sockets directly (bypassing any HTTP client library that would
+normalize the header itself) to prove: a non-loopback Host, a loopback
+host with a wrong or missing port, and a malformed Host are all rejected
+with `421`/`invalid_host` on `/ui/`, an authenticated `/api/` route (even
+with a fully valid credential), `/control/stop`, `/health`, and the
+WebSocket upgrade — and that a canonical `127.0.0.1:<port>` Host still
+works normally throughout.
+
+### Security headers
+
+Every UI asset response carries:
+
+| Header | Value |
+| --- | --- |
+| `Content-Security-Policy` | `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Referrer-Policy` | `no-referrer` |
+| `X-Frame-Options` | `DENY` |
+| `Cache-Control` | `no-store` |
+
+No `'unsafe-inline'` or `'unsafe-eval'` appears anywhere in that policy.
+`ui/index.html` has exactly one `<script>` tag (`src="/ui/app.js"`, no
+inline body) and one external `<link rel="stylesheet">`; there is no
+inline `<style>` block and no inline event-handler attribute
+(`onclick=`, ...) anywhere in the page — every interaction is wired up in
+`ui/app.js` via `addEventListener`. `test/ui.test.mjs` asserts all of this
+by reading the actual shipped source, not merely by trusting this
+description.
+
+These UI routes are served **without** requiring `Authorization` or
+`X-Protocol-Version` — ordinary browser navigation and `<script src>`/
+`<link>` fetches never send either header, and the static assets
+themselves carry no secret and perform no action by themselves. Every
+actual operation the page performs is an ordinary call to the existing
+authenticated, protocol-versioned `/api/` routes, from `ui/app.js`,
+exactly like any other local API caller (the reference client, `curl`,
+...) — there is no special server-side path that trusts the browser page
+any more than it trusts any other caller.
+
+### Escaping untrusted content
+
+Every value that could have come from the browser or from a derived
+record — tab/window titles and URLs, history entries, captured page text,
+summary text, proposal rationale/payload, tag/collection names, and so on
+— is written into the page with `textContent` only (or via a small
+`el()` DOM-builder helper that itself only ever sets `textContent`). This
+file never assigns `innerHTML`/`outerHTML`, never calls `document.write`,
+and never calls `eval`/`new Function` — `test/ui.test.mjs` scans the
+actual shipped `ui/app.js` source and fails if any of those appear
+anywhere in it, not merely in the functions this description happens to
+mention.
+
+### Owner token, obtained fresh on each load
+
+The page never embeds, requests, or is granted a credential by the
+service itself. A password-type input ("Owner token") asks the person
+using the page to paste the owner pairing token (shown once by
+`npm run service -- start`, or re-displayed with `show-token`); "Connect"
+validates it against the new, extension-independent `GET /api/owner.status`
+route (see below — **not** `browser.get_capabilities`, which round-trips
+through the extension and is also agent-allowed) and, only on success,
+holds it in an ordinary JavaScript module-level variable for as long as
+the page stays open. It is never written to the URL, a query string,
+`localStorage`, `sessionStorage`, a cookie, or any `console`/log
+statement, and the visible input field is cleared immediately after the
+token is captured into memory. Reloading the page, or clicking
+"Disconnect", discards it; it must be pasted in again. The page explicitly
+explains that the separate, more restricted Stage 4 **external-agent**
+token is not sufficient here — it cannot read or decide proposals, delete
+records, or clear stored data — and does not attempt to accept it as a
+fallback.
+
+#### `GET /api/owner.status`
+
+A new, minimal route (`service/server.mjs`'s `handleOwnerStatus`):
+authenticated and protocol-versioned exactly like every other `/api/`
+route, but it never calls `sendExtensionRequest` at all — it only answers
+"does this credential authenticate, and does it carry owner scope?" This
+fixes both halves of the Terra finding at once: an owner can connect and
+enter the review UI even while the extension is disconnected (where
+`browser.get_capabilities` would fail with `503 disconnected`), and an
+agent-scoped token is explicitly `403 forbidden_scope` here — unlike
+`browser.get_capabilities`, which agent scope can also reach, so it never
+actually proved "this is the owner." `owner.status` is not reachable
+through any `AGENT_ALLOWED_*` set, the same way `/control/stop` is
+owner-only by its own explicit scope check, not by omission from an
+allowlist. The Connect handler calls `owner.status` first; only after it
+succeeds does the page separately read `/health` (immediately, and then
+on its existing 5-second poll) — "then health separately," so connection
+state and owner-scope validation are two independent facts, neither one
+gating the other. `test/owner-status.test.mjs` covers: success with no
+store and no extension connection configured at all; `403 forbidden_scope`
+for a configured agent credential; `401` for a missing/wrong credential;
+and the ordinary protocol-version/method enforcement every other route
+already has.
+
+### Browser sessions
+
+`browserSessionId` is established **only** by a fresh, successful
+`browser.list_windows` result (`rememberSessionFromWindowsResult` in
+`ui/app.js`) — never adopted from a `list_tabs`/`list_tab_groups`/
+`query_history`/`workflow.capture_tab` response, and never from a
+superseded one (see "Race prevention" below for how a superseded one is
+recognized at all). Any `list_tabs`/`list_tab_groups`/`workflow.capture_tab`
+outcome whose `code` is `stale_session` triggers `handleStaleBrowserSession`:
+the entire windows/tabs/groups/capture-button tree is torn down (every
+row removed, not merely the one that happened to notice), the remembered
+session id is cleared, and the inspector status explicitly says the
+session changed and a fresh "Load windows" click is required — never a
+silent retry, and never a numeric window/tab handle from before the
+change reused against whatever session happens to be current afterward.
+
+### Race prevention
+
+Three independent kinds of race, and the primitives (`ui/lib.mjs`, a
+small native ES module with zero DOM dependencies, imported by
+`ui/app.js`) that prevent each one — deterministically unit tested in
+plain Node with no browser at all (`test/ui-lib.test.mjs`), since none of
+this logic touches `document`/`window`/`fetch`:
+
+- **Disconnect-during-request** (`createGenerationCounter`): an
+  `auth` generation, bumped only on Disconnect, and a separate `browser`
+  generation, bumped on Disconnect *and* on every fresh "Load windows"
+  click *and* whenever a stale browser session is detected. Every async
+  handler captures a snapshot before its request and checks
+  `isStale(snapshot)` immediately before any DOM mutation — on the
+  relevant generation for what it touches (browser-tree handlers check
+  the browser generation; everything else checks the auth generation).
+  Connect itself follows the same rule: it captures the auth generation
+  before its own request and never commits a token, enables controls, or
+  shows a "Connected" status if a Disconnect happened while that request
+  was in flight — "Connect cannot complete after disconnect." An
+  `AbortController`, created at the start of each Connect attempt
+  (assigned immediately, before that attempt's own fetch, so Disconnect
+  can always cancel it even pre-success) and aborted on Disconnect, is
+  attached to every authenticated request `apiRequest` makes.
+- **Stale capture-detail selection** (plain object-identity comparison):
+  `selectCapture(id)` creates one fresh `{ id, offset }` session object
+  and assigns it to `state.detailSession`; the chunk-loading and
+  related-records code captures that exact object (not merely the id) and
+  the requested `offset` as an immutable local snapshot *before* each
+  await, then re-renders only if `state.detailSession` is still that same
+  object by reference and the auth generation has not gone stale. Two
+  overlapping requests for the same capture, or a quick switch to a
+  different capture (even one that happened to reuse the same id), can
+  therefore never corrupt each other's offset bookkeeping or render into
+  the wrong capture's panel.
+- **An older list refresh overwriting a newer one** (`createListVersionGuard`):
+  used for `store.proposals.list` specifically (the route most sensitive
+  to this, since it also drives decision-button state) — `start()` is
+  called before a refresh's own request, and the result can only be
+  applied if no newer refresh has since started, and no newer-or-equal
+  result has already applied.
+
+### Proposal decisions, in full
+
+Proposal decision state (idle/submitting/committed/failed) is tracked by
+id in a module-level `createDecisionTracker()` (`ui/lib.mjs`) — *outside*
+any one rendered `<li>`, so it survives the list being cleared and
+rebuilt by every refresh. `begin(id)` refuses to start a second decision
+while one is already submitting or already committed, independent of
+whatever the currently rendered row's buttons happen to show. A PATCH
+that never reaches/succeeds against the server (`fail(id)`) is retryable;
+a PATCH that succeeds (`commit(id)`, permanent from then on) followed by
+a failed confirmation re-read is **not** — the status text says "Decision
+recorded, but refreshing the list failed," and the Accept/Reject buttons
+are never re-enabled, because the decision is already recorded
+server-side and offering to retry it would attempt to decide an
+already-decided proposal. While any decision is submitting (PATCH and/or
+its own follow-up reread), the manual "Refresh proposals" button is also
+disabled, so a user-triggered refresh can never race a decision's own
+refresh. `store.proposals.list` refreshes are additionally guarded by the
+list-version guard above.
+
+### Accessibility
+
+Every *dynamically created* per-row/per-section async status element
+(tabs/groups/capture/collection-items/tag-assignments/decision status —
+previously plain, silent elements) is now built through a shared
+`statusElement()` helper that sets `role="status"` and `aria-live="polite"`,
+matching the static, HTML-authored status paragraphs that already had
+this. Selecting a capture moves focus to the capture-detail heading
+(`tabindex="-1"` in `ui/index.html`, so it is programmatically focusable
+without being in the normal tab order); a successful proposals refresh —
+whether from the manual button or from a decision's own post-commit
+reread — moves focus to the Proposals section heading, so a keyboard or
+screen-reader user is never silently left focused on a now-detached or
+repurposed element after a rerender.
+
+### What the page shows and does
+
+- **Connection state**: a `/health`-backed panel (polled every 5 seconds,
+  unauthenticated, independent of the owner token) showing whether the
+  service is up, whether the extension is connected, and whether the
+  derived store is available.
+- **Windows, tabs, and groups**: nothing is fetched until asked for.
+  "Load windows" calls `browser.list_windows`; each window row has its own
+  "Load tabs"/"Load groups" buttons (`browser.list_tabs`/
+  `browser.list_tab_groups`); each tab row has an explicit "Capture"
+  button that calls the owner-authorized `workflow.capture_tab` — the same
+  server-side-fetched-evidence route Stage 4 restricts external-agent
+  scope to, here invoked with full owner scope — and reports the resulting
+  capture id or outcome inline, never silently.
+- **History**: a start/end range (plus a max-results-per-page field) calls
+  `browser.query_history`; the page renders the literal `returnedCount`/
+  `truncated`/`nextCursor` fields alongside a plain-language summary, and
+  an explicit "incomplete" outcome (`pagination_limit_reached`) is shown
+  as an error rather than silently treated like a normal page. "Load next
+  page" is only shown while `nextCursor` is non-null.
+- **Captures**: a table from `store.captures.list`, with "View" (loads the
+  detail panel below) and "Delete" (with a `has_dependents` conflict
+  prompting a cascade-confirmation retry, exactly mirroring the store's
+  own refuse-by-default semantics) per row.
+- **Capture detail**: selecting a capture shows its full provenance
+  (`browserSessionId`, `sourceOperation`, `capturedAt`, `schemaVersion`,
+  character counts, truncation, status/code/detail) alongside its bounded
+  captured text, paged through `store.captures.read`'s own bounded
+  `offset`/`maxChars` chunks via a "Load more text" button — never the
+  whole text in one response — plus read-only lists of whichever summaries
+  and proposals (from the same bounded `store.summaries.list`/
+  `store.proposals.list` calls the dedicated sections below also use)
+  cite that capture's id in `sourceCaptureIds`.
+- **Summaries, collections, queue**: independently refreshable, bounded
+  (`limit=200`, this project's `MAX_LIST_LIMIT`) list sections, each item
+  showing its creator, timestamps, and source ids where applicable, with a
+  "Delete" button calling the corresponding `store.*.delete` route.
+  Collections additionally support "Load items".
+- **Tags**: the same bounded, refreshable list, plus a per-tag "Load
+  assignments" button (`store.tags.assignments.list?tagId=...`) showing
+  which captures/summaries that tag is actually assigned to and the
+  assignment's own creator provenance (`recordType`/`recordId`,
+  `creatorType`/`creatorName`, `createdAt`) — previously missing
+  entirely; a tag record with no visible assignments was otherwise
+  unreviewable.
+- **Proposals**: each proposal's kind, rationale, payload (rendered as
+  opaque JSON text, never parsed/executed), creator, source ids, and state
+  are shown. **Only a `"pending"` proposal not already committed by this
+  page's own decision tracker shows Accept/Reject buttons at all** — a
+  decided one shows its decision timestamp and decider identity instead,
+  with only a "Delete" button. See "Proposal decisions, in full" above for
+  the complete in-flight/committed/failed lifecycle, the manual-refresh
+  lockout while a decision is submitting, and why a successful decision
+  followed by a failed confirmation re-read never re-enables the buttons.
+  Nothing here ever applies a proposal's suggested change itself (no
+  route this page calls does that either — see "Stage 3: the derived
+  store" above).
+- **Clear stored data**: a single confirmed `store.clear` call, reported
+  via the real `removedBackupCount` the service returns.
+
+### Tests
+
+```sh
+node --test test/ui.test.mjs   # also included in plain `npm test`
+```
+
+`test/ui.test.mjs` covers: every UI asset route (including the new
+`/ui/lib.mjs`) serving 200 with a non-empty body and no required
+`Authorization`/`X-Protocol-Version` header; the exact security headers
+and CSP directives above, on every asset route; correct `Content-Type`
+per asset; `/ui/` and `/ui/index.html` serving byte-identical content; a
+representative set of unknown and path-traversal-attempt paths under
+`/ui/` all producing a plain `404 not_found` (never leaking service
+source); a `POST` to a UI path not being treated as a UI asset at all;
+that serving UI assets never passes a credential or request content to
+the service's `log` callback; and static source checks against the
+actual shipped `ui/index.html`/`ui/app.js`/`ui/lib.mjs`/`ui/styles.css`
+(no `innerHTML`/`outerHTML`/`document.write`/`eval`, no inline
+script/style/event-handler attributes, exactly one external `<script>`
+tag, an external stylesheet `<link>`, and — new in this revision —
+`ui/lib.mjs` itself scanned for staying DOM/network-free).
+
+`test/ui-lib.test.mjs` is new: deterministic unit tests for
+`createGenerationCounter`/`createListVersionGuard`/`createDecisionTracker`
+(`ui/lib.mjs`) in plain Node, no browser and no mocked DOM — covering
+generation bump/staleness, version-guard apply-ordering (a newer `start()`
+always wins; the same token can only apply once), and the decision
+tracker's begin/commit/fail transitions (a committed decision can never
+restart; a failed one can retry; independent ids are tracked
+independently).
+
+`test/host-defense.test.mjs` is new: see "Host-header defense" above.
+
+`test/owner-status.test.mjs` is new: see "`GET /api/owner.status`" above.
+
+`test/smoke/stage1-bridge-smoke.mjs` (see "Real-browser bridge smoke test"
+above) extends real-browser coverage with Step 2.7: using the scoped
+external-agent credential, it seeds one fresh capture/summary and two
+fresh pending proposals (never through the owner token, and never a
+direct store call), opens the real `/ui/` page in Chrome for Testing, and
+drives it via CDP `Runtime.evaluate` — setting the token field's value and
+calling `.click()` on the page's own real buttons, the same technique this
+harness already uses for every other browser action it performs. It fills
+in the owner token and connects via `owner.status`, then accepts one
+pending proposal and rejects the other through the UI's own Accept/Reject
+buttons, each located by a unique rationale marker (never DOM position).
+Both decisions are then confirmed through the **owner's own public HTTP
+API** — a real re-read, never merely trusting what the page rendered —
+and the seeded tab is confirmed never closed, navigated, or grouped by
+any of this. Finally, a real-browser connect/disconnect race: "Load
+windows" and "Disconnect" are clicked back-to-back *synchronously* in the
+same browser task (JavaScript's run-to-completion model, not timing, is
+what makes this deterministic rather than merely likely), proving a
+stale, late-arriving `browser.list_windows` response — which this test
+lets actually land, over the real loopback connection, before asserting
+on it — can never repopulate the windows list after Disconnect.
+
+### What Stage 5 does not add
+
+Exactly one new `store.*`-adjacent read is used that was not already
+rendered (`store.tags.assignments.list`, which already existed as a Stage
+3 route — this revision is the first to actually call it from the UI),
+plus exactly one genuinely new route, `GET /api/owner.status`
+(extension- and store-independent; see above). Every other operation the
+page performs was already exposed by Stage 2/3/4 (`browser.list_windows`/
+`list_tabs`/`list_tab_groups`/`query_history`, `workflow.capture_tab`,
+and the existing `store.*` CRUD/list routes). Still no build step,
+bundler, or UI framework; `ui/app.js`'s use of native ES modules
+(`import`/`export`, loaded directly by the browser) is a language
+feature, not a build step. No browser mutation route is exposed or called
+from this page, and no model is called from it.
+
+### Verification status
+
+The orchestrator ran `npm test` (331/331 passing), the focused UI/security
+suite, `npm audit --omit=dev` (no vulnerabilities), syntax and diff checks,
+and the expanded real Chrome for Testing bridge smoke against this
+revision. The browser smoke drove owner connection, proposal acceptance and
+rejection, confirmed rereads, and a disconnect race through the shipped UI.
+Independent Terra review findings were remediated at the server and UI trust
+boundaries. The Stage 5 checklist in project.md is complete.
+
 ## Local development
 
 Load `extension/` as an unpacked extension in a Chromium browser. Stage 1 adds

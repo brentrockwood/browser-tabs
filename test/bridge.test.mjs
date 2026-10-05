@@ -1087,8 +1087,10 @@ test("an oversized inbound extension WebSocket message is rejected by the transp
     const code = await closed;
     assert.equal(typeof code, "number");
 
-    // The service itself must still be healthy and usable afterward.
-    const health = await httpRequest({ port, path: "/health" });
+    // The service itself must still be healthy and usable afterward. The
+    // client-side close event can win a race with the server's close handler,
+    // so wait until /health observes the settled disconnected state.
+    const health = await pollHealthUntilDisconnected({ port });
     assert.equal(health.status, 200);
     assert.equal(health.json.extension.connected, false);
   });

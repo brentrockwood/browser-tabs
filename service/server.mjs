@@ -16,6 +16,7 @@ import {
 } from "../extension/protocol.js";
 import { STORE_ERROR_CODES, StoreError } from "./store-errors.mjs";
 import { STORE_ERROR_STATUS, STORE_ROUTES } from "./store-routes.mjs";
+import { UI_ROUTES, serveUiAsset } from "./ui.mjs";
 import { MAX_REQUEST_BODY_BYTES } from "./validation.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -129,6 +130,10 @@ const AGENT_ALLOWED_BROWSER_METHODS = new Set([
 ]);
 // workflow.*: the one capture-creation path agent scope may use.
 const AGENT_ALLOWED_WORKFLOW_METHODS = new Set(["workflow.capture_tab"]);
+// Stage 5 remediation: `owner.status` (handleOwnerStatus, below) is
+// deliberately not reachable through any AGENT_ALLOWED_* set at all —
+// like `/control/stop`, it is owner-only by its own explicit scope check,
+// not by omission from an allowlist that merely happens not to name it.
 // store.*: read evidence already captured, and write only the two derived
 // record types Stage 4's workflow needs (summaries, proposals) — never
 // update/delete, never tags/collections/queue, never retention/clear, and
@@ -161,6 +166,58 @@ function timingSafeTokenEquals(candidate, expected) {
 
 function isTrustedExtensionOrigin(origin) {
   return typeof origin === "string" && origin.startsWith("chrome-extension://");
+}
+
+// Stage 5 remediation: Host-header defense against DNS rebinding and
+// similar Host-header-confusion attacks. This service binds only to
+// 127.0.0.1 (project.md's trust model), but loopback binding alone is not
+// sufficient isolation: a page served from an attacker-controlled DNS name
+// that *resolves* to 127.0.0.1 causes the victim's own browser to issue an
+// ordinary same-origin-looking request here, with the Host header set from
+// the navigated-to hostname — not the resolved IP. project.md's trust model
+// already makes exactly this point about the extension WebSocket's Origin
+// check ("Loopback alone is not authentication"); this is the HTTP-side
+// counterpart, applied before anything else — serving the UI, answering
+// /health, or dispatching an authenticated /api/ or /control/ route — ever
+// happens for a request whose own Host header is not this exact, literal,
+// canonical value.
+//
+// The only accepted Host is `127.0.0.1:<port>`, where `<port>` must be the
+// exact port *this connection* is actually being served on
+// (`req.socket.localPort`) — never merely "any 127.0.0.1", and never
+// derived from a configured/expected port that could drift from what the
+// server actually bound (this also makes the check correct for an
+// ephemeral `port: 0` test listener, whose real port is only known after
+// `listen()`). A missing Host header, more than one Host header value, or
+// anything not matching this exact pattern is rejected the same way.
+const CANONICAL_LOOPBACK_HOST_PATTERN = /^127\.0\.0\.1:(\d{1,5})$/;
+
+function isCanonicalLoopbackHost(hostHeader, expectedPort) {
+  if (typeof hostHeader !== "string") return false;
+  const match = CANONICAL_LOOPBACK_HOST_PATTERN.exec(hostHeader.trim());
+  if (!match) return false;
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 && port === expectedPort;
+}
+
+// Returns `null` when the request's Host header is the canonical
+// `127.0.0.1:<this connection's actual listening port>`, or a failure
+// descriptor (`{ status, error }`, HTTP 421 Misdirected Request — distinct
+// from every other 4xx this service returns, so a caller/test can tell
+// this apart from a malformed request, a bad credential, or an
+// unsupported protocol version) otherwise. `req.socket.localPort` is used
+// rather than any value captured at `listen()` time, so this is always
+// correct for the port the request actually arrived on.
+function checkHost(req) {
+  const expectedPort = req.socket.localPort;
+  if (isCanonicalLoopbackHost(req.headers.host, expectedPort)) return null;
+  return {
+    status: 421,
+    error: {
+      code: ERROR_CODES.INVALID_HOST,
+      detail: `expected Host: 127.0.0.1:${expectedPort}`,
+    },
+  };
 }
 
 // True if the request declares any body framing at all — a `Content-Length`
@@ -704,6 +761,36 @@ export function createService({
     }
   }
 
+  // Stage 5 remediation: an extension-independent, authenticated,
+  // protocol-versioned owner-scope probe. Unlike `browser.get_capabilities`
+  // (which round-trips through the extension and therefore fails with
+  // `disconnected` whenever the extension is not currently connected),
+  // this route never touches `sendExtensionRequest` at all — it only
+  // answers the question "does this credential authenticate, and does it
+  // carry owner scope?" The UI's Connect flow uses this (not
+  // `browser.get_capabilities`) to validate the pasted token, specifically
+  // so an owner can still enter the review UI while the extension is
+  // disconnected, and so an agent-scoped token is explicitly rejected
+  // here rather than incidentally succeeding merely because
+  // `browser.get_capabilities` happens to be agent-allowed too.
+  function handleOwnerStatus(req, res) {
+    const requestId = requestIdFor(req);
+    const auth = authenticate(req);
+    if (!auth.ok) {
+      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
+      return;
+    }
+    if (auth.scope !== "owner") {
+      respondJson(res, 403, forbiddenScopeResponse(requestId, "owner.status"));
+      return;
+    }
+    if (!checkRateLimit()) {
+      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
+      return;
+    }
+    respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result: { scope: "owner" } });
+  }
+
   function handleHealth(_req, res) {
     respondJson(res, 200, {
       protocolVersion: PROTOCOL_VERSION,
@@ -737,18 +824,12 @@ export function createService({
   }
 
   const httpServer = createHttpServer((req, res) => {
-    const versionFailure = checkProtocolVersion(req);
-    if (versionFailure) {
-      respondJson(res, versionFailure.status, { protocolVersion: PROTOCOL_VERSION, error: versionFailure.error });
-      return;
-    }
-
     // Guarded: `req.url` is the raw, caller-controlled HTTP request target,
     // and `new URL(...)` throws `ERR_INVALID_URL` for a malformed one (e.g.
     // an invalid raw target like `//[`). That must become an explicit,
     // bounded 400 response — never an uncaught exception that could crash
-    // the process — and must happen before any authentication or route
-    // dispatch is attempted.
+    // the process — and must happen before any authentication, protocol
+    // check, or route dispatch is attempted.
     let url;
     try {
       url = new URL(req.url, "http://127.0.0.1");
@@ -757,6 +838,34 @@ export function createService({
         protocolVersion: PROTOCOL_VERSION,
         error: { code: ERROR_CODES.INVALID_REQUEST, detail: error instanceof Error ? error.message : String(error) },
       });
+      return;
+    }
+
+    // Stage 5 remediation: the Host-header check runs before *everything*
+    // else — before even serving a UI asset — so a DNS-rebinding-style
+    // request never gets so much as the UI shell, let alone a chance to
+    // reach an authenticated route. See checkHost's own comment above.
+    const hostFailure = checkHost(req);
+    if (hostFailure) {
+      respondJson(res, hostFailure.status, { protocolVersion: PROTOCOL_VERSION, error: hostFailure.error });
+      return;
+    }
+
+    // Stage 5: the local review UI's static assets are served before (and
+    // regardless of) the X-Protocol-Version check below — ordinary browser
+    // navigation and <script src>/<link> fetches never send that header,
+    // and these routes carry no secret and perform no action by themselves
+    // (see service/ui.mjs). Every actual operation the UI performs is a
+    // call to the authenticated, protocol-versioned /api/ routes below,
+    // exactly like any other local API caller.
+    if (req.method === "GET" && UI_ROUTES.has(url.pathname)) {
+      serveUiAsset(res, UI_ROUTES.get(url.pathname));
+      return;
+    }
+
+    const versionFailure = checkProtocolVersion(req);
+    if (versionFailure) {
+      respondJson(res, versionFailure.status, { protocolVersion: PROTOCOL_VERSION, error: versionFailure.error });
       return;
     }
 
@@ -770,6 +879,10 @@ export function createService({
     }
     if (url.pathname.startsWith("/api/")) {
       const name = url.pathname.slice("/api/".length);
+      if (req.method === "GET" && name === "owner.status") {
+        handleOwnerStatus(req, res);
+        return;
+      }
       if (req.method === "GET" && API_ROUTES.has(name)) {
         handleApiMethod(name, req, res, url);
         return;
@@ -801,6 +914,20 @@ export function createService({
       socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
       return;
     }
+
+    // Stage 5 remediation: the same Host-header defense applied to every
+    // plain HTTP response also applies to the WebSocket upgrade. The
+    // existing Origin check below already defeats an ordinary web page
+    // (which can never claim a `chrome-extension://` origin), but this is
+    // cheap, consistent defense-in-depth against the same DNS-rebinding
+    // class of attack, checked first.
+    const hostFailure = checkHost(req);
+    if (hostFailure) {
+      log(`rejected websocket upgrade due to an invalid Host header: ${req.headers.host ?? "(none)"}`);
+      socket.end(`HTTP/1.1 ${hostFailure.status} Misdirected Request\r\nConnection: close\r\n\r\n`);
+      return;
+    }
+
     if (req.url !== "/extension") {
       socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       return;

@@ -329,27 +329,27 @@ browser or a general agent console.
 
 Implementation:
 
-- [ ] Show service and extension connection state.
-- [ ] Show windows, tabs, groups, and capture status without polling unbounded
+- [x] Show service and extension connection state.
+- [x] Show windows, tabs, groups, and capture status without polling unbounded
   browser state.
-- [ ] Let the user choose which tabs to capture.
-- [ ] Show captured text with URL, timestamp, truncation, and unsupported-state
+- [x] Let the user choose which tabs to capture.
+- [x] Show captured text with URL, timestamp, truncation, and unsupported-state
   details.
-- [ ] Show summaries, tags, queues, and collections alongside their sources.
-- [ ] Show proposals as proposals, including creator, rationale, evidence, and
+- [x] Show summaries, tags, queues, and collections alongside their sources.
+- [x] Show proposals as proposals, including creator, rationale, evidence, and
   pending/rejected/accepted state.
-- [ ] Allow editing or deleting derived records and clearing stored captures.
-- [ ] Meet basic keyboard, focus, contrast, labeling, and reduced-motion
+- [x] Allow editing or deleting derived records and clearing stored captures.
+- [x] Meet basic keyboard, focus, contrast, labeling, and reduced-motion
   accessibility requirements.
-- [ ] Escape untrusted text and use a restrictive Content Security Policy.
+- [x] Escape untrusted text and use a restrictive Content Security Policy.
 
 Exit criteria:
 
-- [ ] A user can tell what came from the browser, what was inferred, and by
+- [x] A user can tell what came from the browser, what was inferred, and by
   whom.
-- [ ] The primary capture-and-review flow works with keyboard navigation.
-- [ ] Rendering captured page text cannot execute markup or script.
-- [ ] Accepting a Phase 1 proposal changes only derived service data.
+- [x] The primary capture-and-review flow works with keyboard navigation.
+- [x] Rendering captured page text cannot execute markup or script.
+- [x] Accepting a Phase 1 proposal changes only derived service data.
 
 ### Stage 6 — Firefox parity and local release
 
@@ -777,6 +777,117 @@ Terra review found the original client-only trust boundary insufficient;
 its findings were remediated with the scoped server credential/allowlist,
 server-issued capture path, strict client transport, and subsequent
 hardening tests. The Stage 4 checklist above is complete.
+
+Stage 5 (the local review UI) is implemented and verified against this
+revision; see README.md's "Stage 5: the local review UI" section for the
+full description. `service/ui.mjs` serves five exact, fixed paths (`/ui/`,
+`/ui/index.html`, `/ui/app.js`, `/ui/lib.mjs`, `/ui/styles.css`) from an
+explicit `Map` of path -> file
+content read once at module load — never a generic static-file server
+walking a caller-supplied path — with a restrictive
+`Content-Security-Policy` (`default-src 'none'`, script/style/connect only
+`'self'`, `frame-ancestors 'none'`, no `unsafe-inline`/`unsafe-eval`),
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+`X-Frame-Options: DENY`, and `Cache-Control: no-store` on every asset
+response; `service/server.mjs`'s request handler now resolves the request
+URL and serves a matching UI asset *before* its existing
+`X-Protocol-Version` check, since ordinary browser navigation never sends
+that header, while every other existing route (`/health`, `/control/stop`,
+`/api/*`) is unaffected and unmoved. `ui/index.html`/`ui/app.js`/`ui/lib.mjs`/`ui/styles.css` are plain,
+dependency-free static files (no build step,
+no framework): every browser- or derived-record-owned string (titles,
+URLs, captured text, summary text, proposal rationale/payload, tag/
+collection names, ...) is rendered via `textContent` only through a small
+DOM-builder helper — the file never assigns `innerHTML`/`outerHTML` and
+never calls `document.write`/`eval`/`new Function` anywhere, and there is
+no inline `<script>` body, inline `<style>` block, or inline
+event-handler attribute in the page; every interaction is wired up via
+`addEventListener`. The owner token is obtained only via an explicit
+password-type input validated against the extension-independent, owner-only
+`owner.status` route, held only in an in-page JavaScript variable for as long as the page stays
+open (never the URL, `localStorage`, `sessionStorage`, a cookie, or a log
+statement), and discarded on reload or an explicit "Disconnect"; the page
+explains that Stage 4's separate, more restricted external-agent token
+does not work here. No new `store.*`/`browser.*` route was added — every
+action the page takes (listing windows/tabs/groups, `workflow.capture_tab`
+for an explicitly selected tab, paginated `browser.query_history` with
+visible complete/truncated/incomplete status, the existing bounded
+`store.captures.read` chunked-text route for capture detail, and the
+existing `store.*` list/delete/update routes) already existed from Stage
+2–4; only the five static-asset routes and owner-scope probe are new. Proposals show
+Accept/Reject buttons only while `state === "pending"`; clicking either
+disables both immediately (preventing a double submit), calls the
+owner-only `store.proposals.update` with the decision and
+`creatorType: "user"` as its own provenance, and then re-fetches the
+proposals list from the service rather than optimistically updating the
+clicked row locally, so the confirmed state shown is always the server's,
+never a local guess — nothing here ever applies a proposal's own
+suggested change. `test/ui.test.mjs` is new (route/header/traversal/
+no-log-leakage integration tests over a real `createService`, plus static
+source scans of the actual shipped UI files for the properties above);
+`test/smoke/stage1-bridge-smoke.mjs` gained a new Step 2.7 that seeds a
+fresh capture/summary and two fresh pending proposals through the scoped
+Stage 4 external-agent credential, opens the real `/ui/` page in Chrome
+for Testing, drives it via CDP `Runtime.evaluate` (setting the token
+field's value and calling `.click()` on the page's own buttons — the same
+technique this harness already uses for every other browser action), and
+confirms both an accept and a reject decision through the **owner's**
+own public HTTP API plus the seeded tab's continued, unmutated existence.
+
+An independent (Terra) review of that first Stage 5 implementation found
+seven concrete issues, all addressed in this revision (see README.md's
+"Remediation round (Terra findings)" under "Stage 5: the local review UI"
+for the itemized list and full description of each fix): (1) no
+Host-header defense against DNS rebinding — `service/server.mjs`'s new
+`checkHost` now rejects any request (UI, `/health`, `/control/stop`, every
+`/api/*` route, and the extension WebSocket upgrade) whose `Host` header
+is not exactly `127.0.0.1:<the port this connection is actually being
+served on>`, with a distinct `421 invalid_host`, checked before anything
+else; (2) the Connect flow depended on `browser.get_capabilities`, which
+round-trips through the extension (failing whenever it is disconnected)
+and is agent-allowed, so it neither worked while disconnected nor actually
+distinguished an owner token from an agent one — fixed with a new,
+extension-independent, owner-only `GET /api/owner.status` route, which
+Connect now uses first, with `/health` read immediately afterward as a
+separate fact; (3) `browserSessionId` handling was loose about where it
+could be adopted from and did not handle staleness explicitly — fixed so
+only a fresh `browser.list_windows` result may ever set it, and any
+`stale_session` outcome now tears down the entire windows/tabs/groups/
+capture-button tree and requires an explicit fresh "Load windows"; (4) no
+protection against async races (disconnect-during-request, a superseded
+capture-detail selection, an older list refresh overwriting a newer one)
+— fixed with `ui/lib.mjs`, a small native-ES-module (no framework, no
+build step) set of pure, DOM-free primitives (`createGenerationCounter`,
+`createListVersionGuard`, `createDecisionTracker`), deterministically unit
+tested with no browser at all in `test/ui-lib.test.mjs`, and threaded
+through every async handler in `ui/app.js`; (5) proposal decisions had no
+dedicated in-flight/committed tracking outside the rendered row and did
+not distinguish a retryable PATCH failure from an already-committed
+decision whose confirmation reread then failed — fixed via
+`createDecisionTracker`, a manual-refresh lockout while any decision is
+submitting, and a `createListVersionGuard`-backed `store.proposals.list`
+refresh; (6) tags had no assignment view at all — fixed with a per-tag
+"Load assignments" control calling the already-existing (but previously
+unused by this UI) `store.tags.assignments.list`; (7) accessibility gaps
+— dynamically created per-row status elements were not ARIA live regions,
+and no focus was moved on the capture-detail panel appearing or the
+proposals list re-rendering — fixed with a shared `role="status"
+aria-live="polite"` helper and explicit `.focus()` calls to
+`tabindex="-1"` headings. `test/host-defense.test.mjs` and
+`test/owner-status.test.mjs` are new; `test/ui.test.mjs` and
+`test/smoke/stage1-bridge-smoke.mjs`'s Step 2.7 were both extended
+(the latter gained a deterministic, real-browser connect/disconnect race
+check — synchronous back-to-back clicks, not timing, make it
+deterministic — proving a stale `browser.list_windows` response can never
+repopulate the UI after Disconnect).
+
+**Stage 5 verification:** the orchestrator ran `npm test` (331/331
+passing), the focused UI/security suite, `npm audit --omit=dev` (no
+vulnerabilities), syntax and diff checks, and the expanded real Chrome for
+Testing bridge smoke. The smoke drove owner authentication, proposal
+acceptance and rejection with confirmed rereads, and a disconnect race
+through the shipped UI. Independent Terra review findings were remediated;
+the Stage 5 checklist above is complete.
 
 ## Definition of done for any stage
 
