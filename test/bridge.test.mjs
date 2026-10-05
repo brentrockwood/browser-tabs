@@ -311,6 +311,19 @@ test("the websocket upgrade is rejected for an untrusted browser origin", async 
   });
 });
 
+test("the websocket upgrade is accepted from a Firefox moz-extension:// origin", async () => {
+  await withService({}, async (_service, port) => {
+    const ws = connectAsExtension(port, { origin: "moz-extension://firefox-test-uuid" });
+    const outcome = await new Promise((resolve) => {
+      ws.on("open", () => resolve("open"));
+      ws.on("unexpected-response", (_req, res) => resolve(`unexpected-response:${res.statusCode}`));
+      ws.on("error", () => resolve("error"));
+    });
+    assert.equal(outcome, "open");
+    ws.close();
+  });
+});
+
 test("the websocket connection is rejected and closed for an invalid pairing token", async () => {
   await withService({}, async (_service, port) => {
     const ws = connectAsExtension(port);

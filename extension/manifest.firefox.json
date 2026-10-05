@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Tabs (Deterministic Prototype)",
+  "version": "0.1.0",
+  "description": "Enumerates browser windows, tabs, and tab groups, reads explicit page-text snapshots, and queries browsing history.",
+  "permissions": ["tabs", "scripting", "storage", "alarms", "history"],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src ws://127.0.0.1:8743"
+  },
+  "background": {
+    "scripts": ["background.bundle.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "browser-tabs@brentrockwood.com",
+      "strict_min_version": "115.0"
+    }
+  },
+  "action": {
+    "default_title": "Browser Tabs"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}

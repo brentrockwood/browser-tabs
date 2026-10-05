@@ -164,8 +164,13 @@ function timingSafeTokenEquals(candidate, expected) {
   return timingSafeEqual(a, b);
 }
 
+// Browser-extension origin schemes only: `chrome-extension://` (Chrome-family)
+// and `moz-extension://` (Firefox sends this as the WebSocket Origin for a
+// background script). An ordinary web page cannot claim either scheme.
 function isTrustedExtensionOrigin(origin) {
-  return typeof origin === "string" && origin.startsWith("chrome-extension://");
+  return (
+    typeof origin === "string" && (origin.startsWith("chrome-extension://") || origin.startsWith("moz-extension://"))
+  );
 }
 
 // Stage 5 remediation: Host-header defense against DNS rebinding and

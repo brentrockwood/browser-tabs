@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Stage 6: "Add continuous unit tests" + "Verify that the service runs on
+  # Linux" (project.md). Runs the exact same commands on macOS and Linux —
+  # no OS-specific branching — so this is a real cross-platform proof, not
+  # merely a Linux-flavored label on a macOS-only job.
+  unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci
+      - run: npm run check:versions
+      - run: npm test
+      - run: npm audit --omit=dev
+      - name: Service lifecycle (start/status-via-health/authenticated write/restart/stop)
+        run: npm run check:service-lifecycle
+
+  # Stage 6: "repeatable browser smoke-test commands" / "browser jobs may
+  # install current Chromium/Firefox" (project.md). Best-effort: installing
+  # a real, GUI-capable Chromium and Firefox build (plus geckodriver) on a
+  # hosted CI runner is inherently more fragile than the unit-tests job
+  # above, so this job is allowed to fail without blocking the required
+  # unit-tests job, and the smoke scripts themselves already distinguish a
+  # real product failure (`SMOKE_FAIL`, exit 1) from an environment blocker
+  # (`SMOKE_BLOCKED`, exit 2) — see test/smoke/*.mjs's own header comments.
+  browser-smoke:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci
+      - name: Install Chromium and Firefox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser firefox
+      - name: Install geckodriver
+        run: |
+          tag="$(curl -fsSL https://api.github.com/repos/mozilla/geckodriver/releases/latest | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).tag_name))')"
+          curl -fsSL "https://github.com/mozilla/geckodriver/releases/download/${tag}/geckodriver-${tag}-linux64.tar.gz" -o geckodriver.tar.gz
+          tar -xzf geckodriver.tar.gz
+          sudo mv geckodriver /usr/local/bin/geckodriver
+          sudo chmod +x /usr/local/bin/geckodriver
+      - name: Chromium read-API smoke
+        env:
+          CHROME_PATH: /usr/bin/chromium-browser
+        run: npm run test:smoke
+      - name: Chromium bridge/Stage4/Stage5 smoke
+        env:
+          CHROME_PATH: /usr/bin/chromium-browser
+        run: npm run test:smoke:bridge
+      - name: Firefox read-API/Stage4/Stage5 smoke
+        env:
+          FIREFOX_PATH: /usr/bin/firefox
+        run: npm run test:smoke:firefox

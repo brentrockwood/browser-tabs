@@ -358,28 +358,28 @@ Browser-specific code should remain at the extension API boundary.
 
 Implementation:
 
-- [ ] Run the read API and review workflow in current Chrome and Firefox.
-- [ ] Test at least one additional Chromium browser without adding a separate
+- [x] Run the read API and review workflow in current Chrome and Firefox.
+- [x] Test at least one additional Chromium browser without adding a separate
   implementation for its brand.
-- [ ] Isolate tab-group differences behind capability reporting.
-- [ ] Document installation, pairing, startup, upgrade, backup, reset, and
+- [x] Isolate tab-group differences behind capability reporting.
+- [x] Document installation, pairing, startup, upgrade, backup, reset, and
   uninstall behavior on macOS.
-- [ ] Verify that the service runs on Linux even if desktop packaging remains
+- [x] Verify that the service runs on Linux even if desktop packaging remains
   a later task.
-- [ ] Add continuous unit tests and repeatable browser smoke-test commands.
-- [ ] Version the extension, service, API, and database schema deliberately.
-- [ ] Produce checksummed local release artifacts.
+- [x] Add continuous unit tests and repeatable browser smoke-test commands.
+- [x] Version the extension, service, API, and database schema deliberately.
+- [x] Produce checksummed local release artifacts.
 
 Phase 1 completion checklist:
 
-- [ ] A clean Mac installation reaches the review UI using documented steps.
-- [ ] Chromium and Firefox can list supported browser state and capture pages.
-- [ ] History, captures, derived records, and proposals retain provenance.
-- [ ] All payloads and queries have tested bounds.
-- [ ] Authentication and origin checks protect the loopback service.
-- [ ] The user can inspect and erase locally retained data.
-- [ ] No browser mutation API is exposed.
-- [ ] Automated tests pass and the manual release checklist is recorded.
+- [x] A clean Mac installation reaches the review UI using documented steps.
+- [x] Chromium and Firefox can list supported browser state and capture pages.
+- [x] History, captures, derived records, and proposals retain provenance.
+- [x] All payloads and queries have tested bounds.
+- [x] Authentication and origin checks protect the loopback service.
+- [x] The user can inspect and erase locally retained data.
+- [x] No browser mutation API is exposed.
+- [x] Automated tests pass and the manual release checklist is recorded.
 
 ## Phase 2: explicit browser actions
 
@@ -888,6 +888,35 @@ Testing bridge smoke. The smoke drove owner authentication, proposal
 acceptance and rejection with confirmed rereads, and a disconnect race
 through the shipped UI. Independent Terra review findings were remediated;
 the Stage 5 checklist above is complete.
+
+Stage 6 and Phase 1 are complete at this revision. The browser-specific
+boundary now produces Chrome and Firefox packages from the shared extension
+source. Firefox uses a classic `background.scripts` bundle, omits the
+unsupported `tabGroups` permission, allows only the fixed loopback WebSocket
+in its extension-page CSP, and reports tab-group support through the existing
+capability API. The bridge accepts both Chrome and Firefox extension origins;
+all other origins still fail.
+
+The release path now includes deterministic, checksummed Chrome, Firefox, and
+source archives; deliberate product/protocol/result/database version checks;
+a cross-platform service lifecycle check; and CI jobs for macOS, Linux, and
+best-effort browser smoke tests. Release files come from explicit allowlists,
+never include local credentials or databases, and are byte-identical for the
+same source. Custom output paths are bounded and replace stale output only
+after artifact construction succeeds.
+
+Verification completed on this revision: 381/381 unit and integration tests,
+`npm audit --omit=dev`, version/build/release checks, macOS and Linux-container
+service lifecycle checks, real Firefox read/capture/review workflow, real
+Chrome for Testing read and full bridge/restart workflow, and the shared read
+smoke (only) in Brave as the additional Chromium-family browser — the long
+bridge smoke is canonical on Chrome for Testing and hung under Brave, so
+Brave is not claimed to support the full bridge workflow. Firefox-specific
+transport and packaging failures found during the first run were fixed: the
+default MV3 CSP had upgraded the loopback `ws://` connection, and the options
+page needed its imported local modules included in the Firefox package. Terra
+review also drove credential-safe failure diagnostics, deterministic dirty-
+output replacement, and release-path containment before publication.
 
 ## Definition of done for any stage
 

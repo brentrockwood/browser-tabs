@@ -18,13 +18,25 @@ import { connectCdp } from "./cdp-socket.mjs";
 
 export { connectCdp };
 
-// Only auto-detects open-source Chromium: a locally installed, branded
-// Google Chrome (and, by the same restriction, branded Edge/Brave) is known
-// to silently ignore --load-extension and is not supported by this
-// automated path (see README). Chrome for Testing reliably supports it but
-// has no fixed install path, so point CHROME_PATH at one instead of guessing.
+// Only auto-detects open-source Chromium. A locally installed consumer Google
+// Chrome ignored the unpacked-extension flags in this project's environment,
+// so branded browsers are never auto-detected; whether any other browser
+// honors --load-extension depends on the exact build, and nothing here
+// brand-infers (see README). Chrome for Testing reliably supports it but has
+// no fixed install path, so point CHROME_PATH at one instead of guessing.
+//
+// Stage 6: CHROME_PATH takes priority when both are set (so CI's default
+// job, which only ever sets CHROME_PATH, is unaffected), but CHROMIUM_PATH
+// is checked next, before auto-detection — every one of this project's
+// smoke scripts therefore already supports running the *exact same* smoke
+// test against a second, distinct open-source Chromium-family build without
+// any new script or flag: set CHROMIUM_PATH instead of CHROME_PATH. See
+// README's "A second Chromium-family browser" section for why that second
+// binary must actually be a different build (not the same CHROME_PATH
+// binary under a second name) to mean anything.
 export function findChromeExecutable() {
   if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+  if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
 
   const candidates =
     {

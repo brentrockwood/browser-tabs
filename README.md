@@ -24,24 +24,32 @@ envelope (`schemaVersion`, `browserSessionId`, `sourceOperation`,
 
 ## Support boundary
 
-The code targets Manifest V3 WebExtensions. Today, only Chromium-family
-browsers are exercised by the test suite in this repository (see
-`test/smoke/chromium-smoke.mjs`); Firefox parity is a planned later milestone
-(project.md Stage 6) and is not yet tested. Browsers may refuse content
-access to internal pages, extension-store pages, or other protected
-contexts. Those cases are returned as explicit `unsupported` outcomes with a
-stable error code, never as empty or invented page content.
+The code targets Manifest V3 WebExtensions. Chromium-family browsers are
+exercised by `test/smoke/chromium-smoke.mjs` and
+`test/smoke/stage1-bridge-smoke.mjs`; Firefox is exercised by
+`test/smoke/firefox-smoke.mjs` (Stage 6 — see that section below for how it
+drives a real Firefox without CDP, and for the one real capability
+difference, `tabGroups`, which is feature-detected and reported, not
+assumed). Browsers may refuse content access to internal pages,
+extension-store pages, or other protected contexts. Those cases are
+returned as explicit `unsupported` outcomes with a stable error code, never
+as empty or invented page content.
 
 Within Chromium-family browsers, the automated smoke path has a narrower,
 evidence-based requirement: it needs a build that reliably honors
-`--load-extension` on the command line. A locally installed, branded Google
-Chrome (and, by the same restriction, branded Edge/Brave) is known to
-silently ignore `--load-extension` and is **not supported** by the automated
-smoke test; it is not auto-detected and is not a recommended `CHROME_PATH`
-target. What is proven to work is a Chrome for Testing binary
-(https://googlechromelabs.github.io/chrome-for-testing/) pointed to
-explicitly via `CHROME_PATH`; Chromium (the open-source build) is also
-expected to work and is the only browser this script auto-detects.
+`--load-extension` on the command line. Observed in this project's
+development environment: a locally installed consumer Google Chrome ignored
+the unpacked-extension flags, so it is **not supported** by the automated
+smoke test, is not auto-detected, and is not a recommended `CHROME_PATH`
+target. Whether another branded browser honors the flag depends on the exact
+build, so no brand is assumed either way. What is proven to work is a Chrome
+for Testing binary (https://googlechromelabs.github.io/chrome-for-testing/)
+pointed to explicitly via `CHROME_PATH`, which is the canonical target for
+both Chromium smoke scripts; Chromium (the open-source build) is also
+expected to work and is the only browser this script auto-detects. The
+shared read smoke (`npm run test:smoke`) additionally passed against a
+current Brave build via `CHROMIUM_PATH` (see "A second Chromium-family
+browser"); that is the extent of the Brave claim.
 
 ## Stage 1: the local bridge
 
@@ -143,7 +151,7 @@ a browser-API failure) still returns HTTP 200 with the outcome encoded in
 
 The extension's own WebSocket connection is authenticated the same way (an
 `auth` message carrying the token and protocol version) and is only
-accepted from a `chrome-extension://` origin; any other origin — including
+accepted from a `chrome-extension://` or (Firefox) `moz-extension://` origin; any other origin — including
 a page served from `localhost` — is rejected at the HTTP upgrade (`403`)
 before a WebSocket is ever established. The server never dispatches a
 request to that connection until *after* it has sent `auth_ok`; the
@@ -571,8 +579,9 @@ any route exercised. See project.md's Stage 2 checklist (now checked) and
 its "Current verification status (Stage 2)" section for the itemized
 evidence.
 
-Honest limits, unchanged by this verification: Firefox parity is still
-Stage 6, not claimed here; history pagination can still be inconsistent
+Honest limits, unchanged by this verification: this verification itself is
+Chromium-only — see "Stage 6: Firefox parity and local release" below for
+the separate real-Firefox smoke proof; history pagination can still be inconsistent
 across two page requests if history mutates between them; reaching the
 per-page scan ceiling yields an explicit `incomplete` outcome rather than a
 silently wrong page; and the discarded-tab smoke outcome depends on the
@@ -1761,6 +1770,386 @@ rejection, confirmed rereads, and a disconnect race through the shipped UI.
 Independent Terra review findings were remediated at the server and UI trust
 boundaries. The Stage 5 checklist in project.md is complete.
 
+## Stage 6: Firefox parity and local release
+
+Stage 6 closes Phase 1: Firefox parity for the read API and the Stage 4/5
+review workflow, a second Chromium-family browser proof, macOS operating
+docs, Linux service verification, deliberate versioning, and a deterministic
+local release script. Browser-specific code stays at the extension API
+boundary (project.md): `client/` and `ui/` did not change for this stage,
+and the one `service/` change is the WebSocket origin check in
+`service/server.mjs`, which now accepts `moz-extension://` (Firefox's
+extension origin) in addition to `chrome-extension://`. Every other origin
+is still rejected with `403`, and Host-header and token authentication are
+unchanged.
+
+### Firefox parity, at the build boundary
+
+`extension/` is still one source tree. Chrome's Manifest V3 background
+shape — an ES-module `service_worker` — is not Firefox's current, reliably
+supported MV3 background shape; Firefox's is a classic (non-module)
+`background.scripts` event page. Rather than add a second hand-maintained
+copy of `service-worker.js`/`service-client.js`/`protocol.js`, or reach for
+a general-purpose bundler, `build/build-extension.mjs` is a small,
+dependency-free, in-repo bundler that only has to handle the one narrow
+shape those three files actually use (plain ES modules, only static named
+imports/exports, no renaming or default exports): it strips each file's own
+`import`/`export` statements and concatenates them, in dependency order,
+into `background.bundle.js`.
+
+- `node build/build-extension.mjs` (or `npm run build:extension`) writes
+  `dist/extension/chrome/` (the source files, unchanged — Chrome's own
+  `manifest.json`, `service-worker.js` as an ES module, `service-client.js`,
+  `protocol.js`, `options.html`, `options.js`) and `dist/extension/firefox/`
+  (`extension/manifest.firefox.json` copied to `manifest.json`,
+  `background.bundle.js`, and the same `options.html`/`options.js` — options
+  pages are ordinary extension pages, which both browsers already support as
+  ES modules, so they need no bundling).
+- `extension/manifest.firefox.json` is the Firefox manifest source: it
+  omits the `tabGroups` permission (Firefox has no such API) and declares a
+  fixed `browser_specific_settings.gecko.id` so a temporary install has a
+  stable identity.
+- Both manifest sources must already agree with `package.json`'s version
+  (see "Versioning" below); the build refuses to produce a package from a
+  mismatched manifest rather than silently rewriting it.
+- `test/build-extension.test.mjs` proves this is not merely
+  text-transformation: it actually runs the generated Firefox bundle in a
+  fresh V8 context (`node:vm`) against a mock of the WebExtension `browser`
+  namespace modeled on Firefox (no `tabGroups`), and confirms it initializes
+  without throwing and registers the real `runtime.onMessage` listener —
+  the strongest proof available without a real browser. It also proves both
+  builds are byte-for-byte deterministic across repeated runs.
+
+Load `dist/extension/chrome/` or `dist/extension/firefox/` unpacked exactly
+like `extension/` itself (see "macOS: installation and operation" below).
+
+### Capability reporting across browsers
+
+`browser.get_capabilities` (Stage 2) already feature-detects every
+capability it reports — `Boolean(browserApi.tabGroups)`, not a browser-name
+check — so Firefox reports `tabGroups: false` while `history`, `scripting`,
+windows, tabs, and `read_tab` all continue to work exactly as on Chrome.
+Stage 6 added no new capability-detection logic; it only proved the existing
+detection against a real Firefox (see "Real-browser Firefox smoke test"
+below) and removed the now-redundant `tabGroups` permission from the
+Firefox manifest source.
+
+### A second Chromium-family browser
+
+Every existing Chromium smoke script (`test/smoke/chromium-smoke.mjs`,
+`test/smoke/stage1-bridge-smoke.mjs`) already resolves its browser binary
+through `findChromeExecutable()` in `test/smoke/chrome-harness.mjs`, which
+now checks `CHROME_PATH` first and `CHROMIUM_PATH` second. This means every
+one of those scripts already supports running the exact same smoke test
+against a second, distinct open-source Chromium-family build with no new
+script, flag, or code path — set `CHROMIUM_PATH` instead of `CHROME_PATH`:
+
+```sh
+CHROMIUM_PATH=/path/to/a/different/chromium/build npm run test:smoke
+```
+
+This is only a meaningful second proof if that binary is a genuinely
+different build from whatever `CHROME_PATH` (or auto-detection) would have
+found — for example, a plain Chromium build alongside a separately
+downloaded Chrome for Testing binary, not the same binary pointed to by two
+env var names. The project does not brand-infer anything from either
+binary's name; both are driven through the identical CDP harness and
+exercise the identical `browser.*` routes.
+
+What has actually been run, so the claim stays exact:
+
+- **Shared read smoke (`npm run test:smoke`)**: passed with
+  `CHROMIUM_PATH=/Applications/Brave Browser.app/...` against a current
+  Brave. This is the project's "one additional Chromium-family browser"
+  evidence, and it is **read smoke only**.
+- **Full bridge/restart smoke (`npm run test:smoke:bridge`)**: its canonical
+  target is Chrome for Testing, where it passes. Run under Brave it hung, so
+  Brave is **not** claimed to support the full bridge workflow.
+- A locally installed consumer Google Chrome ignored the unpacked-extension
+  flags in this environment, so it was not used for either smoke script.
+
+### Real-browser Firefox smoke test
+
+`test/smoke/firefox-smoke.mjs` (`npm run test:smoke:firefox`) is Firefox's
+counterpart to the Chrome-family bridge smoke test. Firefox has no CDP
+equivalent, so it drives Firefox through **geckodriver** — Mozilla's own
+WebDriver server for Firefox — via a small, dependency-free WebDriver HTTP
+client (`test/smoke/webdriver-client.mjs`), rather than a new npm
+dependency. It proves, against a real, current Firefox:
+
+1. The real, built Firefox package (`build/build-extension.mjs`'s
+   `buildFirefoxExtension` output — the same thing an operator would load)
+   installs as a temporary add-on via geckodriver's `moz/addon/install`
+   extension command (the automated equivalent of about:debugging's "Load
+   Temporary Add-on" button); temporary installs bypass signature
+   verification entirely, the same as that manual flow.
+2. Pairing: a test-only content script (never part of the real package —
+   injected only into this test's own staged copy, matching only the local
+   fixture server's host) calls `browser.storage.local.set({ serviceToken
+   })` directly — content scripts already have access to `storage` (an
+   existing permission) and `runtime.sendMessage` (talking only to their own
+   extension's background), so this needs no new permission and no lookup
+   of Firefox's internal `moz-extension://` UUID. The token itself travels
+   in the fixture page's own URL query string, which the test server already
+   controls.
+3. The Stage 2 read API — `browser.list_windows`, `browser.list_tabs`,
+   `browser.read_tab` (against a real page whose rendered text embeds an
+   adversarial instruction), `browser.get_capabilities` (asserting
+   `tabGroups: false`, `history: true`, `scripting: true`), and
+   `browser.query_history` — all exercised through that same content
+   script's real `browser.runtime.sendMessage` calls against the real
+   background script, never by importing `service-worker.js`'s functions.
+4. `workflow.capture_tab` (Stage 4) persists a real capture from that read.
+5. The real `/ui/` review page (Stage 5), opened as an ordinary page in the
+   same Firefox and driven via WebDriver script execution (no extension
+   privilege needed — it is plain HTTP served by the service, not an
+   extension page), accepts one pending proposal and rejects another through
+   its own Accept/Reject buttons; both decisions are confirmed through the
+   owner's own public HTTP API, exactly as the Chrome-family bridge smoke
+   test confirms its own Stage 5 proof.
+
+Env:
+
+- `FIREFOX_PATH` — path to a current Firefox binary. If unset, the first
+  existing conventional path is used: `/Applications/Firefox.app/Contents/MacOS/firefox`
+  on macOS, or `/usr/bin/firefox` then `/usr/lib/firefox/firefox` on Linux.
+  There is no default on Windows, and a Firefox installed elsewhere (a
+  Snap/Flatpak package, a custom prefix) is not found — set `FIREFOX_PATH`
+  explicitly in those cases.
+- `GECKODRIVER_PATH` — path to a geckodriver binary (default: `geckodriver`
+  on `PATH`). Install from
+  <https://github.com/mozilla/geckodriver/releases> or a system package
+  manager.
+- `SMOKE_HEADLESS=false` to run headed.
+
+Like every other smoke script in this project, it prints `SMOKE_PASS`,
+`SMOKE_FAIL` (exit 1 — a real product assertion failed), or `SMOKE_BLOCKED`
+(exit 2 — Firefox or geckodriver could not be found/started, or a setup
+timeout occurred) with the specific reason, and never runs any browser
+mutation, remote call, or model call.
+
+### Versioning
+
+This project has exactly one **product version** — `package.json`'s
+`"version"` — mirrored into `extension/manifest.json` (Chrome) and
+`extension/manifest.firefox.json` (Firefox). `node scripts/check-versions.mjs`
+(`npm run check:versions`) checks all three for exact equality and reports
+the current value of every other, deliberately *independent* version field
+below; `test/versions.test.mjs` runs the same check as part of `npm test`.
+`build/build-extension.mjs` and `build/release.mjs` both refuse to build
+from a mismatched manifest.
+
+The product version is intentionally the only one of these that is "one
+number everywhere." The others are separate compatibility contracts that
+change only when their own compatibility rules require it — conflating them
+with the product version would force a version bump (or a false sense of
+compatibility) unrelated to what actually changed:
+
+| Field | Where | Bump when |
+| --- | --- | --- |
+| Product version | `package.json`, both extension manifests | Any release; purely informational otherwise. |
+| `PROTOCOL_VERSION` (`extension/protocol.js`) | Every request/response envelope, both the HTTP API and the extension↔service WebSocket | A breaking wire-format or session/handle-requirement change — see its own doc comment for the Stage 2 precedent. Old and new major versions must never be silently treated as compatible. |
+| `RESULT_SCHEMA_VERSION` (`extension/protocol.js`) | Every `browser.*` result's capture-provenance envelope | The envelope's own shape changes within the same `PROTOCOL_VERSION` major version (unknown fields are otherwise tolerated — see project.md's protocol rules). |
+| DB schema version | `service/store.mjs`'s `MIGRATIONS`, highest `version` | Any change to the derived store's schema — always as a new, forward-only, numbered migration (never an edit to an already-shipped one); see "Migrations and backups" above. A `breaking: true` migration backs up the database first. |
+
+Avoid bumping any of these without a real compatibility reason: this
+project does not version defensively, and an unnecessary migration or
+protocol bump has its own cost (see project.md's Stage 3 "avoid unnecessary
+migration" framing, which this generalizes to every version field here).
+
+### Deterministic local release
+
+`node build/release.mjs` (`npm run release`) writes, under
+`dist/release/` by default:
+
+- `browser-tabs-chrome-extension-<version>.zip`
+- `browser-tabs-firefox-extension-<version>.zip`
+- `browser-tabs-source-<version>.zip` — enough service/extension/UI source
+  to run `npm ci && npm run service -- start` from, under a single
+  `browser-tabs-<version>/` top-level directory.
+- `checksums.sha256` — `sha256sum`-compatible checksums of the three zips.
+- `manifest.json` — version, `PROTOCOL_VERSION`, `RESULT_SCHEMA_VERSION`,
+  DB schema version, and each artifact's checksum/byte size together. It
+  carries no build timestamp, so the whole output directory is
+  byte-identical across repeated builds.
+
+An optional argument (`node build/release.mjs <outDir>`) overrides the
+output directory; an absolute path is used as given and a relative one is
+resolved against the current directory. All build work happens in a private
+temp directory that is removed before the script returns, never beside
+`<outDir>`. Only after every artifact has been built successfully is
+`<outDir>` replaced, and `<outDir>` must be new, empty, or a previous
+release recognized by the `"format": "browser-tabs-release-v1"` marker that
+every release `manifest.json` carries (a constant, so the manifest stays
+deterministic). Any other non-empty directory is refused before anything is
+deleted, with an error that never echoes its content — this includes the
+`dist/release` default if it holds something else, or output from a build
+that predates the marker (remove it yourself once). Everything inside a
+recognized prior release (stale files, old archives, subdirectories) is
+removed, so it produces exactly the same output as a clean directory, and a
+failed build leaves the previous output untouched. Nothing outside
+`<outDir>` is ever deleted. The release
+script refuses the filesystem root, the current directory, the repository,
+the home and system temp directories (or any directory containing one of
+them), any repository directory other than a subdirectory of `dist/`, and a
+symlink or regular file as `<outDir>`.
+
+No credential, database, or local data-directory path is ever read or
+included: every archive is built from an explicit, named allowlist of
+repository source files (never a directory walk over this checkout's actual
+working tree), and a second, independent filename-pattern check
+(`credential`, `agent-token`, `*.db`, `*.pid`, `*.port`) runs over every
+entry regardless, before anything is written.
+
+Determinism comes from `build/zip.mjs`, a small, dependency-free ZIP writer
+(Node's built-in `zlib` for DEFLATE, a local CRC-32 table) rather than
+shelling out to a platform `zip`/`tar` binary, whose availability, default
+flags, and mtime handling vary across macOS and Linux. Every entry's
+timestamp is a fixed constant and entries are always sorted by name, so two
+builds from byte-identical source content always produce byte-identical
+archives on any platform Node runs on — proven by
+`test/release.test.mjs`'s own repeated-build comparison. The same test file
+also checks each archive's contents/exclusions, version consistency, and
+recomputed checksums against the written `checksums.sha256`/`manifest.json`.
+
+### Linux service verification and continuous integration
+
+`node scripts/service-lifecycle-check.mjs` (`npm run check:service-lifecycle`)
+needs no browser or extension at all: it starts the real
+`service/cli.mjs` as a child process, confirms `/health`, creates a tag
+through the authenticated store API, stops the service, starts it again
+against the *same* data directory, confirms the tag survived the restart
+(local store persistence), and stops it again — exactly as meaningful run on
+Linux as on macOS, since nothing in it is platform-specific.
+
+`.github/workflows/ci.yml` runs `npm run check:versions`, `npm test`,
+`npm audit --omit=dev`, and this lifecycle check on both `ubuntu-latest` and
+`macos-latest` on every push/PR. A second, best-effort job installs a real
+Chromium, Firefox, and geckodriver on `ubuntu-latest` and runs all three
+real-browser smoke scripts; it is allowed to fail independently of the
+required unit-tests job, since installing GUI browsers on a hosted runner is
+inherently more fragile than the dependency-free checks above — the smoke
+scripts' own `SMOKE_BLOCKED` (environment) vs. `SMOKE_FAIL` (product)
+distinction still applies there.
+
+### macOS: installation and operation
+
+This section documents the full local lifecycle on macOS, the project's
+primary target per project.md's "Direction." Nothing here requires signing,
+notarization, or an app bundle — Phase 1 is a local developer-style
+installation, not packaged desktop distribution (project.md's "Later work").
+
+**Install:**
+
+```sh
+git clone <this repository> browser-tabs
+cd browser-tabs
+npm install   # requires Node.js 24+ (engines.node in package.json)
+```
+
+**Build and load the extension:**
+
+```sh
+npm run build:extension
+```
+
+- Chrome: open `chrome://extensions`, enable "Developer mode," click "Load
+  unpacked," and select `dist/extension/chrome/` (or `extension/` directly —
+  they are identical for Chrome; the build step only matters for Firefox).
+- Firefox: open `about:debugging#/runtime/this-firefox`, click "Load
+  Temporary Add-on…", and select `dist/extension/firefox/manifest.json`.
+  Firefox removes a temporary add-on when it quits; reload it the same way
+  after restarting Firefox for development. (The real Firefox *package*
+  artifact produced by `npm run release`, below, is a zip of this same
+  directory — useful for distribution, not for this unpacked load step.)
+
+**Start the service and pair:**
+
+```sh
+npm run service -- start
+```
+
+First run prints a one-time **owner** pairing token and a separate,
+scoped **external-agent** token (Stage 4) — copy the owner token. Open the
+extension's options page through the browser's extension-management page
+(`chrome://extensions` → this extension → "Details" → "Extension options";
+`about:addons` → this extension → "Preferences"/"Options"). The toolbar icon
+does not open it. Paste the owner token and click "Save." The extension connects over its fixed loopback
+WebSocket target immediately; no restart needed. Re-display either token
+later with `npm run service -- show-token` / `show-agent-token` — neither is
+printed again automatically.
+
+**Startup, status, and stop:**
+
+```sh
+npm run service -- start    # foreground; prints its own one-time tokens on first run
+npm run service -- status   # probes the real health endpoint, not a trusted PID file
+npm run service -- stop     # authenticated shutdown over the loopback API
+```
+
+`status`/`stop` both verify the process on the recorded port is actually
+this project's service (via `/health`'s own shape) before reporting
+anything, so a stale or unrelated process never produces a false positive.
+
+**Using the review UI:**
+
+With the service running and the extension paired, open
+`http://127.0.0.1:8743/ui/` in Chrome or Firefox, paste the **owner** token
+(not the external-agent token — see "Stage 5: the local review UI" above
+for why it will not work there) into "Owner token," and click "Connect."
+From there: load windows/tabs/groups, select tabs to capture, browse
+captures/summaries/proposals/tags/collections/queue, accept or reject
+proposals, and clear stored data — see "What the page shows and does" above
+for the full inventory.
+
+**Upgrade:**
+
+```sh
+git pull
+npm install
+npm run build:extension   # if you load the built, not the source, directory
+```
+
+Reload the extension (Chrome: "Reload" on `chrome://extensions`; Firefox:
+re-run "Load Temporary Add-on…", or just restart Firefox if loaded that
+way) and restart the service (`npm run service -- stop` then `start`). The
+pairing token is unaffected by an upgrade — no re-pairing needed. The
+service's SQLite database is migrated forward automatically on the next
+`start` (see "Migrations and backups" above); a breaking migration backs up
+the database file first, under the same data directory, before touching it.
+
+**Database backup and reset:**
+
+- **Manual backup:** stop the service, then copy
+  `~/.browser-tabs/browser-tabs.db` (and any `browser-tabs.db.backup-*`
+  files already created by a prior breaking migration) elsewhere. The data
+  directory can be overridden for testing via `BROWSER_TABS_DATA_DIR`.
+- **Automatic backup:** already happens on any breaking migration (see
+  above) — no manual step needed for an in-place upgrade.
+- **Reset (erase all captures and derived records, keep pairing):** use the
+  review UI's "Clear stored data" button (Stage 5), or
+  `POST /api/store.clear` with the owner token. This erases content from
+  this application's own managed database and backup files — not a claim
+  of defeating physical-machine forensic recovery — and does not remove the
+  pairing credential itself.
+
+**Uninstall and local-data removal:**
+
+1. `npm run service -- stop`.
+2. Remove the extension from the browser (Chrome: "Remove" on
+   `chrome://extensions`; Firefox: temporary installs disappear on quit, or
+   remove manually from `about:addons`).
+3. Delete the local data directory entirely (the SQLite database, its
+   backups, and both credential files):
+   ```sh
+   rm -rf ~/.browser-tabs
+   ```
+4. Delete the cloned repository directory itself if no longer needed.
+
+No other local state exists: the service binds only to loopback, writes
+nothing outside `~/.browser-tabs` (or `BROWSER_TABS_DATA_DIR`, if set), and
+this project makes no other network or remote calls.
+
 ## Local development
 
 Load `extension/` as an unpacked extension in a Chromium browser. Stage 1 adds
@@ -1794,14 +2183,17 @@ lower version requirement for `npm test` or any other script.
 
 It also needs a browser binary that reliably honors `--load-extension`: set
 `CHROME_PATH` to a Chrome for Testing binary (proven to work) or rely on
-auto-detected Chromium. A locally installed branded Google Chrome, Edge, or
-Brave is known to silently ignore `--load-extension` and is deliberately not
-auto-detected or recommended as `CHROME_PATH`; pointing `CHROME_PATH` at one
-will run, but is unsupported — once Chrome has launched and exposed CDP, the
-extension's service worker never loading (as happens when `--load-extension`
-was silently ignored) is reported as `SMOKE_FAIL`, not `SMOKE_BLOCKED`, since
-at that point the script cannot distinguish "unsupported browser" from a real
-startup regression. Set `SMOKE_HEADLESS=false` to run headed.
+auto-detected Chromium. In this project's development environment a locally
+installed consumer Google Chrome ignored the unpacked-extension flags, so
+branded browsers are deliberately not auto-detected. Pointing `CHROME_PATH`
+or `CHROMIUM_PATH` at a browser that ignores `--load-extension` will run,
+but the extension's service worker never loads — once the browser has
+launched and exposed CDP, that is reported as `SMOKE_FAIL`, not
+`SMOKE_BLOCKED`, since at that point the script cannot distinguish an
+unsupported browser from a real startup regression. A current Brave build
+passed this read smoke via `CHROMIUM_PATH`; that is read smoke only (the
+long bridge smoke is canonical on Chrome for Testing and hung under Brave).
+Set `SMOKE_HEADLESS=false` to run headed.
 
 The script prints `SMOKE_PASS`, `SMOKE_FAIL` (a product assertion failed, the
 `runtime.sendMessage` exercise itself threw, or the extension's service
@@ -1811,3 +2203,14 @@ behaved incorrectly, or an unsupported browser was used), or `SMOKE_BLOCKED`
 all, e.g. no suitable browser found, an invalid `CHROME_PATH` that failed to
 launch, or a CDP/setup timeout before the browser was reachable) with the
 specific reason, and exits non-zero on anything other than a pass.
+
+Set `CHROMIUM_PATH` instead of `CHROME_PATH` to run the identical smoke test
+against a second, distinct open-source Chromium-family build; run
+`npm run test:smoke:firefox` for the Firefox counterpart (via geckodriver,
+not CDP); run `npm run build:extension` to produce both browsers' packages,
+`npm run check:versions` to check product-version consistency, and
+`npm run release` to produce checksummed local release artifacts; run
+`npm run check:service-lifecycle` to verify the service's own start/status/
+stop/restart-persistence behavior with no browser at all (meaningful on
+Linux as well as macOS). See "Stage 6: Firefox parity and local release"
+above for the full documentation of all of these.

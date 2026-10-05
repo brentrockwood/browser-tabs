@@ -11,6 +11,11 @@
     "test:store": "node --test test/store.test.mjs test/store-routes.test.mjs",
     "test:smoke": "node test/smoke/chromium-smoke.mjs",
     "test:smoke:bridge": "node test/smoke/stage1-bridge-smoke.mjs",
+    "test:smoke:firefox": "node test/smoke/firefox-smoke.mjs",
+    "build:extension": "node build/build-extension.mjs",
+    "check:versions": "node scripts/check-versions.mjs",
+    "check:service-lifecycle": "node scripts/service-lifecycle-check.mjs",
+    "release": "node build/release.mjs",
     "service": "node service/cli.mjs",
     "client": "node client/cli.mjs"
   },

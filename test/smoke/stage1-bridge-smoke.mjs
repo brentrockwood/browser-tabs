@@ -698,7 +698,7 @@ async function main() {
   if (!chromePath) {
     blocked(
       "no Chromium executable auto-detected, and CHROME_PATH is not set. See README for supported browsers " +
-        "(Chrome for Testing or open-source Chromium; branded Chrome/Edge/Brave are not supported here).",
+        "(Chrome for Testing is the canonical target; open-source Chromium is also auto-detected).",
     );
     return;
   }

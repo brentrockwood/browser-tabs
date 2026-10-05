@@ -17,9 +17,18 @@
 //
 // Env:
 //   CHROME_PATH     path to a Chrome for Testing or Chromium executable.
-//                    Only open-source Chromium is auto-detected; a locally
-//                    installed branded Chrome/Edge/Brave is known to
-//                    silently ignore --load-extension and is not supported.
+//                    Only open-source Chromium is auto-detected. A consumer
+//                    Google Chrome ignored the unpacked-extension flags in
+//                    this project's environment; whether another branded
+//                    browser honors --load-extension depends on the build
+//                    (a current Brave passed this read smoke).
+//   CHROMIUM_PATH   checked if CHROME_PATH is unset (see
+//                    chrome-harness.mjs's findChromeExecutable) — set this
+//                    instead of CHROME_PATH to run this exact smoke test
+//                    against a second, distinct open-source Chromium-family
+//                    build (Stage 6's "one additional Chromium browser"
+//                    requirement); it must be a genuinely different build,
+//                    not the same binary under a second env var name.
 //   SMOKE_HEADLESS  "false" to run headed (default: headless)
 //
 // Exit codes:
@@ -83,7 +92,7 @@ async function main() {
   if (!chromePath) {
     blocked(
       "no Chromium executable auto-detected, and CHROME_PATH is not set. A locally installed branded " +
-        "Chrome/Edge/Brave is known to silently ignore --load-extension and is not supported here; set " +
+        "Chrome is not auto-detected (a consumer Google Chrome ignored the unpacked-extension flags here); set " +
         "CHROME_PATH to a Chrome for Testing binary " +
         "(https://googlechromelabs.github.io/chrome-for-testing/) or an open-source Chromium build, then re-run.",
     );
@@ -123,10 +132,10 @@ async function main() {
 
     // Once the browser has launched and CDP is reachable, failing to find
     // this extension's service worker is a product/startup regression, not
-    // an infrastructure problem — including when CHROME_PATH points at an
-    // unsupported, branded Chrome/Edge/Brave build that silently ignored
-    // --load-extension (see README): from here on that is a real failure to
-    // report, not a weaker "blocked" classification.
+    // an infrastructure problem — including when the browser at CHROME_PATH
+    // silently ignored --load-extension (as a consumer Google Chrome did in
+    // this project's environment; see README): from here on that is a real
+    // failure to report, not a weaker "blocked" classification.
     let found;
     try {
       found = await findExtensionServiceWorker(port, expectedExtensionName);

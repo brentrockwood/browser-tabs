@@ -1,3 +1,11 @@
 .DS_Store
 web-ext-artifacts/
 node_modules/
+dist/
+
+# A global gitignore on some machines ignores every `build/` directory; this
+# repo's build/ holds tracked release tooling (build-extension.mjs,
+# release.mjs, zip.mjs), so re-include it explicitly. Repo-local rules take
+# precedence over core.excludesFile.
+!/build/
+!/build/*.mjs
