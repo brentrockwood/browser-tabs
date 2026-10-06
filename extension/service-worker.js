@@ -3,29 +3,26 @@ import {
   ERROR_CODES,
   MAX_HISTORY_RESULTS,
   MAX_HISTORY_SCAN,
-  MAX_MOVE_TABS,
   MAX_TAB_GROUPS_RETURNED,
   MAX_TABS_RETURNED,
   MAX_TEXT_CHARACTERS,
   MAX_WINDOWS_RETURNED,
-  PROTOCOL_VERSION,
   TAB_GROUP_ID_NONE,
   captureEnvelope,
   compareHistoryEntries,
   isValidHandle,
   isValidSessionId,
-  isValidTabRecord,
   isValidTimestamp,
-  normalizeArchiveConfig,
-  normalizeGroupConfig,
-  normalizeMoveConfig,
+  normalizeCreateTabGroupRequest,
   normalizeHistoryEntry,
-  normalizeOpenUrl,
+  normalizeMoveTabsRequest,
   normalizeTab,
   normalizeTabGroup,
+  normalizeUpdateTabGroupRequest,
   normalizeWindow,
   pageTextSnapshot,
   requestError,
+  tabGroupMembership,
 } from "./protocol.js";
 import { createServiceClient } from "./service-client.js";
 
@@ -424,549 +421,298 @@ export async function queryHistory({ startTime, endTime, maxResults, cursor } = 
   }
 }
 
-// Lets a client check what this browser supports before calling a
-// capability-dependent method, instead of inferring support from brand name
-// (project.md Stage 2).
-export async function getCapabilities() {
-  await sessionReady;
-  const op = "browser.get_capabilities";
-  return {
-    ...envelope(op, "ok"),
-    protocolVersion: PROTOCOL_VERSION,
-    tabGroups: Boolean(browserApi.tabGroups),
-    history: Boolean(browserApi.history),
-    scripting: Boolean(browserApi.scripting),
-    maxTextCharacters: MAX_TEXT_CHARACTERS,
-    maxWindowsReturned: MAX_WINDOWS_RETURNED,
-    maxTabsReturned: MAX_TABS_RETURNED,
-    maxTabGroupsReturned: MAX_TAB_GROUPS_RETURNED,
-    maxHistoryResults: MAX_HISTORY_RESULTS,
-  };
-}
-
-// Phase 2 Action 1: opens `url` in one new tab — the extension's only
-// browser mutation. The service sends this only after the owner approved a
-// stored preview; this function still trusts nothing it was sent:
-//
-// - `callerSessionId` must be the current browser session, checked here, with
-//   no `await` between that check and `tabs.create`, so a preview taken
-//   before a browser restart can never open anything (`stale_session`,
-//   `created: false`, no mutation).
-// - `url` is re-validated with the same rules the preview used and must
-//   already be in normalized form, so the tab opened is exactly the URL the
-//   owner was shown.
-// - `tabs.create` is called at most once and never retried. Its result is
-//   not trusted as the outcome: the new tab is re-read with `tabs.get` and
-//   that is what is reported. If the create succeeded but the re-read did
-//   not, the result is the explicit partial outcome (`incomplete`,
-//   `observe_failed`, `created: true`) rather than a failure — retrying would
-//   open a second tab.
-export async function openTab(url, callerSessionId) {
-  await sessionReady;
-  const op = "browser.open_tab";
-  const refuse = (result) => ({ ...result, created: false });
-
-  const sessionError = checkSession(op, callerSessionId);
-  if (sessionError) return refuse(sessionError);
-
-  const checked = normalizeOpenUrl(url);
-  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
-  if (checked.url !== url) {
-    return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, "url must already be in normalized form"));
-  }
-
-  let created;
-  try {
-    created = await browserApi.tabs.create({ url, active: true });
-  } catch (error) {
-    return refuse(errorResult(op, ERROR_CODES.OPEN_TAB_FAILED, errMsg(error)));
-  }
-
-  const tabId = isValidHandle(created?.id) ? created.id : null;
-  const windowId = isValidHandle(created?.windowId) ? created.windowId : null;
-  const partial = (detail) => ({
-    ...envelope(op, "incomplete"),
-    code: ERROR_CODES.OBSERVE_FAILED,
-    detail,
-    created: true,
-    tabId,
-    windowId,
-  });
-  if (tabId === null) return partial("tabs.create returned no usable tab id, so the new tab could not be observed");
-
-  let observed;
-  try {
-    observed = await browserApi.tabs.get(tabId);
-  } catch (error) {
-    return partial(errMsg(error));
-  }
-  const tab = normalizeTab(observed ?? {});
-  if (tab.tabId !== tabId || !isValidTabRecord(tab)) {
-    return partial("tabs.get did not return the tab that was just created");
-  }
-
-  return {
-    ...envelope(op, "ok"),
-    created: true,
-    requestedUrl: url,
-    tab,
-    pendingUrl: typeof observed.pendingUrl === "string" ? observed.pendingUrl : null,
-  };
-}
-
-// Phase 2 Action 2 needs both the `tabGroups` API and `tabs.group`, each
-// feature-detected (never inferred from the browser's name): a browser
-// without them answers `unsupported` before anything is read or changed.
+// The tab-group mutations need the `tabGroups` API plus `tabs.group` and
+// `tabs.ungroup`, each feature-detected (never inferred from the browser's
+// name): a browser without them answers `unsupported` before anything is read
+// or changed.
 function groupsSupported() {
-  return Boolean(browserApi.tabGroups) && typeof browserApi.tabs?.group === "function";
+  return Boolean(browserApi.tabGroups) && typeof browserApi.tabs?.group === "function" && typeof browserApi.tabs?.ungroup === "function";
 }
 
 function unsupportedGroups(op) {
   return {
     ...envelope(op, "unsupported"),
     code: ERROR_CODES.UNSUPPORTED_FEATURE,
-    detail: "tab groups cannot be created or configured in this browser",
+    detail: "tab groups cannot be created or changed in this browser",
   };
 }
 
-// Phase 2 Action 2, read-only: reports the one tab (`tabId`) or group
-// (`groupId`) a preview is about, so the service can bind the preview to the
-// handle's current state and to this browser session (the envelope's
-// `browserSessionId`, which is how the service learns it — never from a
-// caller). Mutates nothing.
-export async function inspectGroupTarget(tabId, groupId) {
-  await sessionReady;
-  const op = "browser.inspect_group_target";
-  const wantsTab = tabId !== undefined && tabId !== null;
-  const wantsGroup = groupId !== undefined && groupId !== null;
-  if (wantsTab === wantsGroup || (wantsTab && !isValidHandle(tabId)) || (wantsGroup && !isValidHandle(groupId))) {
-    return errorResult(op, ERROR_CODES.INVALID_PARAMS, "exactly one of tabId or groupId is required, as a non-negative safe integer");
-  }
-  if (!groupsSupported()) return unsupportedGroups(op);
+// Mutation outcomes, each stating `changed` (see isValidMutationNonOkShape in
+// protocol.js): refused before the one mutation call (`false`); that call
+// attempted without a usable answer (`null`, unknown — never retried); or the
+// call resolved but a follow-up step did not complete (`true`, incomplete).
+function refuse(result) {
+  return { ...result, changed: false };
+}
 
-  if (wantsTab) {
-    let tab;
+function unknownChange(op, code, detail) {
+  return { ...errorResult(op, code, detail), changed: null };
+}
+
+function partial(op, code, detail, { groupId = null, windowId = null, tabIds = null } = {}) {
+  return {
+    ...envelope(op, "incomplete"),
+    code,
+    detail,
+    changed: true,
+    groupId: isValidHandle(groupId) ? groupId : null,
+    windowId: isValidHandle(windowId) ? windowId : null,
+    tabIds: tabIds !== null && tabIds.length > 0 ? tabIds : null,
+  };
+}
+
+// Re-reads every selected tab immediately before a mutation and applies the
+// rules every mutation shares: each handle still resolves to that tab, all of
+// them are in one window, and none is pinned (grouping a pinned tab could
+// unpin or reorder it). Returns `{ refusal }` or `{ tabs, windowId }`.
+async function readSelectedTabs(op, tabIds) {
+  let found;
+  try {
+    found = await Promise.all(tabIds.map((id) => browserApi.tabs.get(id)));
+  } catch (error) {
+    return { refusal: refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error))) };
+  }
+  for (let i = 0; i < tabIds.length; i += 1) {
+    if (found[i]?.id !== tabIds[i] || !isValidHandle(found[i].windowId)) {
+      return { refusal: refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return a requested tab with its window")) };
+    }
+  }
+  const windowId = found[0].windowId;
+  if (found.some((tab) => tab.windowId !== windowId)) {
+    return { refusal: refuse(errorResult(op, ERROR_CODES.WINDOW_MISMATCH, "the tabs are not all in one window")) };
+  }
+  if (found.some((tab) => tab.pinned)) {
+    return { refusal: refuse(errorResult(op, ERROR_CODES.PINNED_TAB, "a selected tab is pinned; pinned tabs cannot be grouped or ungrouped")) };
+  }
+  return { tabs: found, windowId };
+}
+
+// Reads one existing group. Returns `{ refusal }` or `{ group }`.
+async function readGroup(op, groupId) {
+  let found;
+  try {
+    found = await browserApi.tabGroups.get(groupId);
+  } catch (error) {
+    return { refusal: refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error))) };
+  }
+  const group = normalizeTabGroup(found ?? {});
+  if (group.groupId !== groupId || !isValidHandle(group.windowId)) {
+    return { refusal: refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabGroups.get did not return the requested group")) };
+  }
+  return { group };
+}
+
+function requestedMetadataMissing(group, title, color) {
+  return (title !== null && (group.title ?? "") !== title) || (color !== null && group.color !== color);
+}
+
+// Reads the selected tabs back after a mutation and keeps, in request order,
+// only those observed in `groupId` (TAB_GROUP_ID_NONE for "no group") in
+// `windowId`. Throws if the browser cannot be read.
+async function observeTabsIn(tabIds, groupId, windowId) {
+  const found = await Promise.all(tabIds.map((id) => browserApi.tabs.get(id)));
+  const observed = [];
+  for (let i = 0; i < tabIds.length; i += 1) {
+    const tab = found[i];
+    if (tab?.id === tabIds[i] && tab.windowId === windowId && tabGroupMembership(tab) === groupId) {
+      observed.push({ tabId: tab.id, windowId: tab.windowId, groupId: tabGroupMembership(tab) });
+    }
+  }
+  return observed;
+}
+
+function missingTabDetail(tabIds, observed, place) {
+  const missing = tabIds.find((id) => !observed.some((tab) => tab.tabId === id));
+  return `tab ${missing} was not observed ${place} after the change`;
+}
+
+// The read-back after a call that put `tabIds` into `groupId`: the group and
+// every tab as the browser now reports them. Anything less is the explicit
+// partial outcome, naming only the tabs actually observed in the group.
+async function observeGroupedTabs(op, { groupId, windowId, tabIds, title = null, color = null }) {
+  let found;
+  let observed;
+  try {
+    [found, observed] = await Promise.all([browserApi.tabGroups.get(groupId), observeTabsIn(tabIds, groupId, windowId)]);
+  } catch (error) {
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, errMsg(error), { groupId, windowId });
+  }
+  const group = normalizeTabGroup(found ?? {});
+  if (group.groupId !== groupId || group.windowId !== windowId) {
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, "tabGroups.get did not return the group in the tabs' window", { groupId, windowId });
+  }
+  const observedIds = observed.map((tab) => tab.tabId);
+  if (observed.length !== tabIds.length) {
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, missingTabDetail(tabIds, observed, "in the group"), { groupId, windowId, tabIds: observedIds });
+  }
+  if (requestedMetadataMissing(group, title, color)) {
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, "the group was not observed with the requested title and color", { groupId, windowId, tabIds: observedIds });
+  }
+  return { ...envelope(op, "ok"), changed: true, group, tabs: observed };
+}
+
+// Every mutation below trusts nothing it was sent, even from the
+// authenticated service:
+//
+// - the browser session must be the current one (`stale_session`), checked
+//   before anything else, so a handle from before a browser restart is never
+//   retargeted;
+// - the request is re-validated with the rules the service used;
+// - the relevant current state is re-read immediately before the mutation and
+//   must satisfy the method's rules, otherwise the result is a refusal with
+//   `changed: false` and nothing is changed;
+// - the one mutation call is made at most once and never retried. Its outcome
+//   is the browser state read back afterwards, not an echo of the request.
+//
+// The browser offers no atomic check-and-mutate, so a user action between the
+// re-read and the call is not detectable; a call that then fails is reported
+// as an unknown outcome (`changed: null`).
+
+// `browser.create_tab_group`: one `tabs.group` call creating a group around
+// all the selected tabs in their window, then at most one `tabGroups.update`
+// for the requested title/color.
+export async function createTabGroup(params) {
+  await sessionReady;
+  const op = "browser.create_tab_group";
+  const sessionError = checkSession(op, params?.browserSessionId);
+  if (sessionError) return refuse(sessionError);
+  const checked = normalizeCreateTabGroupRequest(params);
+  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
+  if (!groupsSupported()) return refuse(unsupportedGroups(op));
+  const { tabIds, title, color } = checked.request;
+
+  const selected = await readSelectedTabs(op, tabIds);
+  if (selected.refusal) return selected.refusal;
+  const { windowId } = selected;
+
+  let groupId;
+  try {
+    // The window is stated explicitly: without it a browser may place the new
+    // group in its current window, moving the tabs out of theirs.
+    groupId = await browserApi.tabs.group({ tabIds, createProperties: { windowId } });
+  } catch (error) {
+    return unknownChange(op, ERROR_CODES.GROUP_FAILED, errMsg(error));
+  }
+  if (!isValidHandle(groupId)) {
+    return unknownChange(op, ERROR_CODES.OBSERVE_FAILED, "tabs.group returned no usable group id, so whether it changed anything is unknown");
+  }
+
+  const props = {};
+  if (title !== null) props.title = title;
+  if (color !== null) props.color = color;
+  if (Object.keys(props).length > 0) {
     try {
-      tab = await browserApi.tabs.get(tabId);
+      await browserApi.tabGroups.update(groupId, props);
     } catch (error) {
-      return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
+      return partial(op, ERROR_CODES.GROUP_UPDATE_FAILED, errMsg(error), { groupId, windowId });
     }
-    if (tab?.id !== tabId || !isValidHandle(tab.windowId)) {
-      return errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return the requested tab");
-    }
-    const { title, url } = normalizeTab(tab);
-    // Anything but the explicit "no group" id counts as grouped, so a tab whose
-    // group cannot be determined is never offered for creating a new group.
-    return { ...envelope(op, "ok"), tab: { tabId, windowId: tab.windowId, grouped: tab.groupId !== TAB_GROUP_ID_NONE, pinned: Boolean(tab.pinned), title, url }, group: null };
+  }
+  return observeGroupedTabs(op, { groupId, windowId, tabIds, title, color });
+}
+
+// `browser.update_tab_group`: one `tabGroups.update` call carrying only the
+// requested fields that differ from the group's current title/color. A
+// request that would change neither is refused as `no_change`.
+export async function updateTabGroup(params) {
+  await sessionReady;
+  const op = "browser.update_tab_group";
+  const sessionError = checkSession(op, params?.browserSessionId);
+  if (sessionError) return refuse(sessionError);
+  const checked = normalizeUpdateTabGroupRequest(params);
+  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
+  if (!groupsSupported()) return refuse(unsupportedGroups(op));
+  const { groupId, title, color } = checked.request;
+
+  const current = await readGroup(op, groupId);
+  if (current.refusal) return current.refusal;
+  const { windowId } = current.group;
+  const props = {};
+  if (title !== null && title !== (current.group.title ?? "")) props.title = title;
+  if (color !== null && color !== current.group.color) props.color = color;
+  if (Object.keys(props).length === 0) {
+    return refuse(errorResult(op, ERROR_CODES.NO_CHANGE, "the group already has the requested title and color"));
+  }
+
+  try {
+    await browserApi.tabGroups.update(groupId, props);
+  } catch (error) {
+    return unknownChange(op, ERROR_CODES.GROUP_UPDATE_FAILED, errMsg(error));
   }
 
   let found;
   try {
     found = await browserApi.tabGroups.get(groupId);
   } catch (error) {
-    return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, errMsg(error), { groupId, windowId });
   }
   const group = normalizeTabGroup(found ?? {});
   if (group.groupId !== groupId || !isValidHandle(group.windowId)) {
-    return errorResult(op, ERROR_CODES.STALE_HANDLE, "tabGroups.get did not return the requested group");
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, "tabGroups.get did not return the group that was just updated", { groupId, windowId });
   }
-  return { ...envelope(op, "ok"), tab: null, group };
+  if (requestedMetadataMissing(group, title, color)) {
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, "the group was not observed with the requested title and color", { groupId, windowId: group.windowId });
+  }
+  return { ...envelope(op, "ok"), changed: true, group };
 }
 
-// Phase 2 Action 2: creates a tab group around exactly one existing ungrouped
-// tab, or renames/recolors an existing group — the extension's second browser
-// mutation. The service sends it only after the owner approved a stored
-// preview; this function still trusts nothing it was sent:
-//
-// - the browser session must be the current one (`stale_session`);
-// - the whole request is re-validated with the same rules the preview used
-//   (normalizeGroupConfig), including that an update changes something;
-// - the bound current state is re-read and must still match — a create needs
-//   the tab still ungrouped in the previewed window; an update needs the
-//   group still in the previewed window with the previewed title and color —
-//   otherwise `stale_handle` / `state_mismatch` and nothing is changed. The
-//   mutation follows that read with no `await` in between;
-// - `tabs.group` and `tabGroups.update` are each called at most once and never
-//   retried, and the outcome reported is the group as read back with
-//   `tabGroups.get`, not an echo of the request. A change that was made but
-//   not completed or observed is the explicit partial outcome (`incomplete`,
-//   `changed: true`): retrying could not be known safe.
-//
-// Every non-ok result states `changed` consistently (see
-// isValidConfigureGroupNonOkShape in protocol.js).
-export async function configureGroup(params) {
-  await sessionReady;
-  const op = "browser.configure_group";
-  const refuse = (result) => ({ ...result, changed: false });
-
-  const sessionError = checkSession(op, params?.browserSessionId);
-  if (sessionError) return refuse(sessionError);
-  const checked = normalizeGroupConfig(params);
-  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
-  if (!groupsSupported()) return refuse(unsupportedGroups(op));
-  const { config } = checked;
-  const creating = config.operation === "create";
-
-  const partial = (code, detail, groupId) => ({
-    ...envelope(op, "incomplete"),
-    code,
-    detail,
-    changed: true,
-    groupId: isValidHandle(groupId) ? groupId : null,
-    windowId: config.windowId,
-    tabId: creating ? config.tabId : null,
-  });
-  const props = {};
-  if (config.title !== null) props.title = config.title;
-  if (config.color !== null) props.color = config.color;
-
-  let groupId = config.groupId;
-  if (creating) {
-    let tab;
-    try {
-      tab = await browserApi.tabs.get(config.tabId);
-    } catch (error) {
-      return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error)));
-    }
-    if (tab?.id !== config.tabId) return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return the requested tab"));
-    // A pinned tab is refused too: grouping it could unpin or reorder it.
-    if (tab.windowId !== config.windowId || tab.groupId !== TAB_GROUP_ID_NONE || tab.pinned) {
-      return refuse(errorResult(op, ERROR_CODES.STATE_MISMATCH, "the tab is no longer an unpinned, ungrouped tab in the previewed window"));
-    }
-    try {
-      // The window is stated explicitly: without it a browser may place the new
-      // group in its current window, moving the tab out of the previewed one.
-      groupId = await browserApi.tabs.group({ tabIds: [config.tabId], createProperties: { windowId: config.windowId } });
-    } catch (error) {
-      return refuse(errorResult(op, ERROR_CODES.GROUP_FAILED, errMsg(error)));
-    }
-    if (!isValidHandle(groupId)) return partial(ERROR_CODES.OBSERVE_FAILED, "tabs.group returned no usable group id, so the group could not be observed", null);
-  } else {
-    let current;
-    try {
-      current = await browserApi.tabGroups.get(config.groupId);
-    } catch (error) {
-      return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error)));
-    }
-    const group = normalizeTabGroup(current ?? {});
-    if (group.groupId !== config.groupId) return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabGroups.get did not return the requested group"));
-    if (group.windowId !== config.windowId || (group.title ?? "") !== config.expectedTitle || group.color !== config.expectedColor) {
-      return refuse(errorResult(op, ERROR_CODES.STATE_MISMATCH, "the group's window, title, or color changed since the preview"));
-    }
-  }
-
-  if (Object.keys(props).length > 0) {
-    try {
-      await browserApi.tabGroups.update(groupId, props);
-    } catch (error) {
-      // For a new group the group now exists without what was requested: a
-      // partial outcome. For an existing group nothing is known to have changed.
-      return creating ? partial(ERROR_CODES.GROUP_UPDATE_FAILED, errMsg(error), groupId) : refuse(errorResult(op, ERROR_CODES.GROUP_UPDATE_FAILED, errMsg(error)));
-    }
-  }
-
-  let observed;
-  try {
-    observed = await browserApi.tabGroups.get(groupId);
-  } catch (error) {
-    return partial(ERROR_CODES.OBSERVE_FAILED, errMsg(error), groupId);
-  }
-  const group = normalizeTabGroup(observed ?? {});
-  if (group.groupId !== groupId || !isValidHandle(group.windowId)) {
-    return partial(ERROR_CODES.OBSERVE_FAILED, "tabGroups.get did not return the group that was just configured", groupId);
-  }
-  return { ...envelope(op, "ok"), changed: true, operation: config.operation, tabId: creating ? config.tabId : null, group };
-}
-
-// Phase 2 Action 3, read-only: reports every selected tab's current window,
-// group membership (-1 for none), and pinned state, in the order asked, and —
-// when `groupId` is given — the existing destination group, so the service can
-// bind a preview to that state and to this browser session (the envelope's
-// `browserSessionId`; never supplied by a caller). Mutates nothing.
-export async function inspectMoveTarget(tabIds, groupId) {
-  await sessionReady;
-  const op = "browser.inspect_move_target";
-  const wantsGroup = groupId !== undefined && groupId !== null;
-  const listValid =
-    Array.isArray(tabIds) && tabIds.length >= 1 && tabIds.length <= MAX_MOVE_TABS && tabIds.every(isValidHandle) && new Set(tabIds).size === tabIds.length;
-  if (!listValid || (wantsGroup && !isValidHandle(groupId))) {
-    return errorResult(op, ERROR_CODES.INVALID_PARAMS, `tabIds must list 1 to ${MAX_MOVE_TABS} distinct non-negative safe integers, and groupId (if given) one such integer`);
-  }
-  if (!groupsSupported()) return unsupportedGroups(op);
-
-  let found;
-  try {
-    found = await Promise.all(tabIds.map((id) => browserApi.tabs.get(id)));
-  } catch (error) {
-    return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
-  }
-  const tabs = [];
-  for (let i = 0; i < tabIds.length; i += 1) {
-    const tab = found[i];
-    if (tab?.id !== tabIds[i] || !isValidHandle(tab.windowId) || (tab.groupId !== TAB_GROUP_ID_NONE && !isValidHandle(tab.groupId))) {
-      return errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return a requested tab with its window and group");
-    }
-    const { title, url } = normalizeTab(tab);
-    tabs.push({ tabId: tab.id, windowId: tab.windowId, groupId: tab.groupId, pinned: Boolean(tab.pinned), title, url });
-  }
-
-  let group = null;
-  if (wantsGroup) {
-    let current;
-    try {
-      current = await browserApi.tabGroups.get(groupId);
-    } catch (error) {
-      return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
-    }
-    group = normalizeTabGroup(current ?? {});
-    if (group.groupId !== groupId || !isValidHandle(group.windowId)) {
-      return errorResult(op, ERROR_CODES.STALE_HANDLE, "tabGroups.get did not return the requested group");
-    }
-  }
-  return { ...envelope(op, "ok"), tabs, group };
-}
-
-// Phase 2 Action 3: moves 1..MAX_MOVE_TABS selected tabs, all in one window,
-// into one existing group in that window or into one new group created around
-// them — the extension's third browser mutation. The service sends it only
-// after the owner approved a stored preview; this function still trusts
-// nothing it was sent:
-//
-// - the browser session must be current (`stale_session`) and the whole request
-//   is re-validated with the same rules the preview used (normalizeMoveConfig);
-// - every selected tab and (for an existing destination) the group are
-//   re-read and must still match the preview — each tab in the previewed
-//   window, in the group it was in, not pinned; the group in the previewed
-//   window with its previewed title and color — otherwise `stale_handle` /
-//   `state_mismatch` and nothing is changed. The mutation follows that read
-//   with no `await` in between;
-// - `tabs.group` is called exactly once with the whole list (never retried),
-//   and for a new group `tabGroups.update` at most once for its title/color.
-//   The outcome reported is the group and each tab as read back, not an echo.
-//   If `tabs.group` rejects, or a new-group call resolves with no usable group
-//   id, whether the browser changed is unknown (`changed: null`). Once it
-//   resolves with a usable group a move is known to have been made, and one
-//   whose metadata update or read-back did not complete is the explicit partial
-//   outcome (`incomplete`, `changed: true`) whose `tabIds` is null (none
-//   observed in the group, or no observation) or exactly the ordered subset
-//   that was observed there — only a full ok result says every tab was.
-//
-// The browser offers no atomic check-and-move, so a user action between the
-// re-read and the call is not detectable, and a source group left with no tabs
-// is removed by the browser itself (not reported as a separate change).
+// `browser.move_tabs`: with a `groupId`, one `tabs.group` call moving every
+// selected tab into that existing group in the same window; with
+// `groupId: null`, one `tabs.ungroup` call removing them from their groups.
+// Tabs may come from several source groups; a source group left with no tabs
+// is removed by the browser itself (not reported as a separate change). A move
+// that would leave every tab where it already is is refused as `no_change`.
 export async function moveTabs(params) {
   await sessionReady;
   const op = "browser.move_tabs";
-  const refuse = (result) => ({ ...result, changed: false });
-
   const sessionError = checkSession(op, params?.browserSessionId);
   if (sessionError) return refuse(sessionError);
-  const checked = normalizeMoveConfig(params);
+  const checked = normalizeMoveTabsRequest(params);
   if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
   if (!groupsSupported()) return refuse(unsupportedGroups(op));
-  const { config } = checked;
-  const existing = config.destination === "existing";
-  const tabIds = config.tabs.map((tab) => tab.tabId);
+  const { tabIds, groupId } = checked.request;
 
-  let current;
-  let destination;
-  try {
-    [current, destination] = await Promise.all([
-      Promise.all(tabIds.map((id) => browserApi.tabs.get(id))),
-      existing ? browserApi.tabGroups.get(config.groupId) : null,
-    ]);
-  } catch (error) {
-    return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error)));
-  }
-  for (let i = 0; i < tabIds.length; i += 1) {
-    const tab = current[i];
-    if (tab?.id !== tabIds[i]) return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return a requested tab"));
-    if (tab.windowId !== config.windowId || tab.groupId !== config.tabs[i].groupId || tab.pinned) {
-      return refuse(errorResult(op, ERROR_CODES.STATE_MISMATCH, "a selected tab's window, group, or pinned state changed since the preview"));
+  const selected = await readSelectedTabs(op, tabIds);
+  if (selected.refusal) return selected.refusal;
+  const { windowId } = selected;
+
+  if (groupId !== null) {
+    const destination = await readGroup(op, groupId);
+    if (destination.refusal) return destination.refusal;
+    if (destination.group.windowId !== windowId) {
+      return refuse(errorResult(op, ERROR_CODES.WINDOW_MISMATCH, "the destination group is not in the tabs' window"));
     }
-  }
-  if (existing) {
-    const group = normalizeTabGroup(destination ?? {});
-    if (group.groupId !== config.groupId) return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabGroups.get did not return the requested group"));
-    if (group.windowId !== config.windowId || (group.title ?? "") !== config.expectedTitle || group.color !== config.expectedColor) {
-      return refuse(errorResult(op, ERROR_CODES.STATE_MISMATCH, "the destination group's window, title, or color changed since the preview"));
+    if (selected.tabs.every((tab) => tabGroupMembership(tab) === groupId)) {
+      return refuse(errorResult(op, ERROR_CODES.NO_CHANGE, "every selected tab is already in the group"));
     }
-  }
-
-  // The move is known to have been made (`tabs.group` resolved with a usable
-  // destination group). `observedIds` is null — none observed in the
-  // destination, or observation unavailable — or the ordered subset of the
-  // requested tabs that were actually seen there; it never claims more.
-  const partial = (code, detail, groupId, observedIds = null) => ({
-    ...envelope(op, "incomplete"),
-    code,
-    detail,
-    changed: true,
-    groupId: isValidHandle(groupId) ? groupId : null,
-    windowId: config.windowId,
-    tabIds: observedIds !== null && observedIds.length > 0 ? observedIds : null,
-  });
-  // The one `tabs.group` call was attempted but whether it changed the browser
-  // is unknown: `changed: null`, never claimed as none or as moved.
-  const unknownChange = (code, detail) => ({ ...errorResult(op, code, detail), changed: null });
-
-  let groupId = existing ? config.groupId : null;
-  try {
-    const returned = await browserApi.tabs.group(existing ? { groupId: config.groupId, tabIds } : { tabIds, createProperties: { windowId: config.windowId } });
-    if (!existing) groupId = returned;
-  } catch (error) {
-    return unknownChange(ERROR_CODES.GROUP_FAILED, errMsg(error));
-  }
-  if (!isValidHandle(groupId)) return unknownChange(ERROR_CODES.OBSERVE_FAILED, "tabs.group returned no usable group id, so whether it changed anything is unknown");
-
-  const props = {};
-  if (!existing && config.title !== null) props.title = config.title;
-  if (!existing && config.color !== null) props.color = config.color;
-  if (Object.keys(props).length > 0) {
     try {
-      await browserApi.tabGroups.update(groupId, props);
+      await browserApi.tabs.group({ groupId, tabIds });
     } catch (error) {
-      return partial(ERROR_CODES.GROUP_UPDATE_FAILED, errMsg(error), groupId);
+      return unknownChange(op, ERROR_CODES.GROUP_FAILED, errMsg(error));
     }
+    return observeGroupedTabs(op, { groupId, windowId, tabIds });
   }
 
-  let observedGroup;
-  let observedTabs;
+  if (selected.tabs.every((tab) => tabGroupMembership(tab) === TAB_GROUP_ID_NONE)) {
+    return refuse(errorResult(op, ERROR_CODES.NO_CHANGE, "none of the selected tabs is in a group"));
+  }
   try {
-    [observedGroup, observedTabs] = await Promise.all([
-      browserApi.tabGroups.get(groupId),
-      Promise.all(tabIds.map((id) => browserApi.tabs.get(id))),
-    ]);
+    await browserApi.tabs.ungroup(tabIds);
   } catch (error) {
-    return partial(ERROR_CODES.OBSERVE_FAILED, errMsg(error), groupId);
+    return unknownChange(op, ERROR_CODES.UNGROUP_FAILED, errMsg(error));
   }
-  const group = normalizeTabGroup(observedGroup ?? {});
-  if (group.groupId !== groupId || group.windowId !== config.windowId) {
-    return partial(ERROR_CODES.OBSERVE_FAILED, "tabGroups.get did not return the destination group in the previewed window", groupId);
-  }
-  const tabs = [];
-  for (let i = 0; i < tabIds.length; i += 1) {
-    const tab = observedTabs[i];
-    if (tab?.id === tabIds[i] && tab.windowId === config.windowId && tab.groupId === groupId) {
-      tabs.push({ tabId: tab.id, windowId: tab.windowId, groupId: tab.groupId });
-    }
-  }
-  if (tabs.length !== tabIds.length) {
-    // Only the tabs actually seen in the destination are reported as such.
-    const missing = tabIds.find((id) => !tabs.some((tab) => tab.tabId === id));
-    return partial(
-      ERROR_CODES.OBSERVE_FAILED,
-      `tab ${missing} was not observed in the destination group in the previewed window after the move`,
-      groupId,
-      tabs.map((tab) => tab.tabId),
-    );
-  }
-  return { ...envelope(op, "ok"), changed: true, destination: config.destination, group, tabs };
-}
-
-// Phase 2 Action 4: the address a tab is at *right now* for the purposes of an
-// archive. During a navigation Chrome keeps the committed address in `url`
-// while `pendingUrl` already holds the address being loaded, so a tab that is
-// mid-navigation to B still reports `url` A. The effective address prefers a
-// non-empty `pendingUrl` and falls back to `url`; it is null when the browser
-// reports neither (the service then refuses to bind a preview to it). Used by
-// inspection and by the close's re-check alike, so the two can never disagree;
-// the general tab records (normalizeTab, listings) are deliberately unchanged.
-function effectiveAddress(tab) {
-  if (typeof tab.pendingUrl === "string" && tab.pendingUrl.length > 0) return tab.pendingUrl;
-  return typeof tab.url === "string" ? tab.url : null;
-}
-
-// A tab's group membership as the protocol states it: its group's handle, or
-// -1 for none. A browser that reports no group at all (no tab groups) is
-// consistently "none", in inspection and in the close's re-check alike.
-function groupMembership(tab) {
-  return Number.isInteger(tab.groupId) && tab.groupId >= 0 ? tab.groupId : TAB_GROUP_ID_NONE;
-}
-
-// Phase 2 Action 4, read-only: reports the one tab (`tabId`) an archive
-// preview is about — window, group membership, pinned state, title, and address
-// — so the service can bind the preview to that state and to this browser
-// session (the envelope's `browserSessionId`; never supplied by a caller).
-// Mutates nothing. `tabs.remove` is a standard WebExtension API; a browser
-// without it answers `unsupported` rather than binding a preview it could not
-// carry out.
-export async function inspectArchiveTarget(tabId) {
-  await sessionReady;
-  const op = "browser.inspect_archive_target";
-  if (!isValidHandle(tabId)) return errorResult(op, ERROR_CODES.INVALID_PARAMS, "tabId must be a non-negative safe integer");
-  if (typeof browserApi.tabs?.remove !== "function") {
-    return { ...envelope(op, "unsupported"), code: ERROR_CODES.UNSUPPORTED_FEATURE, detail: "tabs cannot be closed in this browser" };
-  }
-  let tab;
+  let observed;
   try {
-    tab = await browserApi.tabs.get(tabId);
+    observed = await observeTabsIn(tabIds, TAB_GROUP_ID_NONE, windowId);
   } catch (error) {
-    return errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error));
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, errMsg(error), { windowId });
   }
-  if (tab?.id !== tabId || !isValidHandle(tab.windowId)) {
-    return errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return the requested tab");
+  if (observed.length !== tabIds.length) {
+    return partial(op, ERROR_CODES.OBSERVE_FAILED, missingTabDetail(tabIds, observed, "outside every group"), {
+      windowId,
+      tabIds: observed.map((tab) => tab.tabId),
+    });
   }
-  const { title } = normalizeTab(tab);
-  // `url` is the effective address (a pending navigation's target when there is one).
-  return { ...envelope(op, "ok"), tab: { tabId, windowId: tab.windowId, groupId: groupMembership(tab), pinned: Boolean(tab.pinned), title, url: effectiveAddress(tab) } };
-}
-
-// Phase 2 Action 4: closes exactly one tab — the extension's fourth browser
-// mutation and the only one that removes anything. The service sends it only
-// after the owner approved a stored preview *and* a capture of the tab was
-// durably saved; this function still trusts nothing it was sent:
-//
-// - the browser session must be current (`stale_session`) and the whole request
-//   is re-validated with the same rules the preview used (normalizeArchiveConfig);
-// - the tab is re-read and must still be the same tab in the same window, at the
-//   (effective) address — a pending navigation's target when there is one —
-//   in the same group, with the same pinned state — otherwise
-//   `stale_handle` / `state_mismatch` and the tab is left open. `tabs.remove`
-//   follows that check with no `await` in between;
-// - `tabs.remove` is called exactly once and never retried. If it resolves the
-//   tab is closed (nothing is read afterwards: it is gone). If it rejects,
-//   whether the tab closed is unknown (`changed: null`) — a rejection can
-//   follow the browser having closed it.
-//
-// The browser offers no atomic check-and-close, so a user action between the
-// re-read and the call is not detectable.
-export async function closeTab(params) {
-  await sessionReady;
-  const op = "browser.close_tab";
-  const refuse = (result) => ({ ...result, changed: false });
-
-  const sessionError = checkSession(op, params?.browserSessionId);
-  if (sessionError) return refuse(sessionError);
-  const checked = normalizeArchiveConfig(params);
-  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
-  if (typeof browserApi.tabs?.remove !== "function") {
-    return refuse({ ...envelope(op, "unsupported"), code: ERROR_CODES.UNSUPPORTED_FEATURE, detail: "tabs cannot be closed in this browser" });
-  }
-  const { config } = checked;
-
-  let tab;
-  try {
-    tab = await browserApi.tabs.get(config.tabId);
-  } catch (error) {
-    return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error)));
-  }
-  if (tab?.id !== config.tabId) return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, "tabs.get did not return the requested tab"));
-  if (
-    tab.windowId !== config.windowId ||
-    effectiveAddress(tab) !== config.url ||
-    groupMembership(tab) !== config.groupId ||
-    Boolean(tab.pinned) !== config.pinned
-  ) {
-    return refuse(errorResult(op, ERROR_CODES.STATE_MISMATCH, "the tab's window, address, group, or pinned state changed since the preview"));
-  }
-
-  try {
-    await browserApi.tabs.remove(config.tabId);
-  } catch (error) {
-    return { ...errorResult(op, ERROR_CODES.CLOSE_FAILED, errMsg(error)), changed: null };
-  }
-  return { ...envelope(op, "ok"), changed: true, tabId: config.tabId, windowId: config.windowId };
+  return { ...envelope(op, "ok"), changed: true, group: null, tabs: observed };
 }
 
 // Shared by the extension's own runtime.onMessage listener and by requests
@@ -990,8 +736,6 @@ export async function routeMessage(message) {
         maxResults: message.maxResults,
         cursor: message.cursor,
       });
-    case "browser.get_capabilities":
-      return getCapabilities();
     default:
       return errorResult(
         typeof message?.method === "string" ? message.method : "unknown",
@@ -1002,21 +746,16 @@ export async function routeMessage(message) {
 }
 
 // The service WebSocket's dispatcher: everything routeMessage handles, plus
-// the mutating `browser.open_tab`, `browser.configure_group`,
-// `browser.move_tabs`, and `browser.close_tab` and the preview-only
-// `browser.inspect_group_target`, `browser.inspect_move_target`, and
-// `browser.inspect_archive_target`. Only requests from the authenticated
-// service reach it; `runtime.onMessage` below uses the read-only routeMessage,
-// so extension pages and other message senders cannot open tabs, change tab
-// groups, move tabs, or close a tab.
+// the three tab-group mutations. Only requests from the authenticated service
+// reach it; `runtime.onMessage` below uses the read-only routeMessage, so
+// extension pages and other message senders cannot change the browser.
+// A forwarded request's parameters arrive as the message's own fields
+// alongside `method`, which is not a request field and is dropped here.
 export async function routeServiceMessage(message) {
-  if (message?.method === "browser.open_tab") return openTab(message.url, message.browserSessionId);
-  if (message?.method === "browser.configure_group") return configureGroup(message);
-  if (message?.method === "browser.inspect_group_target") return inspectGroupTarget(message.tabId, message.groupId);
-  if (message?.method === "browser.move_tabs") return moveTabs(message);
-  if (message?.method === "browser.inspect_move_target") return inspectMoveTarget(message.tabIds, message.groupId);
-  if (message?.method === "browser.close_tab") return closeTab(message);
-  if (message?.method === "browser.inspect_archive_target") return inspectArchiveTarget(message.tabId);
+  const { method, ...params } = message ?? {};
+  if (method === "browser.create_tab_group") return createTabGroup(params);
+  if (method === "browser.update_tab_group") return updateTabGroup(params);
+  if (method === "browser.move_tabs") return moveTabs(params);
   return routeMessage(message);
 }
 

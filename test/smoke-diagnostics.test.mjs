@@ -5,8 +5,8 @@ import { test } from "node:test";
 
 import { DiagnosticError, describeError, safeLabel } from "../scripts/safe-diagnostics.mjs";
 
-// The Firefox smoke test handles the owner/agent tokens (the owner token is
-// even carried in the fixture page's URL) plus page text and URLs read from a
+// The Firefox smoke test handles the pairing token (it is even carried in the
+// fixture page's URL) plus page text and URLs read from a
 // real browser. These tests pin down that its failure output is built from
 // stable status/code/count diagnostics only. The real smoke test needs a
 // Firefox binary, so the source-level checks below are what keep a future
@@ -24,13 +24,12 @@ const SMOKE_SOURCES = {
 // Identifiers/properties whose value may be (or may contain) a secret,
 // browser-derived text, or raw service/WebDriver output.
 const FORBIDDEN_IN_INTERPOLATION =
-  /\b(ownerToken|agentToken|token|fixtureUrl|probeRaw|probe|getStdout|getStderr|responseBody|stdout|stderr|data)\b|\.message\b|\.stack\b/;
+  /\b(pairingToken|token|fixtureUrl|probeRaw|probe|getStdout|getStderr|responseBody|stdout|stderr|data)\b|\.message\b|\.stack\b/;
 
-// The only interpolations allowed to name a forbidden identifier: injecting
-// the owner token into the page script that drives the real review UI,
-// building the fixture URL itself (never printed), and the Authorization
-// header of an outgoing request (a line containing "Bearer").
-const ALLOWED_SECRET_INTERPOLATIONS = new Set(["JSON.stringify(ownerToken)", "ownerToken"]);
+// The only interpolations allowed to name a forbidden identifier: building
+// the fixture URL itself (never printed), and the Authorization header of an
+// outgoing request (a line containing "Bearer").
+const ALLOWED_SECRET_INTERPOLATIONS = new Set(["pairingToken"]);
 
 function interpolations(source) {
   return source
@@ -86,9 +85,6 @@ for (const [name, source] of Object.entries(SMOKE_SOURCES)) {
   test(`${name} only JSON.stringifies known-safe values`, () => {
     const allowed = [
       /JSON\.stringify\(body\)/, // outgoing request payloads
-      /JSON\.stringify\(ownerToken\)/, // injected into the review-UI page script
-      /JSON\.stringify\(acceptProposalId\)/,
-      /JSON\.stringify\(rejectProposalId\)/,
       /JSON\.stringify\(manifest, null, 2\)/, // staging the extension manifest
     ];
     for (const line of source.split("\n")) {

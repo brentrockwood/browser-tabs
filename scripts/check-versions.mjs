@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// Stage 6: "Version the extension, service, API, and database schema
-// deliberately" (project.md).
+// Versions the extension, service, and API deliberately.
 //
 // This project deliberately has *one* product-version field —
 // package.json's "version" — mirrored into both extension manifests
@@ -16,7 +15,7 @@
 // when their own compatibility rules require it. This script's job for
 // those is only to report their current values so a release's version
 // report always shows all of them together. See "Versioning" in README.md
-// for the bump rule for each.
+// (docs/development.md) for the bump rule for each.
 //
 // Usage: node scripts/check-versions.mjs
 // Exit code: 0 if the product version is consistent, 1 otherwise.
@@ -26,7 +25,6 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PROTOCOL_VERSION, RESULT_SCHEMA_VERSION } from "../extension/protocol.js";
-import { MIGRATIONS } from "../service/store.mjs";
 
 const PACKAGE_JSON_PATH = fileURLToPath(new URL("../package.json", import.meta.url));
 const CHROME_MANIFEST_PATH = fileURLToPath(new URL("../extension/manifest.json", import.meta.url));
@@ -42,8 +40,6 @@ export async function checkVersions() {
     readJson(CHROME_MANIFEST_PATH),
     readJson(FIREFOX_MANIFEST_PATH),
   ]);
-
-  const dbSchemaVersion = Math.max(...MIGRATIONS.map((migration) => migration.version));
 
   const mismatches = [];
   if (chromeManifest.version !== pkg.version) {
@@ -64,7 +60,6 @@ export async function checkVersions() {
       productVersion: pkg.version,
       protocolVersion: PROTOCOL_VERSION,
       resultSchemaVersion: RESULT_SCHEMA_VERSION,
-      dbSchemaVersion,
     },
   };
 }
@@ -74,7 +69,6 @@ async function main() {
   console.log(`Product version (package.json, both extension manifests): ${report.productVersion}`);
   console.log(`API/extension-bridge protocol version (extension/protocol.js PROTOCOL_VERSION): ${report.protocolVersion}`);
   console.log(`Capture/result envelope schema version (RESULT_SCHEMA_VERSION): ${report.resultSchemaVersion}`);
-  console.log(`Database schema version (service/store.mjs MIGRATIONS, highest version): ${report.dbSchemaVersion}`);
   if (!ok) {
     console.error("\nVersion mismatch:");
     for (const mismatch of mismatches) console.error(`  - ${mismatch}`);

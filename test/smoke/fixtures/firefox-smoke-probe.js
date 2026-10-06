@@ -10,7 +10,7 @@
 // (already permitted by the "storage" permission every build declares) —
 // exactly the same two capabilities a real pairing/read-API caller uses, so
 // this exercises the real `routeMessage` dispatch in service-worker.js, not
-// a stand-in. The owner pairing token is read from this page's own URL
+// a stand-in. The pairing token is read from this page's own URL
 // query string (set by firefox-smoke.mjs when it navigates here), so no
 // privileged, browser-internal lookup (e.g. the extension's moz-extension://
 // UUID) is ever needed.
@@ -40,7 +40,9 @@
     result.tabId = thisTab?.tabId ?? null;
     result.browserSessionId = browserSessionId ?? null;
 
-    result.steps.capabilities = await browser.runtime.sendMessage({ method: "browser.get_capabilities" });
+    result.steps.groups = ownTab
+      ? await browser.runtime.sendMessage({ method: "browser.list_tab_groups", windowId: ownTab.windowId, browserSessionId })
+      : null;
 
     result.steps.history = await browser.runtime.sendMessage({
       method: "browser.query_history",

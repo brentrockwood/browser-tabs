@@ -1,4 +1,4 @@
-// Stage 5 remediation: regression tests for the Host-header defense
+// Regression tests for the Host-header defense
 // against DNS rebinding and similar Host-header-confusion attacks
 // (service/server.mjs's checkHost). This service binds only to loopback,
 // but loopback alone does not stop a page served from an
@@ -17,7 +17,7 @@ import WebSocket from "ws";
 import { ERROR_CODES, PROTOCOL_VERSION } from "../extension/protocol.js";
 import { createService } from "../service/server.mjs";
 
-const TOKEN = "host-defense-owner-token-0123456789";
+const TOKEN = "host-defense-token-0123456789";
 const EXTENSION_ORIGIN = "chrome-extension://host-defense-test-extension";
 
 async function withService(options, run) {
@@ -35,14 +35,14 @@ async function withService(options, run) {
 // library — the only way to actually send a Host header a real client
 // would never construct on its own, and to prove the *server* (not some
 // client-side guard) is what rejects it.
-function sendRawRequest(port, requestLine, headers) {
+function sendRawRequest(port, requestLine, headers, body = "") {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ port, host: "127.0.0.1" }, () => {
       const headerLines = Object.entries(headers)
         .filter(([, value]) => value !== undefined)
         .map(([key, value]) => `${key}: ${value}`)
         .join("\r\n");
-      socket.write(`${requestLine}\r\n${headerLines}\r\n\r\n`);
+      socket.write(`${requestLine}\r\n${headerLines}\r\n\r\n${body}`);
     });
     let data = "";
     socket.on("data", (chunk) => (data += chunk.toString()));
@@ -81,15 +81,22 @@ function substitutePort(host, port) {
   return host.replaceAll("__PORT__", String(port));
 }
 
-test("DNS-rebinding/evil-Host regression: GET /ui/ is rejected with 421 invalid_host and never the UI body", async () => {
+test("DNS-rebinding/evil-Host regression: a mutation route is rejected with 421 before its body is read or anything is forwarded", async () => {
   await withService({}, async (port) => {
+    const body = JSON.stringify({ browserSessionId: "s", tabIds: [1], groupId: null });
     for (const hostTemplate of EVIL_HOSTS) {
       const host = substitutePort(hostTemplate, port);
-      const raw = await sendRawRequest(port, "GET /ui/ HTTP/1.1", { Host: host, Connection: "close" });
-      const { status, json, body } = parseRawResponse(raw);
+      const raw = await sendRawRequest(port, "POST /api/browser.move_tabs HTTP/1.1", {
+        Host: host,
+        Authorization: `Bearer ${TOKEN}`,
+        "X-Protocol-Version": String(PROTOCOL_VERSION),
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(body)),
+        Connection: "close",
+      }, body);
+      const { status, json } = parseRawResponse(raw);
       assert.equal(status, 421, `Host "${host}" was not rejected with 421: ${raw.slice(0, 300)}`);
-      assert.equal(json?.error?.code, ERROR_CODES.INVALID_HOST, `Host "${host}" did not report invalid_host: ${raw.slice(0, 300)}`);
-      assert.doesNotMatch(body, /<html|<!DOCTYPE/i, `Host "${host}" leaked the UI's HTML body instead of a stable JSON error`);
+      assert.equal(json?.error?.code, ERROR_CODES.INVALID_HOST);
     }
   });
 });
@@ -98,7 +105,7 @@ test("DNS-rebinding/evil-Host regression: an authenticated /api/ route is reject
   await withService({}, async (port) => {
     for (const hostTemplate of EVIL_HOSTS) {
       const host = substitutePort(hostTemplate, port);
-      const raw = await sendRawRequest(port, "GET /api/owner.status HTTP/1.1", {
+      const raw = await sendRawRequest(port, "GET /api/browser.list_windows HTTP/1.1", {
         Host: host,
         Authorization: `Bearer ${TOKEN}`,
         "X-Protocol-Version": String(PROTOCOL_VERSION),
@@ -111,7 +118,7 @@ test("DNS-rebinding/evil-Host regression: an authenticated /api/ route is reject
   });
 });
 
-test("DNS-rebinding/evil-Host regression: /control/stop is rejected with 421, never reaching the owner-only check", async () => {
+test("DNS-rebinding/evil-Host regression: /control/stop is rejected with 421, never reaching authentication", async () => {
   await withService({}, async (port) => {
     const raw = await sendRawRequest(port, "POST /control/stop HTTP/1.1", {
       Host: "evil.example",
@@ -144,9 +151,9 @@ test("DNS-rebinding/evil-Host regression: /health itself is rejected with 421 fo
   });
 });
 
-test("a request with no Host header at all is rejected before any UI body is served", async () => {
+test("a request with no Host header at all is rejected", async () => {
   await withService({}, async (port) => {
-    const raw = await sendRawRequest(port, "GET /ui/ HTTP/1.1", { Host: undefined, Connection: "close" });
+    const raw = await sendRawRequest(port, "GET /health HTTP/1.1", { Host: undefined, Connection: "close" });
     const { status, body } = parseRawResponse(raw);
     // Node's HTTP/1.1 parser rejects a missing mandatory Host header with
     // 400 before the application request handler can return its own 421.

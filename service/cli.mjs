@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-// Development service CLI: `start` (foreground), `status`, `stop`,
-// `show-token` (re-display the owner pairing credential), and
-// `show-agent-token` (re-display the separate, scoped Stage 4
-// external-agent credential — see service/credential.mjs).
+// Development service CLI: `start` (foreground), `status`, `stop`, and
+// `show-token` (re-display the pairing credential).
 //
 // `status` and `stop` identify a running service by actually probing the
 // port recorded at `start` (GET /health), and `stop` tears it down through
@@ -12,16 +10,14 @@
 // a port file left over from a crashed/killed previous run is detected by
 // the probe failing, not trusted at face value, and is cleaned up.
 //
-// Usage: node service/cli.mjs <start|status|stop|show-token|show-agent-token>
+// Usage: node service/cli.mjs <start|status|stop|show-token>
 
 import http from "node:http";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 
 import { createService } from "./server.mjs";
-import { getDataDir, loadOrCreateAgentCredential, loadOrCreateCredential } from "./credential.mjs";
-import { openStore } from "./store.mjs";
+import { getDataDir, loadOrCreateCredential } from "./credential.mjs";
 import { DEFAULT_SERVICE_PORT, PROTOCOL_VERSION } from "../extension/protocol.js";
 
 // Shared with the extension's fixed WebSocket target (see
@@ -125,187 +121,30 @@ async function cleanupStateFiles() {
   await rm(portPath, { force: true });
 }
 
-// One service process per data directory, enforced (not merely assumed):
-// startup reconciliation of interrupted browser actions (store.mjs's
-// reconcileInterruptedActions) is only correct if no other service could be
-// executing one. The port cannot provide that — a different
-// BROWSER_TABS_PORT would bypass it — so `start` first takes an exclusive
-// lock file in the data directory, created with the `wx` flag (atomic: only
-// one creator wins) and holding the owner's pid. Nothing is opened,
-// reconciled, or listened on before it is held.
-//
-// A leftover lock whose pid is dead (the owner was killed) is stale and is
-// reclaimed; a live pid refuses the start. Reclaiming is serialized by a
-// second `wx` file, so two starters racing over the same stale lock cannot
-// each delete the other's fresh one. Only the lock this process wrote is
-// ever removed. A live-but-unrelated process that reused a dead owner's pid
-// would block starts until `service.lock` is deleted by hand (the refusal
-// message says so) — the safe direction for a personal tool.
-const lockPath = join(dataDir, "service.lock");
-const reclaimPath = `${lockPath}.reclaim`;
-
-function pidIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM"; // exists, owned by someone else
-  }
-}
-
-async function tryCreateExclusive(path) {
-  try {
-    await writeFile(path, String(process.pid), { flag: "wx", mode: 0o600 });
-    return true;
-  } catch (error) {
-    if (error.code === "EEXIST") return false;
-    throw error;
-  }
-}
-
-// The pid recorded in a lock file: a positive integer, 0 if the file is empty
-// (its creator may be mid-write), -1 if it holds anything else (never a live
-// owner), or null if the file does not exist.
-async function readLockPid(path) {
-  try {
-    const value = Number((await readFile(path, "utf8")).trim());
-    return Number.isInteger(value) && value >= 0 ? value : -1;
-  } catch (error) {
-    return error.code === "ENOENT" ? null : -1;
-  }
-}
-
-// Returns `{ ok: true }` once this process holds the lock, or `{ ok: false,
-// pid }` naming the live process that does.
-async function acquireServiceLock() {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (await tryCreateExclusive(lockPath)) return { ok: true };
-
-    const owner = await readLockPid(lockPath);
-    if (owner === null) continue; // vanished between our create and read: try again
-    if (owner > 0 && pidIsAlive(owner)) return { ok: false, pid: owner };
-    if (owner === 0 && attempt < 10) {
-      await delay(50); // empty: its creator may be between create and write
-      continue;
-    }
-
-    // Stale (dead pid, or empty for good): reclaim under the reclaim mutex.
-    if (await tryCreateExclusive(reclaimPath)) {
-      try {
-        if ((await readLockPid(lockPath)) === owner) await rm(lockPath, { force: true });
-      } finally {
-        await rm(reclaimPath, { force: true });
-      }
-    } else {
-      await delay(50); // another starter is reclaiming
-      const reclaimer = await readLockPid(reclaimPath);
-      if (reclaimer !== null && reclaimer !== 0 && !(reclaimer > 0 && pidIsAlive(reclaimer))) {
-        await rm(reclaimPath, { force: true }); // its reclaimer died mid-reclaim
-      }
-    }
-  }
-  throw new Error(`could not acquire ${lockPath}`);
-}
-
-// Removes the lock only if it is this process's own.
-async function releaseServiceLock() {
-  if ((await readLockPid(lockPath)) === process.pid) await rm(lockPath, { force: true });
-}
-
 async function cmdStart() {
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
 
-  // The lock comes first, before anything else is checked, opened, cleaned
-  // up, reconciled, or listened on.
-  const lock = await acquireServiceLock();
-  if (!lock.ok) {
-    console.error(
-      `Another Browser Tabs service (pid ${lock.pid}) holds ${lockPath}: only one service may run per data directory, ` +
-        "whatever port it uses. Stop it first (`stop` on its port), or, if that process is not a Browser Tabs service, " +
-        "delete the lock file.",
-    );
-    process.exitCode = 1;
-    return;
-  }
-  try {
-    const existingPort = await readNumberFile(portPath);
-    if (existingPort) {
-      try {
-        await httpGetOurHealth(existingPort);
-        // A service answering without holding the lock (e.g. one started
-        // before locking existed): leave it alone, and do not start a second.
-        console.log(`Service already running on port ${existingPort}. Use "status" or "stop".`);
-        await releaseServiceLock();
-        return;
-      } catch {
-        console.log(
-          `Found a stale port file for ${existingPort} (nothing responded there, or it is not this project's ` +
-            "service); starting fresh.",
-        );
-        await cleanupStateFiles();
-      }
+  const existingPort = await readNumberFile(portPath);
+  if (existingPort) {
+    try {
+      await httpGetOurHealth(existingPort);
+      console.log(`Service already running on port ${existingPort}. Use "status" or "stop".`);
+      return;
+    } catch {
+      console.log(
+        `Found a stale port file for ${existingPort} (nothing responded there, or it is not this project's ` +
+          "service); starting fresh.",
+      );
+      await cleanupStateFiles();
     }
-    await runService();
-  } catch (error) {
-    await releaseServiceLock(); // a failed start must not leave its own lock behind
-    throw error;
   }
+  await runService();
 }
 
 async function runService() {
   const port = Number(process.env.BROWSER_TABS_PORT) || DEFAULT_PORT;
 
   const { token, created } = await loadOrCreateCredential(dataDir);
-  // Stage 4: a distinct, separately-stored credential for external-agent
-  // callers (see service/credential.mjs). Loaded/created unconditionally,
-  // exactly like the owner credential above, so it is always available for
-  // an operator who wants to hand a scoped token to an agent — but it is a
-  // different value in a different file, and authorizes only the
-  // server-side allowlists in service/server.mjs, never full access.
-  const { token: agentToken, created: agentCreated } = await loadOrCreateAgentCredential(dataDir);
-  const agentCreatorName = process.env.BROWSER_TABS_AGENT_NAME || "reference-agent";
-
-  // Stage 3: created on first start, migrated forward on every start (see
-  // service/store.mjs). Logging here deliberately never includes
-  // credentials or browser content — only operational messages (db path,
-  // migration version numbers) — project.md Stage 3's logging requirement.
-  // Opening the store is best-effort at this layer: a Node.js runtime
-  // without `node:sqlite` (see store.mjs's own error message) must not take
-  // down the Stage 1/2 bridge, which has no dependency on it — the service
-  // still starts, and every store.* route explicitly reports
-  // `store_unavailable` (service/server.mjs) rather than the whole process
-  // failing to start.
-  let store = null;
-  try {
-    store = await openStore({ dataDir, log: (message) => console.log(`[store] ${message}`) });
-  } catch (error) {
-    console.log(`[store] unavailable, continuing without the derived store: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  // Deliberately a separate try/catch from the one above: opening the
-  // store succeeding or failing is a different fact from retention
-  // cleanup succeeding or failing once it is open. Folding both into one
-  // catch would misreport a cleanup failure as "store unavailable" (the
-  // store did open — `store` is non-null, store.* routes remain
-  // available) and could equally hide a real store-open failure behind a
-  // "retention cleanup failed" message that never applies when there is no
-  // store to clean up. Cleanup failing never prevents the service from
-  // starting with an otherwise-working store.
-  if (store) {
-    try {
-      const cleanupResult = store.runRetentionCleanup();
-      if (cleanupResult.enabled) {
-        console.log(
-          `[store] retention cleanup removed ${cleanupResult.deletedCaptures} capture(s), ` +
-            `${cleanupResult.deletedSummaries} summary(ies), and ${cleanupResult.deletedProposals} proposal(s).`,
-        );
-      }
-    } catch (error) {
-      console.log(
-        `[store] retention cleanup failed (the store itself remains open and available): ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
 
   let shuttingDown = false;
   const shutdown = async () => {
@@ -313,42 +152,17 @@ async function runService() {
     shuttingDown = true;
     console.log("Shutting down...");
     await service.close();
-    store?.close();
     await cleanupStateFiles();
-    await releaseServiceLock();
     process.exit(0);
   };
 
   const service = createService({
     credentialToken: token,
-    agentCredentialToken: agentToken,
-    agentCreatorName,
     port,
     host: "127.0.0.1",
-    store,
     onControlStop: shutdown,
   });
   const address = await service.listen();
-
-  // Phase 2 crash/restart reconciliation. Holding the data-directory lock
-  // (acquireServiceLock, taken before anything else in `start`) is this
-  // process's proof that no other service uses this database — whatever port
-  // it listens on — so any action still "approved" belongs to a service that
-  // died mid-execution, never to a live one. This
-  // runs synchronously right after the bind, before any request is handled,
-  // so it cannot touch an action this process approves. A failure is logged
-  // and does not stop the service (the action then simply stays approved,
-  // and `store.clear` keeps refusing until a later start reconciles it).
-  if (store) {
-    try {
-      const { reconciledCount } = store.reconcileInterruptedActions();
-      if (reconciledCount > 0) {
-        console.log(`[store] marked ${reconciledCount} interrupted browser action(s) as failed with an unknown outcome.`);
-      }
-    } catch (error) {
-      console.log(`[store] could not reconcile interrupted browser actions: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
 
   await writeFile(portPath, String(address.port), "utf8");
   await writeFile(pidPath, String(process.pid), "utf8");
@@ -360,13 +174,6 @@ async function runService() {
     console.log('Not printed again by default; re-display it with "show-token" if needed.');
   } else {
     console.log("Using the existing pairing credential; the extension does not need to re-pair.");
-  }
-  if (agentCreated) {
-    console.log("First run: generated a new, separate external-agent credential.");
-    console.log(`External-agent token (scoped; set as BROWSER_TABS_AGENT_TOKEN for an agent caller): ${agentToken}`);
-    console.log('Not printed again by default; re-display it with "show-agent-token" if needed.');
-  } else {
-    console.log("Using the existing external-agent credential.");
   }
 
   process.on("SIGINT", shutdown);
@@ -433,14 +240,6 @@ async function cmdShowToken() {
   console.log(token);
 }
 
-// Stage 4: re-displays the separate external-agent credential, the same
-// way "show-token" re-displays the owner one — a distinct command because
-// it is a distinct file/token, never printed automatically after first run.
-async function cmdShowAgentToken() {
-  const { token } = await loadOrCreateAgentCredential(dataDir);
-  console.log(token);
-}
-
 const [, , command] = process.argv;
 switch (command) {
   case "start":
@@ -455,10 +254,7 @@ switch (command) {
   case "show-token":
     await cmdShowToken();
     break;
-  case "show-agent-token":
-    await cmdShowAgentToken();
-    break;
   default:
-    console.error("Usage: node service/cli.mjs <start|status|stop|show-token|show-agent-token>");
+    console.error("Usage: node service/cli.mjs <start|status|stop|show-token>");
     process.exitCode = 1;
 }

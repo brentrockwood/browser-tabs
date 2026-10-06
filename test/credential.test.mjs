@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
   ensureDataDir,
-  getAgentCredentialPath,
   getCredentialPath,
-  loadOrCreateAgentCredential,
   loadOrCreateCredential,
 } from "../service/credential.mjs";
 
@@ -84,64 +82,18 @@ test("creates the credential exactly once under concurrent, racing callers", asy
   });
 });
 
-// Stage 4: the external-agent credential is a distinct file with a
-// distinct value, generated and managed with the exact same race-safe,
-// crash-safe, permission-repairing lifecycle as the owner credential above
-// — but the two must never be the same value, and clearing/rotating one
-// must never affect the other.
-test("the external-agent credential is a distinct file and a distinct value from the owner credential, with user-only permissions on first run", async () => {
+// The service has one pairing credential. An `agent-token` file left by an
+// earlier version is neither created, read, changed, nor deleted.
+test("loading the pairing credential leaves an obsolete agent-token file untouched and never creates one", async () => {
   await withTempDataDir(async (dataDir) => {
-    const owner = await loadOrCreateCredential(dataDir);
-    const agent = await loadOrCreateAgentCredential(dataDir);
+    await loadOrCreateCredential(dataDir);
+    assert.deepEqual(await readdir(dataDir), ["credential"]);
 
-    assert.notEqual(getAgentCredentialPath(dataDir), getCredentialPath(dataDir));
-    assert.notEqual(agent.token, owner.token);
-    assert.equal(agent.created, true);
-    assert.match(agent.token, /^[0-9a-f]{64}$/);
-
-    const info = await stat(getAgentCredentialPath(dataDir));
-    assert.equal(info.mode & 0o777, 0o600);
-
-    // The owner credential's own file must be completely unaffected by
-    // having also created an agent credential in the same data directory.
-    const ownerAfter = await loadOrCreateCredential(dataDir);
-    assert.equal(ownerAfter.token, owner.token);
-    assert.equal(ownerAfter.created, false);
-  });
-});
-
-test("reuses an existing external-agent credential instead of regenerating it", async () => {
-  await withTempDataDir(async (dataDir) => {
-    const first = await loadOrCreateAgentCredential(dataDir);
-    const second = await loadOrCreateAgentCredential(dataDir);
-    assert.equal(second.created, false);
-    assert.equal(second.token, first.token);
-  });
-});
-
-test("repairs an existing external-agent credential file left with looser permissions", async () => {
-  await withTempDataDir(async (dataDir) => {
-    const { token } = await loadOrCreateAgentCredential(dataDir);
-    await chmod(getAgentCredentialPath(dataDir), 0o644);
-
-    const repaired = await loadOrCreateAgentCredential(dataDir);
-    assert.equal(repaired.token, token);
-
-    const fileInfo = await stat(getAgentCredentialPath(dataDir));
-    assert.equal(fileInfo.mode & 0o777, 0o600);
-  });
-});
-
-test("creates the external-agent credential exactly once under concurrent, racing callers, independent of the owner credential", async () => {
-  await withTempDataDir(async (dataDir) => {
-    const [ownerResults, agentResults] = await Promise.all([
-      Promise.all(Array.from({ length: 4 }, () => loadOrCreateCredential(dataDir))),
-      Promise.all(Array.from({ length: 4 }, () => loadOrCreateAgentCredential(dataDir))),
-    ]);
-    const ownerTokens = new Set(ownerResults.map((result) => result.token));
-    const agentTokens = new Set(agentResults.map((result) => result.token));
-    assert.equal(ownerTokens.size, 1);
-    assert.equal(agentTokens.size, 1);
-    assert.notEqual([...ownerTokens][0], [...agentTokens][0]);
+    const obsolete = join(dataDir, "agent-token");
+    await writeFile(obsolete, "obsolete-agent-token", { mode: 0o644 });
+    const again = await loadOrCreateCredential(dataDir);
+    assert.equal(again.created, false);
+    assert.equal(await readFile(obsolete, "utf8"), "obsolete-agent-token");
+    assert.equal((await stat(obsolete)).mode & 0o777, 0o644);
   });
 });

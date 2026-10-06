@@ -1,13 +1,15 @@
 #!/usr/bin/env node
-// Repeatable Chromium smoke test for Stage 0.
+// Repeatable Chromium read smoke test.
 //
 // Stages a temporary copy of the extension (plus a test-only harness page),
 // loads it unpacked in a real Chromium-family browser, and exercises the
 // extension's actual runtime.onMessage entry point via
 // chrome.runtime.sendMessage from that harness page — not by importing and
 // calling service-worker.js's exported functions. Covers window listing,
-// tab listing, reading an ordinary page, reading a protected chrome:// page,
-// and an unknown method.
+// tab listing, tab-group listing, a history query, reading an ordinary page,
+// reading a protected chrome:// page, an unknown method, and that the
+// tab-group mutations are not reachable through runtime.onMessage (only the
+// authenticated service connection may mutate).
 //
 // Usage: npm run test:smoke
 //
@@ -201,8 +203,28 @@ async function main() {
             tabId: ${JSON.stringify(protectedTab.id)},
             browserSessionId,
           });
+          const groups = await chrome.runtime.sendMessage({
+            method: "browser.list_tab_groups",
+            windowId: ${JSON.stringify(readableTab.windowId)},
+            browserSessionId,
+          });
+          const history = await chrome.runtime.sendMessage({
+            method: "browser.query_history",
+            startTime: 0,
+            endTime: Date.now(),
+            maxResults: 5,
+          });
           const unknownMethodResult = await chrome.runtime.sendMessage({ method: "browser.not_a_real_method" });
-          return { windows, tabs, readableSnapshot, protectedSnapshot, unknownMethodResult };
+          const mutationResults = [];
+          for (const message of [
+            { method: "browser.create_tab_group", browserSessionId, tabIds: [${JSON.stringify(readableTab.id)}] },
+            { method: "browser.update_tab_group", browserSessionId, groupId: 1, title: "x" },
+            { method: "browser.move_tabs", browserSessionId, tabIds: [${JSON.stringify(readableTab.id)}], groupId: null },
+          ]) {
+            mutationResults.push(await chrome.runtime.sendMessage(message));
+          }
+          const readableTabAfter = await chrome.tabs.get(${JSON.stringify(readableTab.id)});
+          return { windows, tabs, groups, history, readableSnapshot, protectedSnapshot, unknownMethodResult, mutationResults, readableGroupAfter: readableTabAfter.groupId };
         })()
         `,
       );
@@ -229,6 +251,8 @@ async function main() {
       : undefined;
     if (!readableTabEntry) {
       fail(`browser.list_tabs did not include the fixture tab: ${JSON.stringify(outcome.tabs)}`);
+    } else if (readableTabEntry.groupId !== -1) {
+      fail(`browser.list_tabs did not report the ungrouped fixture tab with groupId -1: ${JSON.stringify(readableTabEntry)}`);
     }
 
     if (outcome.readableSnapshot?.status !== "ok" || !outcome.readableSnapshot.text?.includes("smoke test fixture")) {
@@ -245,6 +269,21 @@ async function main() {
       fail(
         `browser.read_tab's protected-page result is missing diagnostic detail: ${JSON.stringify(outcome.protectedSnapshot)}`,
       );
+    }
+
+    if (outcome.groups?.status !== "ok" || !Array.isArray(outcome.groups.groups)) {
+      fail(`browser.list_tab_groups did not return an ok list: ${JSON.stringify(outcome.groups)}`);
+    }
+
+    if (outcome.history?.status !== "ok" || !Array.isArray(outcome.history.entries)) {
+      fail(`browser.query_history did not return an ok page: ${JSON.stringify(outcome.history)}`);
+    }
+
+    if (!outcome.mutationResults.every((result) => result?.status === "error" && result?.code === "unknown_method")) {
+      fail(`a tab-group mutation was reachable through runtime.onMessage: ${JSON.stringify(outcome.mutationResults)}`);
+    }
+    if (outcome.readableGroupAfter !== -1) {
+      fail(`the fixture tab was grouped by a runtime.onMessage request (groupId ${outcome.readableGroupAfter})`);
     }
 
     if (outcome.unknownMethodResult?.status !== "error" || outcome.unknownMethodResult?.code !== "unknown_method") {
@@ -270,8 +309,9 @@ async function main() {
 
     if (process.exitCode !== 1) {
       console.log(
-        "SMOKE_PASS: window listing, tab listing, a readable page, a protected page, and an unknown method " +
-          "all behaved as expected via the extension's actual runtime.onMessage listener.",
+        "SMOKE_PASS: window, tab, and tab-group listing, a history query, a readable page, a protected page, an " +
+          "unknown method, and refused mutations all behaved as expected via the extension's actual " +
+          "runtime.onMessage listener.",
       );
     }
   } catch (error) {

@@ -6,32 +6,17 @@ import {
   ERROR_CODES,
   HEARTBEAT_GRACE_MS,
   HEARTBEAT_INTERVAL_MS,
-  MAX_ARCHIVE_URL_LENGTH,
   MAX_RESPONSE_BYTES,
   MAX_WS_MESSAGE_BYTES,
   PROTOCOL_VERSION,
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_MS,
   WS_MESSAGE_TYPES,
-  normalizeOpenUrl,
+  normalizeCreateTabGroupRequest,
+  normalizeMoveTabsRequest,
+  normalizeUpdateTabGroupRequest,
   validateMethodResult,
 } from "../extension/protocol.js";
-import { STORE_ERROR_CODES, StoreError } from "./store-errors.mjs";
-import { STORE_ERROR_STATUS, STORE_ROUTES, requireIdParam } from "./store-routes.mjs";
-import { UI_ROUTES, serveUiAsset } from "./ui.mjs";
-import {
-  MAX_ACTION_DETAIL_LENGTH,
-  MAX_CODE_LENGTH,
-  MAX_OBSERVED_STATUS_LENGTH,
-  MAX_OBSERVED_TITLE_LENGTH,
-  MAX_OBSERVED_URL_LENGTH,
-  MAX_REQUEST_BODY_BYTES,
-  clipText,
-  validateArchivePreviewRequest,
-  validateGroupPreviewRequest,
-  validateMovePreviewRequest,
-} from "./validation.mjs";
-
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_AUTH_TIMEOUT_MS = 5_000;
 
@@ -56,8 +41,7 @@ function stringParam(url, name) {
   return raw === null ? undefined : raw;
 }
 
-// Stage 2: the allowlist of named browser.* methods exposed as GET
-// /api/<method> routes, each paired with how to read its parameters off the
+// The read-only browser.* methods exposed as GET /api/<method> routes, each paired with how to read its parameters off the
 // query string. A `Map` (not a plain object or object literal) so route
 // lookup can never be confused with inherited `Object.prototype` members —
 // `/api/toString` or `/api/__proto__` simply have no entry and 404, rather
@@ -89,8 +73,21 @@ const API_ROUTES = new Map([
       cursor: numberParam(url, "cursor"),
     }),
   ],
-  ["browser.get_capabilities", () => ({})],
 ]);
+
+// The three direct tab-group mutations, exposed as POST /api/<method> routes
+// with a JSON body, each paired with the shared request validator
+// (extension/protocol.js) the extension re-applies before mutating anything.
+// No preview, approval, or stored record is involved: a valid request is
+// forwarded once, and the extension's observed outcome is returned.
+const MUTATION_ROUTES = new Map([
+  ["browser.create_tab_group", normalizeCreateTabGroupRequest],
+  ["browser.update_tab_group", normalizeUpdateTabGroupRequest],
+  ["browser.move_tabs", normalizeMoveTabsRequest],
+]);
+// A mutation body is at most 100 tab ids and a short title; anything larger
+// is refused before it is parsed.
+const MAX_MUTATION_BODY_BYTES = 16 * 1024;
 
 // HTTP statuses for the stable transport-error codes a caller can receive
 // from the API route. Anything else is reported as a generic internal error
@@ -100,125 +97,6 @@ const ERROR_STATUS = Object.freeze({
   [ERROR_CODES.DISCONNECTED]: 503,
   [ERROR_CODES.SERVICE_SHUTTING_DOWN]: 503,
 });
-
-// Stage 4: the one new operation exposed under /api/workflow.<method>,
-// alongside the existing browser.* (forward-to-extension) and store.*
-// (local-store) namespaces. `workflow.capture_tab` is the *only*
-// capture-creation path exposed to external-agent scope (see
-// AGENT_ALLOWED_STORE_METHODS below, which deliberately excludes
-// `store.captures.create`): it takes a tabId/browserSessionId, performs the
-// real `browser.read_tab` round trip itself, and persists exactly that
-// freshly-fetched, already-validated result — never a caller-supplied
-// capture body — so stored browser evidence cannot be forged by submitting
-// arbitrary JSON (see handleWorkflowMethod below).
-const WORKFLOW_ROUTES = new Map([
-  [
-    "workflow.capture_tab",
-    {
-      httpMethod: "POST",
-      paramsFromQuery: (url) => ({ tabId: numberParam(url, "tabId"), browserSessionId: stringParam(url, "browserSessionId") }),
-    },
-  ],
-]);
-
-// Phase 2 Action 1: the owner-only routes for opening a URL in a new tab —
-// the two-step flow of a preview, then one decision by stored action id.
-// None of these (nor the extension's `browser.open_tab`, which is not in
-// API_ROUTES and so has no HTTP route at all) is in any AGENT_ALLOWED_* set,
-// and handleActionMethod additionally refuses every non-owner scope
-// explicitly. All are `POST` with the operation named by the route, never by
-// a body field.
-//
-// Phase 2 Action 2 adds the same three routes for `configure_group` (create a
-// tab group around one chosen ungrouped tab, or rename/recolor a group). Each
-// route is bound to its kind: a decision on one kind's route for another
-// kind's action id is a 404 that decides nothing.
-const ACTION_ROUTES = new Map([
-  ["action.open_tab.preview", { kind: "open_tab", operation: "preview" }],
-  ["action.open_tab.approve", { kind: "open_tab", operation: "approve" }],
-  ["action.open_tab.reject", { kind: "open_tab", operation: "reject" }],
-  ["action.configure_group.preview", { kind: "configure_group", operation: "preview" }],
-  ["action.configure_group.approve", { kind: "configure_group", operation: "approve" }],
-  ["action.configure_group.reject", { kind: "configure_group", operation: "reject" }],
-  // Phase 2 Action 3: move 1..100 selected tabs into one existing group or one
-  // new group, in one window — the same three owner-only routes.
-  ["action.move_tabs.preview", { kind: "move_tabs", operation: "preview" }],
-  ["action.move_tabs.approve", { kind: "move_tabs", operation: "approve" }],
-  ["action.move_tabs.reject", { kind: "move_tabs", operation: "reject" }],
-  // Phase 2 Action 4: archive one tab — save a capture of it, then close exactly
-  // that tab — with the same three owner-only routes.
-  ["action.archive_tab.preview", { kind: "archive_tab", operation: "preview" }],
-  ["action.archive_tab.approve", { kind: "archive_tab", operation: "approve" }],
-  ["action.archive_tab.reject", { kind: "archive_tab", operation: "reject" }],
-]);
-// A preview body is one short URL (see MAX_OPEN_URL_LENGTH) or a handle and a
-// short title; anything near the store routes' 8 MiB request bound is refused
-// as oversized long before.
-const MAX_ACTION_REQUEST_BODY_BYTES = 16 * 1024;
-// Statuses for the stable codes a *preview* can be refused with because of
-// what the browser reported (the target is gone, or the browser has no tab
-// groups). Not part of ERROR_STATUS, which the read routes also use.
-const PREVIEW_REFUSAL_STATUS = Object.freeze({
-  [ERROR_CODES.STALE_HANDLE]: 409,
-  [ERROR_CODES.UNSUPPORTED_FEATURE]: 501,
-});
-// A group action the extension refuses with one of these changed nothing
-// because what was previewed no longer holds: a stale (not merely failed) outcome.
-const STALE_GROUP_CODES = Object.freeze([ERROR_CODES.STALE_SESSION, ERROR_CODES.STALE_HANDLE, ERROR_CODES.STATE_MISMATCH]);
-
-function codedError(code, message) {
-  const error = new Error(message);
-  error.code = code;
-  return error;
-}
-
-// Stage 4: the server-side allowlists an external-agent credential's scope
-// is restricted to (project.md Stage 4 remediation: "external-agent scope
-// must be server-side allowlisted only to Stage4 operations needed"). The
-// owner credential bypasses these entirely (see `authenticate` below) — it
-// always has full, unscoped access, exactly as before this stage. Anything
-// not listed here is unreachable for agent scope even if the underlying
-// route exists for the owner: a 403 `forbidden_scope`, never a silent
-// allow, and never implemented as "everything except a denylist."
-//
-// browser.*: every Stage 2 read-only route — listing/reading browser
-// sources is always safe; none of them mutate the browser or persist
-// anything.
-const AGENT_ALLOWED_BROWSER_METHODS = new Set([
-  "browser.list_windows",
-  "browser.list_tabs",
-  "browser.list_tab_groups",
-  "browser.read_tab",
-  "browser.query_history",
-  "browser.get_capabilities",
-]);
-// workflow.*: the one capture-creation path agent scope may use.
-const AGENT_ALLOWED_WORKFLOW_METHODS = new Set(["workflow.capture_tab"]);
-// Stage 5 remediation: `owner.status` (handleOwnerStatus, below) is
-// deliberately not reachable through any AGENT_ALLOWED_* set at all —
-// like `/control/stop`, it is owner-only by its own explicit scope check,
-// not by omission from an allowlist that merely happens not to name it.
-// store.*: read evidence already captured, and write only the two derived
-// record types Stage 4's workflow needs (summaries, proposals) — never
-// update/delete, never tags/collections/queue, never retention/clear, and
-// never a direct `store.captures.create` (which would let a caller assert
-// arbitrary "evidence" instead of going through workflow.capture_tab above).
-const AGENT_ALLOWED_STORE_METHODS = new Set([
-  "store.captures.list",
-  "store.captures.read",
-  "store.summaries.create",
-  "store.summaries.list",
-  "store.proposals.create",
-  "store.proposals.list",
-]);
-
-function forbiddenScopeResponse(requestId, name) {
-  return {
-    protocolVersion: PROTOCOL_VERSION,
-    requestId,
-    error: { code: ERROR_CODES.FORBIDDEN_SCOPE, detail: `"${name}" is not permitted for this credential's scope` },
-  };
-}
 
 function timingSafeTokenEquals(candidate, expected) {
   if (typeof candidate !== "string") return false;
@@ -237,7 +115,7 @@ function isTrustedExtensionOrigin(origin) {
   );
 }
 
-// Stage 5 remediation: Host-header defense against DNS rebinding and
+// Host-header defense against DNS rebinding and
 // similar Host-header-confusion attacks. This service binds only to
 // 127.0.0.1 (project.md's trust model), but loopback binding alone is not
 // sufficient isolation: a page served from an attacker-controlled DNS name
@@ -246,8 +124,8 @@ function isTrustedExtensionOrigin(origin) {
 // the navigated-to hostname — not the resolved IP. project.md's trust model
 // already makes exactly this point about the extension WebSocket's Origin
 // check ("Loopback alone is not authentication"); this is the HTTP-side
-// counterpart, applied before anything else — serving the UI, answering
-// /health, or dispatching an authenticated /api/ or /control/ route — ever
+// counterpart, applied before anything else — answering /health, or
+// dispatching an authenticated /api/ or /control/ route — ever
 // happens for a request whose own Host header is not this exact, literal,
 // canonical value.
 //
@@ -289,17 +167,6 @@ function checkHost(req) {
   };
 }
 
-// True if the request declares any body framing at all — a `Content-Length`
-// other than exactly "0", or any `Transfer-Encoding` (chunked bodies carry
-// no Content-Length). Used to reject a body on a route that never reads
-// one (workflow.capture_tab), so a forged body can never be silently
-// ignored and then mistaken for having had no effect.
-function hasRequestBodyFraming(req) {
-  const contentLength = req.headers["content-length"];
-  if (typeof contentLength === "string" && contentLength !== "0") return true;
-  return req.headers["transfer-encoding"] !== undefined;
-}
-
 function respondJson(res, status, body) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -309,40 +176,47 @@ function respondJson(res, status, body) {
   res.end(payload);
 }
 
-// Creates the Stage 1 local bridge: an HTTP API bound to loopback, a
+// The extension sits at a trust boundary, so a reported change must be about
+// this request, not another browser object: the requested session, exactly the
+// requested tabs (in order, or an ordered subset for a partial outcome), and —
+// where the request names one — the requested group. Refusals and unknown
+// outcomes (`changed` false or null) report nothing to compare.
+function mutationResultMatchesRequest(method, request, result) {
+  if (result.changed !== true) return true;
+  if (result.browserSessionId !== request.browserSessionId) return false;
+  const requestedGroup = method === "browser.create_tab_group" ? undefined : request.groupId;
+  if (result.status === "ok") {
+    if (method === "browser.update_tab_group") return result.group.groupId === requestedGroup;
+    const sameTabs = result.tabs.length === request.tabIds.length && result.tabs.every((tab, index) => tab.tabId === request.tabIds[index]);
+    if (method === "browser.create_tab_group") return sameTabs;
+    return sameTabs && (requestedGroup === null ? result.group === null : result.group?.groupId === requestedGroup);
+  }
+  if (requestedGroup !== undefined && result.groupId !== null && result.groupId !== requestedGroup) return false;
+  if (result.tabIds === null) return true;
+  if (method === "browser.update_tab_group") return false;
+  let next = 0;
+  return result.tabIds.every((id) => {
+    next = request.tabIds.indexOf(id, next) + 1;
+    return next > 0;
+  });
+}
+
+// Creates the local bridge: an HTTP API bound to loopback, a
 // WebSocket endpoint the extension connects out to, and the request
 // correlation between them. Does not call `listen()` itself, so tests can
 // bind an ephemeral port.
 export function createService({
   credentialToken,
-  // Stage 4: the separate, scoped external-agent credential (see
-  // service/credential.mjs's loadOrCreateAgentCredential). Optional so
-  // every existing Stage 1/2/3 test/caller that never configures one keeps
-  // exactly its prior behavior: with no agent token configured, only
-  // `credentialToken` (owner) authenticates at all, same as before this
-  // stage.
-  agentCredentialToken = null,
-  // Stage 4: the fixed, server-controlled creator identity bound to every
-  // derived record an agent-scoped write creates (summaries, proposals) —
-  // never the identity the caller's request body claims. See
-  // handleStoreMethod's creator-override step below.
-  agentCreatorName = "reference-agent",
   host = "127.0.0.1",
   port = 0,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS,
   heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
   heartbeatGraceMs = HEARTBEAT_GRACE_MS,
-  // Stage 3: the derived store (service/store.mjs). Optional so Stage 1/2
-  // tests that only exercise the browser-bridge routes can keep constructing
-  // a service without one; any store.* route then explicitly reports
-  // `store_unavailable` (503) rather than crashing.
-  store = null,
-  maxStoreRequestBodyBytes = MAX_REQUEST_BODY_BYTES,
   // Conservative request-rate and response-size bounds enforced at this
-  // service boundary (project.md Stage 2), independent of whatever an
-  // individual browser operation itself bounds. Overridable so tests can
-  // exercise both limits without waiting on production-sized windows.
+  // service boundary, independent of whatever an individual browser
+  // operation itself bounds. Overridable so tests can exercise both limits
+  // without waiting on production-sized windows.
   rateLimitWindowMs = RATE_LIMIT_WINDOW_MS,
   rateLimitMaxRequests = RATE_LIMIT_MAX_REQUESTS,
   maxResponseBytes = MAX_RESPONSE_BYTES,
@@ -358,16 +232,6 @@ export function createService({
   onControlStop = async () => {},
   log = () => {},
 }) {
-  // Fails fast, before any socket is ever opened: an agent credential equal
-  // to the owner credential would let the external-agent token authenticate
-  // with full owner scope (see `authenticate` below, which checks the owner
-  // token first but would still grant "owner" for a presented token equal
-  // to it either way) — exactly the privilege escalation Stage 4's separate
-  // scoped credential exists to prevent.
-  if (typeof agentCredentialToken === "string" && agentCredentialToken.length > 0 && timingSafeTokenEquals(agentCredentialToken, credentialToken)) {
-    throw new Error("agentCredentialToken must not equal credentialToken: a shared token would grant the external-agent credential owner scope");
-  }
-
   const startedAt = Date.now();
   let extensionSocket = null;
   let extensionConnectedAt = null;
@@ -390,26 +254,13 @@ export function createService({
     return rateWindowCount <= rateLimitMaxRequests;
   }
 
-  // Authenticates a request and reports which *scope* the presented
-  // credential carries — `"owner"` (the original pairing credential, full
-  // access, unchanged from before Stage 4) or `"agent"` (the separate,
-  // restricted external-agent credential; see the AGENT_ALLOWED_* sets
-  // above). Returns `{ ok: true, scope }` on success or `{ ok: false,
-  // status, error }` on failure, so every call site can branch on scope
-  // without re-deriving it. Both tokens are compared with the same
-  // timing-safe comparison used before this stage; agentCredentialToken
-  // being unset (the default) means no token other than the owner's can
-  // ever authenticate, exactly matching this project's behavior before
-  // Stage 4.
+  // Authenticates a request against the one pairing credential, which grants
+  // the complete API. Returns `{ ok: true }` or `{ ok: false, status, error }`.
   function authenticate(req) {
     const header = req.headers.authorization;
     const match = typeof header === "string" ? /^Bearer\s+(.+)$/.exec(header) : null;
     if (!match) return { ok: false, status: 401, error: { code: ERROR_CODES.MISSING_CREDENTIAL } };
-    const presented = match[1];
-    if (timingSafeTokenEquals(presented, credentialToken)) return { ok: true, scope: "owner" };
-    if (typeof agentCredentialToken === "string" && agentCredentialToken.length > 0 && timingSafeTokenEquals(presented, agentCredentialToken)) {
-      return { ok: true, scope: "agent" };
-    }
+    if (timingSafeTokenEquals(match[1], credentialToken)) return { ok: true };
     return { ok: false, status: 401, error: { code: ERROR_CODES.INVALID_CREDENTIAL } };
   }
 
@@ -450,7 +301,7 @@ export function createService({
         error.code = ERROR_CODES.DISCONNECTED;
         // Nothing was sent, so nothing can have happened on the other side —
         // unlike every other rejection below, where the request may have
-        // reached the extension. Phase 2 actions record the difference.
+        // reached the extension. Mutation routes report the difference.
         error.requestSent = false;
         reject(error);
         return;
@@ -475,16 +326,6 @@ export function createService({
       respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
       return;
     }
-    // Stage 4: explicit, server-side scope allowlist — the owner scope
-    // bypasses this entirely; agent scope may only reach the browser.*
-    // methods named in AGENT_ALLOWED_BROWSER_METHODS. Checked before rate
-    // limiting/forwarding so a forbidden request never reaches the
-    // extension at all.
-    if (auth.scope === "agent" && !AGENT_ALLOWED_BROWSER_METHODS.has(method)) {
-      respondJson(res, 403, forbiddenScopeResponse(requestId, method));
-      return;
-    }
-
     // Checked after authentication (an unauthenticated caller already gets
     // turned away above) but before the extension round trip: a flood of
     // otherwise-valid requests is rejected here at the service boundary,
@@ -583,7 +424,7 @@ export function createService({
         total += chunk.length;
         if (total > maxBytes) {
           const error = new Error("request body exceeds the maximum allowed size");
-          error.code = STORE_ERROR_CODES.PAYLOAD_TOO_LARGE;
+          error.code = ERROR_CODES.PAYLOAD_TOO_LARGE;
           fail(error);
           return;
         }
@@ -599,999 +440,98 @@ export function createService({
   }
 
   function parseJsonBody(raw) {
-    if (raw.length === 0) return {};
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch (error) {
       const wrapped = new Error(`request body is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
-      wrapped.code = STORE_ERROR_CODES.MALFORMED_BODY;
+      wrapped.code = ERROR_CODES.INVALID_REQUEST;
       throw wrapped;
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
       const error = new Error("request body must be a JSON object");
-      error.code = STORE_ERROR_CODES.MALFORMED_BODY;
+      error.code = ERROR_CODES.INVALID_REQUEST;
       throw error;
     }
     return parsed;
   }
 
-  // Dispatches one Stage 3 store.* route (service/store-routes.mjs):
-  // authenticates and rate-limits exactly like a browser.* route, reads and
-  // bounds the request body for POST/PATCH, runs the route against the
-  // store, and maps a StoreError's stable code to an HTTP status
-  // (STORE_ERROR_STATUS). Deliberately never passes request bodies, query
-  // values, or store error detail to `log()` — those can contain captured
-  // browser content (project.md Stage 3: "keep credentials and browser
-  // content out of logs by default").
-  async function handleStoreMethod(name, route, req, res, url) {
+  // One direct tab-group mutation: authenticate, bound and validate the body
+  // with the shared request validator, forward it to the extension once, and
+  // return the extension's validated, observed outcome. Never retried. Every
+  // response — result or error — states `changed`: `false` when nothing can
+  // have changed (refused before the request reached the browser, or by the
+  // extension before its one mutation call), `true` when a change is known to
+  // have been made, and `null` when the request may have been acted on but
+  // the outcome is unknown (the answer was lost, or unusable).
+  async function handleMutationMethod(method, req, res) {
     const requestId = requestIdFor(req);
+    const respondError = (status, code, detail, changed) => {
+      const error = { code, changed };
+      if (detail !== undefined) error.detail = detail;
+      respondJson(res, status, { protocolVersion: PROTOCOL_VERSION, requestId, error });
+    };
     const auth = authenticate(req);
     if (!auth.ok) {
-      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
-      return;
-    }
-    // Stage 4: agent scope may reach only the store.* methods named in
-    // AGENT_ALLOWED_STORE_METHODS — deliberately excluding
-    // store.captures.create, every update/delete route, tags/collections/
-    // queue entirely, and retention/clear. The owner scope is unaffected.
-    if (auth.scope === "agent" && !AGENT_ALLOWED_STORE_METHODS.has(name)) {
-      respondJson(res, 403, forbiddenScopeResponse(requestId, name));
+      respondError(auth.status, auth.error.code, undefined, false);
       return;
     }
     if (!checkRateLimit()) {
-      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
-      return;
-    }
-    if (!store) {
-      respondJson(res, 503, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: "store_unavailable" } });
-      return;
-    }
-    if (req.method !== route.httpMethod) {
-      respondJson(res, 405, {
-        protocolVersion: PROTOCOL_VERSION,
-        requestId,
-        error: { code: "method_not_allowed", detail: `"${name}" expects ${route.httpMethod}` },
-      });
+      respondError(429, ERROR_CODES.RATE_LIMITED, undefined, false);
       return;
     }
 
-    let body;
-    if (route.httpMethod === "POST" || route.httpMethod === "PATCH") {
-      try {
-        const raw = await readRequestBody(req, maxStoreRequestBodyBytes);
-        body = parseJsonBody(raw);
-      } catch (error) {
-        const status = error.code === STORE_ERROR_CODES.PAYLOAD_TOO_LARGE ? 413 : 400;
-        respondJson(res, status, {
-          protocolVersion: PROTOCOL_VERSION,
-          requestId,
-          error: { code: error.code ?? STORE_ERROR_CODES.MALFORMED_BODY, detail: error.message },
-        });
-        return;
-      }
-    }
-
-    // Stage 4: an agent-scoped write cannot assert its own creator identity
-    // — in particular it cannot claim `creatorType: "user"` to impersonate
-    // the local human. Whatever the request body contains for
-    // creatorType/creatorName is discarded and replaced with the fixed,
-    // server-controlled external-agent identity before the store ever sees
-    // it. This is unconditional for any agent-scoped POST/PATCH body (not
-    // only the two routes that use these fields): agent scope cannot reach
-    // any other mutating store.* route at all (see the allowlist check
-    // above), so there is nothing else for this override to affect.
-    if (auth.scope === "agent" && body !== undefined && body !== null && typeof body === "object" && !Array.isArray(body)) {
-      body = { ...body, creatorType: "agent", creatorName: agentCreatorName };
-    }
-
+    let checked;
     try {
-      const result = route.run({ store, url, body });
-      const responseBody = { protocolVersion: PROTOCOL_VERSION, requestId, result };
-      const payload = JSON.stringify(responseBody);
-      // Same bound and stable outcome as the browser.* routes above
-      // (maxResponseBytes, ERROR_CODES.RESPONSE_TOO_LARGE): a store.*
-      // route's own per-field bounds (e.g. list projections that omit
-      // large text — service/store.mjs's rowToCaptureListItem) keep this
-      // rare in practice, but it is still enforced here as the same
-      // explicit, final backstop, never an unbounded response written to
-      // the socket.
-      if (Buffer.byteLength(payload) > maxResponseBytes) {
-        respondJson(res, 502, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RESPONSE_TOO_LARGE } });
-        return;
-      }
-      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) });
-      res.end(payload);
+      const body = parseJsonBody(await readRequestBody(req, MAX_MUTATION_BODY_BYTES));
+      checked = MUTATION_ROUTES.get(method)(body);
+      if (checked.valid) checked.request.browserSessionId = body.browserSessionId;
     } catch (error) {
-      const storeError =
-        error instanceof StoreError ? error : new StoreError(STORE_ERROR_CODES.DB_ERROR, error instanceof Error ? error.message : String(error));
-      const status = STORE_ERROR_STATUS[storeError.code] ?? 500;
-      respondJson(res, status, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: storeError.code, detail: storeError.message } });
-    }
-  }
-
-  // Stage 4: `workflow.capture_tab` — the only capture-creation path
-  // exposed to external-agent scope (AGENT_ALLOWED_STORE_METHODS
-  // deliberately excludes `store.captures.create` for that reason). Unlike
-  // every store.* route, this one does not take a caller-supplied capture
-  // body at all: it performs the real `browser.read_tab` extension round
-  // trip itself (exactly like handleApiMethod above), validates that
-  // result the same way handleApiMethod does, and persists *that*
-  // server-fetched, already-validated result — never anything read from
-  // the HTTP request body, because there is no such body. A caller cannot
-  // forge stored browser evidence through this route no matter what JSON
-  // it sends, because nothing it sends is ever stored.
-  //
-  // Non-"ok" `browser.read_tab` outcomes (stale handle, protected page,
-  // tab still loading, ...) are persisted too, not discarded: the capture
-  // row then records the envelope's `code`/`detail` only (no invented page
-  // content — the same rule validateCaptureInput already enforces for any
-  // caller), which preserves a documented record of "this is what happened
-  // when tab X was read," matching how store.captures.create already
-  // supports non-"ok" captures (see service/validation.mjs). The response
-  // is always the same bounded capture projection store.captures.create
-  // returns, regardless of status.
-  async function handleWorkflowMethod(name, route, req, res, url) {
-    const requestId = requestIdFor(req);
-    const auth = authenticate(req);
-    if (!auth.ok) {
-      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
+      const tooLarge = error.code === ERROR_CODES.PAYLOAD_TOO_LARGE;
+      respondError(tooLarge ? 413 : 400, tooLarge ? ERROR_CODES.PAYLOAD_TOO_LARGE : ERROR_CODES.INVALID_REQUEST, error.message, false);
       return;
     }
-    if (auth.scope === "agent" && !AGENT_ALLOWED_WORKFLOW_METHODS.has(name)) {
-      respondJson(res, 403, forbiddenScopeResponse(requestId, name));
+    if (!checked.valid) {
+      respondError(400, ERROR_CODES.INVALID_PARAMS, checked.reason, false);
       return;
     }
-    if (!checkRateLimit()) {
-      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
-      return;
-    }
-    if (!store) {
-      respondJson(res, 503, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: "store_unavailable" } });
-      return;
-    }
-    if (req.method !== route.httpMethod) {
-      respondJson(res, 405, {
-        protocolVersion: PROTOCOL_VERSION,
-        requestId,
-        error: { code: "method_not_allowed", detail: `"${name}" expects ${route.httpMethod}` },
-      });
-      return;
-    }
-
-    // `workflow.capture_tab` is a no-body POST (see this function's header
-    // comment): any caller-supplied body is simply never read or inspected,
-    // so a caller asserting one via Content-Length or chunked
-    // Transfer-Encoding framing is rejected explicitly, before the
-    // extension round trip or any persistence, rather than having that body
-    // silently ignored.
-    if (hasRequestBodyFraming(req)) {
-      respondJson(res, 400, {
-        protocolVersion: PROTOCOL_VERSION,
-        requestId,
-        error: { code: ERROR_CODES.INVALID_REQUEST, detail: `"${name}" does not accept a request body` },
-      });
-      return;
-    }
-
-    let params;
-    try {
-      params = route.paramsFromQuery(url);
-    } catch (error) {
-      respondJson(res, 500, {
-        protocolVersion: PROTOCOL_VERSION,
-        requestId,
-        error: { code: ERROR_CODES.INTERNAL_ERROR, detail: error instanceof Error ? error.message : String(error) },
-      });
-      return;
-    }
-
-    try {
-      const extensionResult = await sendExtensionRequest("browser.read_tab", params);
-
-      let validation;
-      try {
-        validation = validateMethodResult("browser.read_tab", extensionResult);
-      } catch (error) {
-        validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-      }
-      if (!validation.valid) {
-        respondJson(res, 502, {
-          protocolVersion: PROTOCOL_VERSION,
-          requestId,
-          error: { code: ERROR_CODES.INVALID_EXTENSION_RESPONSE, detail: validation.reason },
-        });
-        return;
-      }
-
-      let result;
-      try {
-        // The server's own freshly-validated result, exactly as received —
-        // never the HTTP request body (there isn't one for this route).
-        result = store.createCapture(extensionResult);
-      } catch (error) {
-        const storeError =
-          error instanceof StoreError ? error : new StoreError(STORE_ERROR_CODES.DB_ERROR, error instanceof Error ? error.message : String(error));
-        const status = STORE_ERROR_STATUS[storeError.code] ?? 500;
-        respondJson(res, status, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: storeError.code, detail: storeError.message } });
-        return;
-      }
-
-      const body = { protocolVersion: PROTOCOL_VERSION, requestId, result };
-      const payload = JSON.stringify(body);
-      if (Buffer.byteLength(payload) > maxResponseBytes) {
-        respondJson(res, 502, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RESPONSE_TOO_LARGE } });
-        return;
-      }
-      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) });
-      res.end(payload);
-    } catch (error) {
-      const status = ERROR_STATUS[error.code] ?? 502;
-      const code = error.code in ERROR_STATUS ? error.code : ERROR_CODES.INTERNAL_ERROR;
-      const body = { protocolVersion: PROTOCOL_VERSION, requestId, error: { code } };
-      if (!(error.code in ERROR_STATUS)) body.error.detail = error.message;
-      respondJson(res, status, body);
-    }
-  }
-
-  // Phase 2 Action 1, step one: records a preview and executes nothing. The
-  // body is exactly `{ "url": "<absolute http(s) URL>" }` — no other field
-  // (in particular no session id) is accepted. The URL is validated and
-  // normalized here, and the browser session it is bound to is learned from
-  // the extension itself (a `browser.get_capabilities` round trip), never
-  // from the caller.
-  async function previewOpenTab(req) {
-    const body = parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES));
-    const keys = Object.keys(body);
-    if (keys.length !== 1 || keys[0] !== "url") {
-      throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, 'body: must contain exactly one field, "url"');
-    }
-    const checked = normalizeOpenUrl(body.url);
-    if (!checked.valid) throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, `url: ${checked.reason}`);
-
-    const capabilities = await sendExtensionRequest("browser.get_capabilities", {});
-    let validation;
-    try {
-      validation = validateMethodResult("browser.get_capabilities", capabilities);
-    } catch (error) {
-      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (!validation.valid || capabilities.status !== "ok") {
-      const error = new Error(validation.valid ? "the extension could not report its browser session" : validation.reason);
-      error.code = ERROR_CODES.INVALID_EXTENSION_RESPONSE;
-      throw error;
-    }
-    return store.createAction({ url: checked.url, browserSessionId: capabilities.browserSessionId });
-  }
-
-  // Phase 2 Action 2, step one: records a group preview and changes nothing.
-  // The body is exactly an operation, one handle (`tabId` to create a group
-  // around that tab, `groupId` to rename/recolor that group) and the requested
-  // `title`/`color` — never a session or window. The extension is asked
-  // (read-only) about that one handle: the answer's own envelope supplies the
-  // browser session the preview is bound to, and its current state (the tab's
-  // window and that it is ungrouped; the group's window, title, and color) is
-  // what the preview binds and the extension re-checks before mutating.
-  async function previewConfigureGroup(req) {
-    const request = validateGroupPreviewRequest(parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES)));
-    const creating = request.operation === "create";
-    const inspected = await sendExtensionRequest("browser.inspect_group_target", creating ? { tabId: request.tabId } : { groupId: request.groupId });
-    let validation;
-    try {
-      validation = validateMethodResult("browser.inspect_group_target", inspected);
-    } catch (error) {
-      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (!validation.valid) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
-    if (inspected.status === "unsupported") throw codedError(ERROR_CODES.UNSUPPORTED_FEATURE, "this browser does not support tab groups; nothing was changed");
-    if (inspected.status !== "ok") {
-      if (inspected.code === ERROR_CODES.STALE_HANDLE) throw codedError(ERROR_CODES.STALE_HANDLE, "the tab or group no longer exists");
-      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tab or group");
-    }
-
-    let binding;
-    if (creating) {
-      const { tab } = inspected;
-      if (tab === null || tab.tabId !== request.tabId) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported a different tab than the one requested");
-      if (tab.grouped) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tab is already in a group; only an ungrouped tab can be put in a new group");
-      if (tab.pinned) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tab is pinned; a pinned tab cannot be put in a group");
-      binding = {
-        operation: "create",
-        tabId: tab.tabId,
-        windowId: tab.windowId,
-        title: request.title,
-        color: request.color,
-        tabTitle: clipText(tab.title, MAX_OBSERVED_TITLE_LENGTH),
-        tabUrl: clipText(tab.url, MAX_OBSERVED_URL_LENGTH),
-      };
-    } else {
-      const { group } = inspected;
-      if (group === null || group.groupId !== request.groupId) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported a different group than the one requested");
-      binding = {
-        operation: "update",
-        groupId: group.groupId,
-        windowId: group.windowId,
-        expectedTitle: group.title ?? "",
-        expectedColor: group.color,
-        title: request.title,
-        color: request.color,
-      };
-    }
-    return store.createAction({ kind: "configure_group", browserSessionId: inspected.browserSessionId, binding });
-  }
-
-  // Phase 2 Action 3, step one: records a move preview and changes nothing. The
-  // body is exactly the tab ids and a destination — `existing` + `groupId`, or
-  // `new` + an optional `title`/`color` — never a session, window, or any
-  // current state. The extension is asked (read-only) about those tabs and the
-  // destination group: the answer's envelope supplies the browser session the
-  // preview is bound to, and each tab's window, group membership, and pinned
-  // state (and the group's window, title, and color) are what the preview
-  // binds and the extension re-checks before moving anything. Refused up
-  // front, with nothing stored: a pinned tab, tabs in more than one window, a
-  // destination group in another window, a missing handle, and a move that
-  // would change nothing (every tab already in the existing group).
-  async function previewMoveTabs(req) {
-    const request = validateMovePreviewRequest(parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES)));
-    const existing = request.destination === "existing";
-    const inspected = await sendExtensionRequest("browser.inspect_move_target", existing ? { tabIds: request.tabIds, groupId: request.groupId } : { tabIds: request.tabIds });
-    let validation;
-    try {
-      validation = validateMethodResult("browser.inspect_move_target", inspected);
-    } catch (error) {
-      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (!validation.valid) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
-    if (inspected.status === "unsupported") throw codedError(ERROR_CODES.UNSUPPORTED_FEATURE, "this browser does not support tab groups; nothing was changed");
-    if (inspected.status !== "ok") {
-      if (inspected.code === ERROR_CODES.STALE_HANDLE) throw codedError(ERROR_CODES.STALE_HANDLE, "a tab or the group no longer exists");
-      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tabs or group");
-    }
-
-    const { tabs, group } = inspected;
-    const answeredFor = tabs.length === request.tabIds.length && tabs.every((tab, index) => tab.tabId === request.tabIds[index]);
-    if (!answeredFor || (existing ? group === null || group.groupId !== request.groupId : group !== null)) {
-      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported different tabs or a different group than the ones requested");
-    }
-    const windowId = tabs[0].windowId;
-    if (tabs.some((tab) => tab.windowId !== windowId)) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tabs are not all in one window");
-    if (tabs.some((tab) => tab.pinned)) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "a selected tab is pinned; a pinned tab cannot be put in a group");
-    if (existing && group.windowId !== windowId) throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the destination group is not in the tabs' window");
-
-    const binding = {
-      destination: request.destination,
-      windowId,
-      // Only the bound state is kept: each tab's id and the group it is in now.
-      // The titles and addresses the inspection returned are read-only and are
-      // neither stored nor returned for a move.
-      tabs: tabs.map((tab) => ({ tabId: tab.tabId, groupId: tab.groupId })),
-      ...(existing
-        ? { groupId: group.groupId, expectedTitle: group.title ?? "", expectedColor: group.color }
-        : { title: request.title, color: request.color }),
-    };
-    return store.createAction({ kind: "move_tabs", browserSessionId: inspected.browserSessionId, binding });
-  }
-
-  // Interprets the extension's answer to one approved `browser.open_tab`
-  // into the outcome recorded on the action. Never throws: whatever
-  // happened, the approved action must end in a recorded result, because
-  // the decision is already committed and is never retried. `mutation`
-  // says what the browser is known to have undergone — "none" only when it
-  // is certain nothing was sent or created, "unknown" whenever the request
-  // may have been acted on but the answer was lost or unusable.
-  async function executeOpenTab(action) {
-    const failed = (mutation, code, detail) => ({
-      state: "failed",
-      mutation,
-      code,
-      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
-      tabId: null,
-      windowId: null,
-      observed: null,
-    });
+    const { request } = checked;
 
     let result;
     try {
-      result = await sendExtensionRequest("browser.open_tab", { url: action.url, browserSessionId: action.browserSessionId });
+      result = await sendExtensionRequest(method, request);
     } catch (error) {
-      const code = Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR;
-      return error?.requestSent === false
-        ? failed("none", code, "the request was never sent to the extension")
-        : failed("unknown", code, "the request was sent but no answer arrived; the browser may or may not have opened the tab");
-    }
-
-    let validation;
-    try {
-      validation = validateMethodResult("browser.open_tab", result);
-    } catch (error) {
-      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (!validation.valid) return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
-
-    const detail = typeof result.detail === "string" ? clipText(result.detail, MAX_ACTION_DETAIL_LENGTH) : null;
-    if (!result.created) {
-      // The extension refused or failed without creating anything. A
-      // stale_session is the expected "the browser restarted since the
-      // preview" outcome, kept distinct from an ordinary failure.
-      const state = result.code === ERROR_CODES.STALE_SESSION ? "stale" : "failed";
-      return { state, mutation: "none", code: clipText(result.code, MAX_CODE_LENGTH), detail, tabId: null, windowId: null, observed: null };
-    }
-
-    // A tab was created. Its answer must still be about *this* preview.
-    if (result.browserSessionId !== action.browserSessionId || (result.status === "ok" && result.requestedUrl !== action.url)) {
-      return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview");
-    }
-    if (result.status !== "ok") {
-      return { state: "partial", mutation: "created", code: result.code, detail, tabId: result.tabId, windowId: result.windowId, observed: null };
-    }
-    const { tab } = result;
-    return {
-      state: "executed",
-      mutation: "created",
-      code: null,
-      detail: null,
-      tabId: tab.tabId,
-      windowId: tab.windowId,
-      observed: {
-        index: tab.index,
-        active: tab.active,
-        status: clipText(tab.status, MAX_OBSERVED_STATUS_LENGTH) || "unknown",
-        title: clipText(tab.title, MAX_OBSERVED_TITLE_LENGTH),
-        url: clipText(tab.url, MAX_OBSERVED_URL_LENGTH),
-        pendingUrl: clipText(result.pendingUrl, MAX_OBSERVED_URL_LENGTH),
-      },
-    };
-  }
-
-  // Phase 2 Action 2: interprets the extension's answer to one approved
-  // `browser.configure_group` into the outcome recorded on the action, on the
-  // same terms as executeOpenTab: never throws, and `mutation` is "none" only
-  // when nothing was sent or changed, "unknown" when the request may have been
-  // acted on but the answer was lost or unusable. The extension refusing
-  // because the previewed session, handle, or bound state no longer holds is
-  // `stale`; a browser without tab groups, or any other refusal, is `failed`
-  // with mutation "none". A change that was made but not completed or
-  // observed is `partial`, with the handles known.
-  async function executeConfigureGroup(action) {
-    const failed = (mutation, code, detail) => ({
-      state: "failed",
-      mutation,
-      code,
-      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
-      tabId: null,
-      groupId: null,
-      windowId: null,
-      observed: null,
-    });
-    // The stored display-only tab title/address are not part of what the
-    // extension is asked to do.
-    const { tabTitle, tabUrl, ...bound } = action.binding;
-    const creating = bound.operation === "create";
-
-    let result;
-    try {
-      result = await sendExtensionRequest("browser.configure_group", { browserSessionId: action.browserSessionId, ...bound });
-    } catch (error) {
-      const code = Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR;
-      return error?.requestSent === false
-        ? failed("none", code, "the request was never sent to the extension")
-        : failed("unknown", code, "the request was sent but no answer arrived; the browser may or may not have applied the change");
-    }
-
-    let validation;
-    try {
-      validation = validateMethodResult("browser.configure_group", result);
-    } catch (error) {
-      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (!validation.valid) return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
-
-    const detail = typeof result.detail === "string" ? clipText(result.detail, MAX_ACTION_DETAIL_LENGTH) : null;
-    if (!result.changed) {
-      const state = STALE_GROUP_CODES.includes(result.code) ? "stale" : "failed";
-      return { state, mutation: "none", code: clipText(result.code, MAX_CODE_LENGTH), detail, tabId: null, groupId: null, windowId: null, observed: null };
-    }
-
-    // Something was changed. Its answer must still be about *this* preview.
-    const mutation = creating ? "created" : "updated";
-    const mismatch = () => failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview");
-    if (result.browserSessionId !== action.browserSessionId) return mismatch();
-    if (result.status !== "ok") {
-      // The handles must be the preview's own: a partial create names its tab
-      // and window (the new group's handle is the one thing newly assigned), a
-      // partial update names its group and window and no tab.
-      const ownHandles = creating
-        ? result.tabId === bound.tabId && result.windowId === bound.windowId
-        : result.groupId === bound.groupId && result.windowId === bound.windowId && result.tabId === null;
-      if (!ownHandles) return mismatch();
-      return { state: "partial", mutation, code: result.code, detail, tabId: result.tabId, groupId: result.groupId, windowId: result.windowId, observed: null };
-    }
-    const { group } = result;
-    if (
-      result.operation !== bound.operation ||
-      group.windowId !== bound.windowId ||
-      (creating ? result.tabId !== bound.tabId : group.groupId !== bound.groupId)
-    ) {
-      return mismatch();
-    }
-    return {
-      state: "executed",
-      mutation,
-      code: null,
-      detail: null,
-      tabId: result.tabId,
-      groupId: group.groupId,
-      windowId: group.windowId,
-      observed: {
-        windowId: group.windowId,
-        title: clipText(group.title, MAX_OBSERVED_TITLE_LENGTH),
-        color: clipText(group.color, MAX_OBSERVED_STATUS_LENGTH),
-        collapsed: group.collapsed,
-      },
-    };
-  }
-
-  // Phase 2 Action 3: interprets the extension's answer to one approved
-  // `browser.move_tabs` into the outcome recorded on the action, on the same
-  // terms as executeConfigureGroup: never throws, `mutation` is "none" only when
-  // nothing was sent or changed and "unknown" when the request may have been
-  // acted on but the answer was lost, unusable, or says the one `tabs.group`
-  // call's effect is unknown (`changed: null`). A refusal because the previewed
-  // session, handle, or bound state no longer holds is `stale`; another
-  // refusal is `failed`/none. A move known to have been made but not completed
-  // or fully observed is `partial`, whose `tabIds` records only which tabs were
-  // actually observed in the destination (null, or an ordered subset of the
-  // bound ids). Every handle in a changed answer — the tab ids, the window, the
-  // destination group, and each observed tab — is compared with the stored
-  // binding; any mismatch makes the whole answer unusable (`failed`/unknown)
-  // rather than recording another browser object's state.
-  async function executeMoveTabs(action) {
-    const failed = (mutation, code, detail) => ({
-      state: "failed",
-      mutation,
-      code,
-      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
-      tabIds: null,
-      groupId: null,
-      windowId: null,
-      observed: null,
-    });
-    // The binding holds only the bound state (tab ids and their groups, the
-    // window, the destination): exactly what the extension is asked to check.
-    const bound = action.binding;
-    const boundIds = bound.tabs.map((tab) => tab.tabId);
-    const existing = bound.destination === "existing";
-
-    let result;
-    try {
-      result = await sendExtensionRequest("browser.move_tabs", { browserSessionId: action.browserSessionId, ...bound });
-    } catch (error) {
-      const code = Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR;
-      return error?.requestSent === false
-        ? failed("none", code, "the request was never sent to the extension")
-        : failed("unknown", code, "the request was sent but no answer arrived; the browser may or may not have moved the tabs");
-    }
-
-    let validation;
-    try {
-      validation = validateMethodResult("browser.move_tabs", result);
-    } catch (error) {
-      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (!validation.valid) return failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
-
-    const detail = typeof result.detail === "string" ? clipText(result.detail, MAX_ACTION_DETAIL_LENGTH) : null;
-    const mismatch = () => failed("unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview");
-    if (result.changed === false) {
-      const state = STALE_GROUP_CODES.includes(result.code) ? "stale" : "failed";
-      return { state, mutation: "none", code: clipText(result.code, MAX_CODE_LENGTH), detail, tabIds: null, groupId: null, windowId: null, observed: null };
-    }
-    if (result.changed === null) {
-      // The one tabs.group call was attempted and whether it changed the
-      // browser is unknown: terminal failed with an unknown mutation — never
-      // "none" (it may have applied) and never "moved" (it may not have).
-      if (result.browserSessionId !== action.browserSessionId) return mismatch();
-      return failed("unknown", clipText(result.code, MAX_CODE_LENGTH), detail ?? "the browser may or may not have moved the tabs");
-    }
-
-    // A move is known to have been made. Its answer must still be about *this* preview.
-    if (result.browserSessionId !== action.browserSessionId) return mismatch();
-    if (result.status !== "ok") {
-      // Partial: the window must be the preview's own, and an existing
-      // destination its own group; only a new group's handle is newly assigned
-      // (and may be null). `tabIds` says which tabs were actually *observed* in
-      // the destination: null, or an ordered subset of the bound tabs — never
-      // other tabs, repeats, or another order.
-      let next = 0;
-      const subset =
-        result.tabIds === null ||
-        result.tabIds.every((id) => {
-          next = boundIds.indexOf(id, next) + 1;
-          return next > 0;
-        });
-      const ownHandles = subset && result.windowId === bound.windowId && (!existing || result.groupId === bound.groupId);
-      if (!ownHandles) return mismatch();
-      return { state: "partial", mutation: "moved", code: result.code, detail, tabIds: result.tabIds, groupId: result.groupId, windowId: result.windowId, observed: null };
-    }
-    const { group, tabs } = result;
-    if (
-      result.destination !== bound.destination ||
-      group.windowId !== bound.windowId ||
-      (existing && group.groupId !== bound.groupId) ||
-      tabs.length !== boundIds.length ||
-      !tabs.every((tab, index) => tab.tabId === boundIds[index] && tab.windowId === bound.windowId && tab.groupId === group.groupId)
-    ) {
-      return mismatch();
-    }
-    return {
-      state: "executed",
-      mutation: "moved",
-      code: null,
-      detail: null,
-      tabIds: boundIds,
-      groupId: group.groupId,
-      windowId: group.windowId,
-      observed: {
-        windowId: group.windowId,
-        title: clipText(group.title, MAX_OBSERVED_TITLE_LENGTH),
-        color: clipText(group.color, MAX_OBSERVED_STATUS_LENGTH),
-        collapsed: group.collapsed,
-      },
-    };
-  }
-
-  // Phase 2 Action 4, step one: records an archive preview and changes nothing —
-  // no capture is saved and nothing is closed. The body is exactly `{ "tabId":
-  // <id> }`; the session and every piece of current state come from the
-  // browser. The extension is asked (read-only) about that one tab: the answer's
-  // envelope supplies the session the preview is bound to, and the tab's window,
-  // address, group, and pinned state are what the preview binds and the
-  // extension re-checks immediately before closing it (with the title kept, as
-  // clipped text, only so the preview can be recognized). A tab with no address
-  // yet, or one too long to bind exactly, is refused up front: the close is
-  // bound to the exact address, so an address that cannot be stored whole (or
-  // does not exist) cannot protect against closing a changed or reused target.
-  async function previewArchiveTab(req) {
-    const request = validateArchivePreviewRequest(parseJsonBody(await readRequestBody(req, MAX_ACTION_REQUEST_BODY_BYTES)));
-    const inspected = await sendExtensionRequest("browser.inspect_archive_target", { tabId: request.tabId });
-    let validation;
-    try {
-      validation = validateMethodResult("browser.inspect_archive_target", inspected);
-    } catch (error) {
-      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (!validation.valid) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason);
-    if (inspected.status === "unsupported") throw codedError(ERROR_CODES.UNSUPPORTED_FEATURE, "this browser cannot close tabs; nothing was changed");
-    if (inspected.status !== "ok") {
-      if (inspected.code === ERROR_CODES.STALE_HANDLE) throw codedError(ERROR_CODES.STALE_HANDLE, "the tab no longer exists");
-      throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tab");
-    }
-    const { tab } = inspected;
-    if (tab.tabId !== request.tabId) throw codedError(ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension reported a different tab than the one requested");
-    if (typeof tab.url !== "string" || tab.url.length === 0) {
-      throw new StoreError(STORE_ERROR_CODES.CONFLICT, "the tab has no address yet, so a close cannot be bound to it; try again once it has loaded");
-    }
-    if (tab.url.length > MAX_ARCHIVE_URL_LENGTH) {
-      throw new StoreError(STORE_ERROR_CODES.CONFLICT, `the tab's address is longer than ${MAX_ARCHIVE_URL_LENGTH} characters, so it cannot be bound exactly`);
-    }
-    return store.createAction({
-      kind: "archive_tab",
-      browserSessionId: inspected.browserSessionId,
-      binding: {
-        tabId: tab.tabId,
-        windowId: tab.windowId,
-        url: tab.url,
-        groupId: tab.groupId,
-        pinned: tab.pinned,
-        title: clipText(tab.title, MAX_OBSERVED_TITLE_LENGTH),
-      },
-    });
-  }
-
-  // Phase 2 Action 4: carries out one approved archive — two steps, in this
-  // order, with the outcome saying exactly how far it got. Never throws.
-  //
-  // 1. A fresh `browser.read_tab` (never a stale preview-time one) must come
-  //    back for the bound session, tab, and window — and, for a readable page,
-  //    the bound address. A non-"ok" read (a protected page, a tab still
-  //    loading, an error with the tab's handles) is a valid capture of exactly
-  //    that outcome and is saved like any other, with no invented content.
-  //    Anything that is not that — a stale session or handle, a moved window or
-  //    changed address, an unusable answer, a failure to save — ends the action
-  //    here with nothing saved and nothing closed (`stale` or `failed`, mutation
-  //    "none", no capture).
-  //    Before saving, a fresh `browser.inspect_archive_target` must show the
-  //    tab still exactly as previewed (session, tab, window, address, group,
-  //    pinned) — for a non-"ok" read, which has no address, this is the only
-  //    check of that state before the capture.
-  // 2. Only after that capture is durably saved, one `browser.close_tab`, built
-  //    from the stored binding. It is never sent without a saved capture, and a
-  //    capture saved is never discarded: if the extension then refuses (the tab
-  //    changed since the preview) or the request was never sent, the capture
-  //    is kept and the tab deliberately stays open (`partial`, mutation "none");
-  //    if the close's effect is unknown (`changed: null`, or the reply was lost
-  //    or unusable) the action is `failed` with mutation "unknown" and the
-  //    capture id; and only a resolved close is `executed` with mutation
-  //    "closed".
-  async function executeArchiveTab(action) {
-    const bound = action.binding;
-    const outcome = (state, mutation, code, detail, extra = {}) => ({
-      state,
-      mutation,
-      code,
-      detail: clipText(detail, MAX_ACTION_DETAIL_LENGTH),
-      captureId: null,
-      tabId: null,
-      windowId: null,
-      observed: null,
-      ...extra,
-    });
-    const validate = (method, answer) => {
-      try {
-        return validateMethodResult(method, answer);
-      } catch (error) {
-        return { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    };
-    const sendCode = (error) => (Object.hasOwn(ERROR_STATUS, error?.code) ? error.code : ERROR_CODES.INTERNAL_ERROR);
-
-    // --- Step 1: a fresh read, then the capture. ---
-    let read;
-    try {
-      read = await sendExtensionRequest("browser.read_tab", { tabId: bound.tabId, browserSessionId: action.browserSessionId });
-    } catch (error) {
-      return outcome(
-        "failed",
-        "none",
-        sendCode(error),
-        error?.requestSent === false
-          ? "the request was never sent to the extension; nothing was saved and the tab was not closed"
-          : "no answer arrived to the read of the tab; nothing was saved and the tab was not closed",
+      const known = Object.hasOwn(ERROR_STATUS, error.code);
+      respondError(
+        known ? ERROR_STATUS[error.code] : 502,
+        known ? error.code : ERROR_CODES.INTERNAL_ERROR,
+        known ? undefined : error.message,
+        error.requestSent === false ? false : null,
       );
-    }
-    const readValidation = validate("browser.read_tab", read);
-    if (!readValidation.valid) return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, readValidation.reason);
-    const readDetail = typeof read.detail === "string" ? read.detail : "nothing was saved and the tab was not closed";
-    if (read.status === "error" && (read.code === ERROR_CODES.STALE_SESSION || read.code === ERROR_CODES.STALE_HANDLE)) {
-      return outcome("stale", "none", clipText(read.code, MAX_CODE_LENGTH), readDetail);
-    }
-    if (read.browserSessionId !== action.browserSessionId) {
-      return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer is for a different session; nothing was saved");
-    }
-    if (read.tabId !== bound.tabId) {
-      // An error that names no tab (e.g. invalid parameters) is just a failed
-      // read; any other answer for another tab is unusable.
-      return read.status === "error"
-        ? outcome("failed", "none", clipText(read.code, MAX_CODE_LENGTH), readDetail)
-        : outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer is for a different tab; nothing was saved");
-    }
-    if (read.windowId !== bound.windowId) {
-      return outcome("stale", "none", ERROR_CODES.STATE_MISMATCH, "the tab is no longer in the previewed window; nothing was saved and the tab was not closed");
-    }
-    if (read.status === "ok" && read.url !== bound.url) {
-      return outcome("stale", "none", ERROR_CODES.STATE_MISMATCH, "the tab's address changed since the preview; nothing was saved and the tab was not closed");
+      return;
     }
 
-    // The last check before anything is saved: a fresh, read-only look at the
-    // tab, compared EXACTLY with everything the preview bound — session, tab,
-    // window, address, group, and pinned state. A non-"ok" read carries no
-    // address (and none of this state beyond its handles), so this inspection —
-    // not the read — is what protects those captures from being saved for a tab
-    // that changed since the preview. Any stale, mismatched, unsupported, or
-    // unusable answer ends the action here: nothing saved, nothing closed. A
-    // change after this point is caught by the close (capture kept, tab left
-    // open); the cross-process gap between the two is unavoidable.
-    let inspected;
+    let validation;
     try {
-      inspected = await sendExtensionRequest("browser.inspect_archive_target", { tabId: bound.tabId });
+      validation = validateMethodResult(method, result);
+      if (validation.valid && !mutationResultMatchesRequest(method, request, result)) {
+        validation = { valid: false, reason: "the extension reported a change to a different session, tab, or group than the one requested" };
+      }
     } catch (error) {
-      return outcome(
-        "failed",
-        "none",
-        sendCode(error),
-        error?.requestSent === false
-          ? "the request was never sent to the extension; nothing was saved and the tab was not closed"
-          : "no answer arrived to the final check of the tab; nothing was saved and the tab was not closed",
-      );
+      validation = { valid: false, reason: `validation itself failed: ${error instanceof Error ? error.message : String(error)}` };
     }
-    const inspectValidation = validate("browser.inspect_archive_target", inspected);
-    if (!inspectValidation.valid) return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, inspectValidation.reason);
-    if (inspected.status === "unsupported") {
-      return outcome("failed", "none", ERROR_CODES.UNSUPPORTED_FEATURE, "this browser cannot close tabs; nothing was saved and the tab was not closed");
-    }
-    if (inspected.status !== "ok") {
-      return inspected.code === ERROR_CODES.STALE_HANDLE
-        ? outcome("stale", "none", ERROR_CODES.STALE_HANDLE, "the tab no longer exists; nothing was saved")
-        : outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension could not report the tab; nothing was saved and the tab was not closed");
-    }
-    if (inspected.browserSessionId !== action.browserSessionId) {
-      return outcome("stale", "none", ERROR_CODES.STALE_SESSION, "the browser session changed since the preview; nothing was saved and the tab was not closed");
-    }
-    const now = inspected.tab;
-    if (now.tabId !== bound.tabId) {
-      return outcome("failed", "none", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer is for a different tab; nothing was saved");
-    }
-    if (now.windowId !== bound.windowId || now.url !== bound.url || now.groupId !== bound.groupId || now.pinned !== bound.pinned) {
-      return outcome("stale", "none", ERROR_CODES.STATE_MISMATCH, "the tab's window, address, group, or pinned state changed since the preview; nothing was saved and the tab was not closed");
-    }
-
-    let captureId;
-    try {
-      captureId = store.createCapture(read).id;
-    } catch (error) {
-      const code = error instanceof StoreError ? error.code : ERROR_CODES.INTERNAL_ERROR;
-      return outcome("failed", "none", code, "the capture could not be saved, so the tab was not closed");
-    }
-
-    // --- Step 2: the close, only now that the capture is durable. ---
-    let closed;
-    try {
-      closed = await sendExtensionRequest("browser.close_tab", {
-        browserSessionId: action.browserSessionId,
-        tabId: bound.tabId,
-        windowId: bound.windowId,
-        url: bound.url,
-        groupId: bound.groupId,
-        pinned: bound.pinned,
-      });
-    } catch (error) {
-      return error?.requestSent === false
-        ? outcome("partial", "none", sendCode(error), "the capture was saved but the close request was never sent; the tab was left open", { captureId })
-        : outcome("failed", "unknown", sendCode(error), "the capture was saved; the close request was sent but no answer arrived, so the tab may or may not have been closed", { captureId });
-    }
-    const closeValidation = validate("browser.close_tab", closed);
-    if (!closeValidation.valid) return outcome("failed", "unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, closeValidation.reason, { captureId });
-    const closeDetail = typeof closed.detail === "string" ? closed.detail : null;
-
-    if (closed.changed === false) {
-      // Refused before the one tabs.remove call: the capture stands and the tab
-      // deliberately stays open.
-      return outcome("partial", "none", clipText(closed.code, MAX_CODE_LENGTH), closeDetail ?? "the capture was saved; the tab was left open", { captureId });
-    }
-    const mismatch = () => outcome("failed", "unknown", ERROR_CODES.INVALID_EXTENSION_RESPONSE, "the extension's answer does not match the approved preview; the capture was saved", { captureId });
-    if (closed.browserSessionId !== action.browserSessionId) return mismatch();
-    if (closed.changed === null) {
-      return outcome("failed", "unknown", clipText(closed.code, MAX_CODE_LENGTH), closeDetail ?? "the capture was saved; the tab may or may not have been closed", { captureId });
-    }
-    if (closed.tabId !== bound.tabId || closed.windowId !== bound.windowId) return mismatch();
-    return outcome("executed", "closed", null, null, { captureId, tabId: bound.tabId, windowId: bound.windowId });
-  }
-
-  // Phase 2 Action 1, step two (and Action 2's and 3's, by kind): the one terminal
-  // decision on a stored preview, by id alone — no body and no other query
-  // parameter, so the caller cannot restate or alter what is being decided.
-  // The route names the action kind and an action of another kind is simply
-  // not found there. A reject only records the decision. An approve first
-  // requires a connected extension (so a merely-unplugged browser does not
-  // consume the preview), then commits the decision — the race-safe single
-  // transition in store.decideAction, which only one of any number of
-  // concurrent approve/reject calls can win — and only the winner executes,
-  // exactly once, then records the result. The response is the action as
-  // finally recorded, HTTP 200 even if the outcome was `failed`, `stale`, or
-  // `partial`: the decision committed, and the record says what happened.
-  async function decideBrowserAction(kind, operation, req, url) {
-    if (hasRequestBodyFraming(req)) {
-      throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, "this route takes no request body; the action is identified by id alone");
-    }
-    for (const key of url.searchParams.keys()) {
-      if (key !== "id") throw new StoreError(STORE_ERROR_CODES.VALIDATION_ERROR, `${key}: unexpected query parameter; only "id" is accepted`);
-    }
-    const id = requireIdParam(url);
-    // An action's kind is fixed when it is previewed, so this check cannot be
-    // invalidated between here and the decision below.
-    if (store.listActions({ id }).items[0]?.kind !== kind) throw new StoreError(STORE_ERROR_CODES.NOT_FOUND, `action ${id} not found`);
-    if (operation === "reject") return store.decideAction(id, "reject");
-
-    if (extensionSocket === null) {
-      const error = new Error("No extension connected");
-      error.code = ERROR_CODES.DISCONNECTED;
-      throw error;
-    }
-    const action = store.decideAction(id, "approve");
-    const executors = { open_tab: executeOpenTab, configure_group: executeConfigureGroup, move_tabs: executeMoveTabs, archive_tab: executeArchiveTab };
-    const outcome = await executors[kind](action);
-    try {
-      return store.recordActionResult(id, outcome);
-    } catch (error) {
-      // The interpreted outcome should always satisfy the store's own checks
-      // (executeOpenTab clips and normalizes everything). If it somehow does
-      // not, the approved action must still end in a recorded result rather
-      // than stay "approved" forever: record that the outcome is unknown.
-      if (!(error instanceof StoreError) || error.code !== STORE_ERROR_CODES.VALIDATION_ERROR) throw error;
-      return store.recordActionResult(id, {
-        state: "failed",
-        mutation: "unknown",
-        code: ERROR_CODES.INTERNAL_ERROR,
-        detail: "the outcome could not be recorded in full",
-        tabId: null,
-        windowId: null,
-        observed: null,
-      });
-    }
-  }
-
-  async function handleActionMethod(name, route, req, res, url) {
-    const requestId = requestIdFor(req);
-    const auth = authenticate(req);
-    if (!auth.ok) {
-      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
-      return;
-    }
-    // Owner-only by an explicit check, like owner.status and control/stop —
-    // not merely by being absent from the agent allowlists.
-    if (auth.scope !== "owner") {
-      respondJson(res, 403, forbiddenScopeResponse(requestId, name));
-      return;
-    }
-    if (!checkRateLimit()) {
-      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
-      return;
-    }
-    if (!store) {
-      respondJson(res, 503, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: "store_unavailable" } });
-      return;
-    }
-    if (req.method !== "POST") {
-      respondJson(res, 405, {
-        protocolVersion: PROTOCOL_VERSION,
-        requestId,
-        error: { code: "method_not_allowed", detail: `"${name}" expects POST` },
-      });
+    if (!validation.valid) {
+      respondError(502, ERROR_CODES.INVALID_EXTENSION_RESPONSE, validation.reason, null);
       return;
     }
 
-    try {
-      let result;
-      if (route.operation !== "preview") result = await decideBrowserAction(route.kind, route.operation, req, url);
-      else if (route.kind === "open_tab") result = await previewOpenTab(req);
-      else if (route.kind === "configure_group") result = await previewConfigureGroup(req);
-      else if (route.kind === "move_tabs") result = await previewMoveTabs(req);
-      else result = await previewArchiveTab(req);
-      respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result });
-    } catch (error) {
-      const known =
-        Object.hasOwn(STORE_ERROR_STATUS, error?.code) ||
-        Object.hasOwn(ERROR_STATUS, error?.code) ||
-        Object.hasOwn(PREVIEW_REFUSAL_STATUS, error?.code) ||
-        error?.code === ERROR_CODES.INVALID_EXTENSION_RESPONSE;
-      const code = known ? error.code : ERROR_CODES.INTERNAL_ERROR;
-      const status = STORE_ERROR_STATUS[code] ?? ERROR_STATUS[code] ?? PREVIEW_REFUSAL_STATUS[code] ?? (code === ERROR_CODES.INTERNAL_ERROR ? 500 : 502);
-      respondJson(res, status, {
-        protocolVersion: PROTOCOL_VERSION,
-        requestId,
-        error: { code, detail: error instanceof Error ? error.message : String(error) },
-      });
-    }
-  }
-
-  // Stage 5 remediation: an extension-independent, authenticated,
-  // protocol-versioned owner-scope probe. Unlike `browser.get_capabilities`
-  // (which round-trips through the extension and therefore fails with
-  // `disconnected` whenever the extension is not currently connected),
-  // this route never touches `sendExtensionRequest` at all — it only
-  // answers the question "does this credential authenticate, and does it
-  // carry owner scope?" The UI's Connect flow uses this (not
-  // `browser.get_capabilities`) to validate the pasted token, specifically
-  // so an owner can still enter the review UI while the extension is
-  // disconnected, and so an agent-scoped token is explicitly rejected
-  // here rather than incidentally succeeding merely because
-  // `browser.get_capabilities` happens to be agent-allowed too.
-  function handleOwnerStatus(req, res) {
-    const requestId = requestIdFor(req);
-    const auth = authenticate(req);
-    if (!auth.ok) {
-      respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, requestId, error: auth.error });
+    const payload = JSON.stringify({ protocolVersion: PROTOCOL_VERSION, requestId, result });
+    if (Buffer.byteLength(payload) > maxResponseBytes) {
+      respondError(502, ERROR_CODES.RESPONSE_TOO_LARGE, undefined, result.changed);
       return;
     }
-    if (auth.scope !== "owner") {
-      respondJson(res, 403, forbiddenScopeResponse(requestId, "owner.status"));
-      return;
-    }
-    if (!checkRateLimit()) {
-      respondJson(res, 429, { protocolVersion: PROTOCOL_VERSION, requestId, error: { code: ERROR_CODES.RATE_LIMITED } });
-      return;
-    }
-    respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, requestId, result: { scope: "owner" } });
+    res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) });
+    res.end(payload);
   }
 
   function handleHealth(_req, res) {
@@ -1600,7 +540,6 @@ export function createService({
       ok: true,
       service: { startedAt },
       extension: { connected: extensionSocket !== null, connectedAt: extensionConnectedAt },
-      store: { available: store !== null },
     });
   }
 
@@ -1608,14 +547,6 @@ export function createService({
     const auth = authenticate(req);
     if (!auth.ok) {
       respondJson(res, auth.status, { protocolVersion: PROTOCOL_VERSION, error: auth.error });
-      return;
-    }
-    // Stage 4: shutting the service down is never in an agent's scope,
-    // regardless of the AGENT_ALLOWED_* sets above (control/stop is not
-    // even a /api/ route, so it is not reachable through them at all) —
-    // this is an explicit, separate check for the same reason.
-    if (auth.scope !== "owner") {
-      respondJson(res, 403, { protocolVersion: PROTOCOL_VERSION, error: { code: ERROR_CODES.FORBIDDEN_SCOPE, detail: '"control/stop" is owner-only' } });
       return;
     }
     respondJson(res, 200, { protocolVersion: PROTOCOL_VERSION, ok: true });
@@ -1644,25 +575,12 @@ export function createService({
       return;
     }
 
-    // Stage 5 remediation: the Host-header check runs before *everything*
-    // else — before even serving a UI asset — so a DNS-rebinding-style
-    // request never gets so much as the UI shell, let alone a chance to
-    // reach an authenticated route. See checkHost's own comment above.
+    // The Host-header check runs before everything else, so a
+    // DNS-rebinding-style request never reaches an authenticated route.
+    // See checkHost's own comment above.
     const hostFailure = checkHost(req);
     if (hostFailure) {
       respondJson(res, hostFailure.status, { protocolVersion: PROTOCOL_VERSION, error: hostFailure.error });
-      return;
-    }
-
-    // Stage 5: the local review UI's static assets are served before (and
-    // regardless of) the X-Protocol-Version check below — ordinary browser
-    // navigation and <script src>/<link> fetches never send that header,
-    // and these routes carry no secret and perform no action by themselves
-    // (see service/ui.mjs). Every actual operation the UI performs is a
-    // call to the authenticated, protocol-versioned /api/ routes below,
-    // exactly like any other local API caller.
-    if (req.method === "GET" && UI_ROUTES.has(url.pathname)) {
-      serveUiAsset(res, UI_ROUTES.get(url.pathname));
       return;
     }
 
@@ -1682,24 +600,12 @@ export function createService({
     }
     if (url.pathname.startsWith("/api/")) {
       const name = url.pathname.slice("/api/".length);
-      if (req.method === "GET" && name === "owner.status") {
-        handleOwnerStatus(req, res);
-        return;
-      }
       if (req.method === "GET" && API_ROUTES.has(name)) {
         handleApiMethod(name, req, res, url);
         return;
       }
-      if (WORKFLOW_ROUTES.has(name)) {
-        handleWorkflowMethod(name, WORKFLOW_ROUTES.get(name), req, res, url);
-        return;
-      }
-      if (ACTION_ROUTES.has(name)) {
-        handleActionMethod(name, ACTION_ROUTES.get(name), req, res, url);
-        return;
-      }
-      if (STORE_ROUTES.has(name)) {
-        handleStoreMethod(name, STORE_ROUTES.get(name), req, res, url);
+      if (req.method === "POST" && MUTATION_ROUTES.has(name)) {
+        handleMutationMethod(name, req, res);
         return;
       }
     }
@@ -1722,7 +628,7 @@ export function createService({
       return;
     }
 
-    // Stage 5 remediation: the same Host-header defense applied to every
+    // The same Host-header defense applied to every
     // plain HTTP response also applies to the WebSocket upgrade. The
     // existing Origin check below already defeats an ordinary web page
     // (which can never claim a `chrome-extension://` origin), but this is

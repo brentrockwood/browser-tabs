@@ -66,6 +66,9 @@ const SOURCE_FILES = [
   "package-lock.json",
   "README.md",
   "project.md",
+  "docs/architecture.md",
+  "docs/development.md",
+  "docs/refocus-plan.md",
   "extension/manifest.json",
   "extension/manifest.firefox.json",
   "extension/service-worker.js",
@@ -75,18 +78,7 @@ const SOURCE_FILES = [
   "extension/options.js",
   "service/server.mjs",
   "service/cli.mjs",
-  "service/store.mjs",
-  "service/store-routes.mjs",
-  "service/store-errors.mjs",
-  "service/validation.mjs",
   "service/credential.mjs",
-  "service/ui.mjs",
-  "client/browser-tabs-client.mjs",
-  "client/cli.mjs",
-  "ui/index.html",
-  "ui/app.js",
-  "ui/lib.mjs",
-  "ui/styles.css",
 ];
 
 const FORBIDDEN_NAME_PATTERN = /(^|\/)(credential|agent-token|.*\.db|.*\.db-\w+|.*\.pid|.*\.port)$/i;
@@ -292,7 +284,6 @@ export async function buildRelease(outDir = join(REPO_ROOT, "dist/release"), { s
       version,
       protocolVersion: report.protocolVersion,
       resultSchemaVersion: report.resultSchemaVersion,
-      dbSchemaVersion: report.dbSchemaVersion,
       artifacts: summaries,
     };
     files = [

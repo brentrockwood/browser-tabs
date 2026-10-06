@@ -14,6 +14,5 @@ test("reports the independent protocol/schema version numbers", async () => {
   const { report } = await checkVersions();
   assert.equal(Number.isInteger(report.protocolVersion), true);
   assert.equal(Number.isInteger(report.resultSchemaVersion), true);
-  assert.equal(Number.isInteger(report.dbSchemaVersion), true);
-  assert.ok(report.dbSchemaVersion >= 1);
+  assert.equal("dbSchemaVersion" in report, false, "the service has no database schema");
 });

@@ -13,19 +13,6 @@ export function getCredentialPath(dataDir = getDataDir()) {
   return join(dataDir, "credential");
 }
 
-// Stage 4: a distinct, separately-stored credential for external-agent
-// callers (project.md Stage 4 remediation: "a distinct scoped external-agent
-// credential managed by the service"). This is a different token in a
-// different file from the owner pairing credential above — never the same
-// value, never derived from it — so revoking or rotating one has no effect
-// on the other, and a leaked agent token cannot be used to authenticate as
-// the owner. The owner credential above retains full, unscoped access; the
-// agent credential is authorized only for the server-side allowlists in
-// service/server.mjs (AGENT_ALLOWED_*).
-export function getAgentCredentialPath(dataDir = getDataDir()) {
-  return join(dataDir, "agent-token");
-}
-
 // Repairs permissions on an already-existing directory too, not just a
 // freshly created one: `mkdir`'s `mode` option only takes effect when it
 // actually creates the directory, so a pre-existing `~/.browser-tabs` left
@@ -54,12 +41,7 @@ async function readExistingCredential(credentialPath) {
 // Loads the persisted credential at `credentialPath`, generating and storing
 // a new one with user-only permissions on first run. Reusing an existing
 // credential (rather than regenerating on every start) is what lets a
-// service restart recover without re-pairing the extension or re-issuing an
-// external-agent token. Factored out so the owner credential
-// (loadOrCreateCredential) and the Stage 4 external-agent credential
-// (loadOrCreateAgentCredential) below share the exact same race-safe,
-// crash-safe generation logic against two different, independent files —
-// never the same file, never one derived from the other.
+// service restart recover without re-pairing the extension.
 //
 // Race-safe and crash-safe: if two callers race to create the credential
 // for the first time (e.g. two CLI invocations started at once), the
@@ -105,18 +87,4 @@ async function loadOrCreateCredentialAt(credentialPath) {
 export async function loadOrCreateCredential(dataDir = getDataDir()) {
   await ensureDataDir(dataDir);
   return loadOrCreateCredentialAt(getCredentialPath(dataDir));
-}
-
-// Stage 4: loads (or, on first use, generates) the separate external-agent
-// credential — a distinct file, a distinct random token, never shared with
-// or derived from the owner credential above. Called independently from
-// `loadOrCreateCredential` so an operator who never intends to allow an
-// external agent never has one implicitly created merely by starting the
-// service in a way that happens to touch this function; service/cli.mjs
-// calls both unconditionally on `start`, matching the owner credential's own
-// "always present once the service has started" behavior, but the two
-// remain fully independent on disk and in memory.
-export async function loadOrCreateAgentCredential(dataDir = getDataDir()) {
-  await ensureDataDir(dataDir);
-  return loadOrCreateCredentialAt(getAgentCredentialPath(dataDir));
 }

@@ -1,17 +1,19 @@
 #!/usr/bin/env node
-// Stage 6: "Verify that the service runs on Linux even if desktop packaging
-// remains a later task" (project.md). No browser or extension is involved
-// here at all — this proves the service itself (start, status via /health,
-// an authenticated store write, a real process restart, and stop) using
-// only Node.js and the real service/cli.mjs child process, so it is exactly
-// as meaningful run on Linux as on macOS. See .github/workflows/ci.yml,
-// which runs this on both.
+// Verifies the service runs on its own — start, status via /health,
+// authenticated access with the one pairing token, a real process restart with
+// the same persisted token, and an authenticated stop — using only Node.js and
+// the real service/cli.mjs child process, so it is exactly as meaningful on
+// Linux as on macOS. No browser or extension is involved. It also checks that
+// the service creates no database, and that files left by earlier versions
+// (a SQLite database, the old agent token, the old service lock) are left
+// byte-for-byte untouched. See .github/workflows/ci.yml, which runs this on
+// both platforms.
 //
 // Usage: node scripts/service-lifecycle-check.mjs
 // Exit code: 0 on success, 1 otherwise, with the failing step printed.
 
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -111,6 +113,27 @@ async function waitUntilDown(timeoutMs = 8000) {
   throw new DiagnosticError(`service was still answering /health ${timeoutMs}ms after being asked to stop`);
 }
 
+function runCli(dataDir, command) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [SERVICE_CLI_PATH, command], {
+      env: { ...process.env, BROWSER_TABS_DATA_DIR: dataDir, BROWSER_TABS_PORT: String(PORT) },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+    child.once("error", reject);
+    child.once("exit", (code) => resolve({ code, stdout }));
+  });
+}
+
+// Stand-ins for files an earlier version of the service may have left in a
+// data directory. The service must neither read, change, nor delete them.
+const OBSOLETE_FILES = {
+  "browser-tabs.db": "not a real database: lifecycle-check placeholder\n",
+  "agent-token": "0".repeat(64),
+  "service.lock": "999999",
+};
+
 async function main() {
   const dataDir = await mkdtemp(join(tmpdir(), "browser-tabs-lifecycle-check-"));
   let service;
@@ -122,44 +145,60 @@ async function main() {
     if (health.json?.ok !== true) throw new DiagnosticError(`/health did not report ok: true (HTTP status ${health.status})`);
     console.log("[1/6] ok: service started and answered /health.");
 
-    console.log("[2/6] creating a tag through the authenticated store API...");
-    const createResponse = await request("/api/store.tags.create", {
-      method: "POST",
-      token,
-      body: { name: "lifecycle-check", creatorType: "user" },
-    });
-    if (createResponse.status !== 200) {
+    console.log("[2/6] checking that the one pairing token authenticates the API...");
+    const unauthenticated = await request("/api/browser.list_windows");
+    if (unauthenticated.status !== 401) {
+      throw new DiagnosticError(`an unauthenticated request was not refused (HTTP status ${unauthenticated.status})`);
+    }
+    // With no extension connected, an authenticated read gets past
+    // authentication and fails explicitly as disconnected.
+    const authenticated = await request("/api/browser.list_windows", { token });
+    if (authenticated.status !== 503 || authenticated.json?.error?.code !== "disconnected") {
       throw new DiagnosticError(
-        `store.tags.create failed (HTTP status ${createResponse.status}, error code ${safeLabel(createResponse.json?.error?.code)})`,
+        `an authenticated read did not reach the extension bridge (HTTP status ${authenticated.status}, ` +
+          `error code ${safeLabel(authenticated.json?.error?.code)})`,
       );
     }
-    const tagId = createResponse.json.result.id;
-    console.log(`[2/6] ok: created tag ${safeLabel(String(tagId))}.`);
+    const mutation = await request("/api/browser.move_tabs", { method: "POST", token, body: { browserSessionId: "s", tabIds: [1], groupId: null } });
+    if (mutation.status !== 503 || mutation.json?.error?.changed !== false) {
+      throw new DiagnosticError(`an authenticated mutation without an extension did not report changed: false (HTTP status ${mutation.status})`);
+    }
+    const files = (await readdir(dataDir)).sort();
+    if (files.some((name) => /\.db($|-)/.test(name) || name === "agent-token")) {
+      throw new DiagnosticError(`the service created a database or second token file (files: ${files.map(safeLabel).join(", ")})`);
+    }
+    console.log("[2/6] ok: one token authenticates; no database or second token was created.");
 
     console.log("[3/6] stopping the service...");
     await stopChild(service);
     await waitUntilDown();
     console.log("[3/6] ok: service is down.");
 
-    console.log("[4/6] starting the service again against the same data directory...");
+    console.log("[4/6] starting the service again with files an earlier version left behind...");
+    for (const [name, contents] of Object.entries(OBSOLETE_FILES)) await writeFile(join(dataDir, name), contents);
     service = spawnService(dataDir);
-    // The CLI prints tokens only on first creation, so the restart reuses the
-    // token captured from the first start (it is persisted, not regenerated).
+    // The CLI prints the token only on first creation, so the restart reuses
+    // the token captured from the first start (it is persisted, not regenerated).
     await waitForHealth();
     const persisted = (await readFile(join(dataDir, "credential"), "utf8")).trim();
     if (persisted !== token) throw new DiagnosticError("the persisted credential file does not match the first-start token");
+    const afterRestart = await request("/api/browser.list_windows", { token });
+    if (afterRestart.status !== 503) throw new DiagnosticError(`the persisted token did not authenticate after restart (HTTP status ${afterRestart.status})`);
     console.log("[4/6] ok: service restarted with the same persisted credential.");
 
-    console.log("[5/6] confirming the tag survived the restart (local store persistence)...");
-    const listResponse = await request(`/api/store.tags.list?id=${tagId}`, { token });
-    const found = listResponse.json?.result?.items?.some((item) => item.id === tagId && item.name === "lifecycle-check");
-    if (!found) throw new DiagnosticError(`tag ${safeLabel(String(tagId))} did not survive the restart (HTTP status ${listResponse.status})`);
-    console.log("[5/6] ok: the tag persisted across a real process restart.");
-
-    console.log("[6/6] stopping the service...");
-    await stopChild(service);
+    console.log("[5/6] stopping the service through the authenticated CLI stop command...");
+    const stopped = await runCli(dataDir, "stop");
+    if (stopped.code !== 0) throw new DiagnosticError(`the stop command exited with code ${stopped.code}`);
+    await Promise.race([service.exited, delay(8000)]);
     await waitUntilDown();
-    console.log("[6/6] ok: service stopped cleanly.");
+    console.log("[5/6] ok: service stopped cleanly.");
+
+    console.log("[6/6] confirming files from an earlier version were left untouched...");
+    for (const [name, contents] of Object.entries(OBSOLETE_FILES)) {
+      const now = await readFile(join(dataDir, name), "utf8").catch(() => null);
+      if (now !== contents) throw new DiagnosticError(`${safeLabel(name)} was changed or removed by the service`);
+    }
+    console.log("[6/6] ok: the old database, agent token, and lock file are unchanged.");
 
     console.log("LIFECYCLE_CHECK_PASS");
   } catch (error) {

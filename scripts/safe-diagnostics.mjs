@@ -1,7 +1,7 @@
 // Leak-safe failure diagnostics for the real-Firefox smoke test.
 //
-// The Firefox smoke test handles the owner and agent tokens (the owner token
-// is even carried in the fixture page's URL) and reads page text, URLs and
+// The Firefox smoke test handles the pairing token (it is even carried in
+// the fixture page's URL) and reads page text, URLs and
 // service responses that came from a real browser. None of that may reach
 // stdout/stderr — CI logs outlive the run — so every failure message the
 // smoke test prints is built from stable status/code/count values only:

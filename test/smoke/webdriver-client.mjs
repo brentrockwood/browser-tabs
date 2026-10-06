@@ -101,7 +101,7 @@ function webdriverRequest(port, method, path, body) {
           // Error text is deliberately limited to the HTTP status and
           // WebDriver's own short error code (e.g. "invalid argument"):
           // never the response body, whose `message`/`stacktrace` can quote
-          // the URL being navigated to (which carries the owner pairing
+          // the URL being navigated to (which carries the pairing
           // token in the Firefox smoke test) or script/page content.
           let parsed;
           try {

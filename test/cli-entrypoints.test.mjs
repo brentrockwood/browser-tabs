@@ -42,18 +42,10 @@ const COPIED_FILES = [
   "extension/options.js",
   "service/server.mjs",
   "service/cli.mjs",
-  "service/store.mjs",
-  "service/store-routes.mjs",
-  "service/store-errors.mjs",
-  "service/validation.mjs",
   "service/credential.mjs",
-  "service/ui.mjs",
-  "client/browser-tabs-client.mjs",
-  "client/cli.mjs",
-  "ui/index.html",
-  "ui/app.js",
-  "ui/lib.mjs",
-  "ui/styles.css",
+  "docs/architecture.md",
+  "docs/development.md",
+  "docs/refocus-plan.md",
 ];
 
 async function withSpecialRepoCopy(fn) {
@@ -97,7 +89,7 @@ test("scripts/check-versions.mjs runs when invoked from a path with spaces and U
       absolute.stdout.includes(`Product version (package.json, both extension manifests): ${packageJson.version}`),
       `unexpected stdout: ${absolute.stdout}`,
     );
-    assert.match(absolute.stdout, /Database schema version \(service\/store\.mjs MIGRATIONS, highest version\): \d+/);
+    assert.match(absolute.stdout, /API\/extension-bridge protocol version \(extension\/protocol\.js PROTOCOL_VERSION\): \d+/);
 
     // A relative script path (resolved against the cwd) must work too.
     const relative = await runNode(join("scripts", "check-versions.mjs"), [], copyRoot);

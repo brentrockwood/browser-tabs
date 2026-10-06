@@ -96,7 +96,7 @@ test("the Firefox extension artifact contains the bundled background script and 
   });
 });
 
-test("the source archive includes service+ui+extension source and excludes local/credential/db paths", async () => {
+test("the source archive includes only service and extension runtime source plus documentation, excluding removed and local paths", async () => {
   await withTempDir(async (dir) => {
     const result = await buildRelease(join(dir, "release"));
     const artifact = findArtifact(result, "source-" + result.version + ".zip");
@@ -105,10 +105,18 @@ test("the source archive includes service+ui+extension source and excludes local
     const names = entries.map((e) => e.name);
     const prefix = `browser-tabs-${result.version}/`;
     assert.ok(names.includes(`${prefix}service/server.mjs`));
-    assert.ok(names.includes(`${prefix}ui/app.js`));
     assert.ok(names.includes(`${prefix}extension/protocol.js`));
     assert.ok(names.includes(`${prefix}package.json`));
     assert.ok(names.includes(`${prefix}service/credential.mjs`));
+    assert.ok(names.includes(`${prefix}docs/architecture.md`));
+    assert.ok(names.includes(`${prefix}docs/refocus-plan.md`));
+    assert.ok(!names.includes(`${prefix}docs/implementation-history.md`), "the historical diary is not shipped");
+    // Removed features must not ship: the review UI, the agent client, and the
+    // SQLite store and its routes.
+    assert.deepEqual(
+      names.filter((n) => /\/(ui|client|test)\/|\/service\/(store|store-routes|store-errors|validation|ui)\.mjs$/.test(n)),
+      [],
+    );
     assert.deepEqual(names.filter((n) => LEAKED_ARTIFACT.test(n)), []);
   });
 });

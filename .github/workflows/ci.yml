@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Stage 6: "Add continuous unit tests" + "Verify that the service runs on
-  # Linux" (project.md). Runs the exact same commands on macOS and Linux —
+  # Required checks on macOS and Linux. Runs the exact same commands on both —
   # no OS-specific branching — so this is a real cross-platform proof, not
   # merely a Linux-flavored label on a macOS-only job.
   unit-tests:
@@ -25,11 +24,10 @@ jobs:
       - run: npm run check:versions
       - run: npm test
       - run: npm audit --omit=dev
-      - name: Service lifecycle (start/status-via-health/authenticated write/restart/stop)
+      - name: Service lifecycle (start/health/authenticated request/restart/stop, no database)
         run: npm run check:service-lifecycle
 
-  # Stage 6: "repeatable browser smoke-test commands" / "browser jobs may
-  # install current Chromium/Firefox" (project.md). Best-effort: installing
+  # Repeatable browser smoke tests. Best-effort: installing
   # a real, GUI-capable Chromium and Firefox build (plus geckodriver) on a
   # hosted CI runner is inherently more fragile than the unit-tests job
   # above, so this job is allowed to fail without blocking the required
@@ -60,11 +58,11 @@ jobs:
         env:
           CHROME_PATH: /usr/bin/chromium-browser
         run: npm run test:smoke
-      - name: Chromium bridge/Stage4/Stage5 smoke
+      - name: Chromium bridge, mutation, and restart smoke
         env:
           CHROME_PATH: /usr/bin/chromium-browser
         run: npm run test:smoke:bridge
-      - name: Firefox read-API/Stage4/Stage5 smoke
+      - name: Firefox read-API and unsupported-mutation smoke
         env:
           FIREFOX_PATH: /usr/bin/firefox
         run: npm run test:smoke:firefox

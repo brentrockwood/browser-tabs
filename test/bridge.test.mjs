@@ -185,22 +185,6 @@ function queryHistoryResult(overrides = {}) {
   };
 }
 
-function capabilitiesResult(overrides = {}) {
-  return {
-    ...envelope("browser.get_capabilities"),
-    protocolVersion: PROTOCOL_VERSION,
-    tabGroups: true,
-    history: true,
-    scripting: true,
-    maxTextCharacters: 500_000,
-    maxWindowsReturned: 500,
-    maxTabsReturned: 2_000,
-    maxTabGroupsReturned: 500,
-    maxHistoryResults: 500,
-    ...overrides,
-  };
-}
-
 // Auto-replies to any forwarded "request" with a canned (valid-envelope, by
 // default) result, echoing the request's id. Returns the list of requests
 // observed, in arrival order.
@@ -789,17 +773,32 @@ test("GET /api/browser.list_tabs treats an empty windowId query value as malform
   });
 });
 
-test("GET /api/browser.get_capabilities round-trips with no parameters", async () => {
+test("the public browser API is exactly the five reads and three mutations; removed routes are not found and never forwarded", async () => {
   await withService({}, async (_service, port) => {
     const ws = await openAuthenticated(port);
-    autoRespond(ws, capabilitiesResult());
-    const { status, json } = await httpRequest({
-      port,
-      path: "/api/browser.get_capabilities",
-      headers: { authorization: `Bearer ${TOKEN}` },
-    });
-    assert.equal(status, 200);
-    assert.deepEqual(json.result, capabilitiesResult());
+    const seen = autoRespond(ws);
+    for (const [method, path] of [
+      ["GET", "/api/browser.get_capabilities"],
+      ["GET", "/api/owner.status"],
+      ["POST", "/api/browser.open_tab"],
+      ["POST", "/api/browser.close_tab"],
+      ["POST", "/api/browser.configure_group"],
+      ["POST", "/api/workflow.capture_tab?tabId=1&browserSessionId=s"],
+      ["POST", "/api/action.move_tabs.preview"],
+      ["POST", "/api/action.open_tab.approve?id=1"],
+      ["GET", "/api/store.captures.list"],
+      ["POST", "/api/store.clear"],
+      ["GET", "/ui/"],
+      ["GET", "/ui/app.js"],
+      // A read is not reachable by POST, nor a mutation by GET.
+      ["POST", "/api/browser.list_windows"],
+      ["GET", "/api/browser.move_tabs"],
+    ]) {
+      const { status, json } = await httpRequest({ port, path, method, headers: { authorization: `Bearer ${TOKEN}` } });
+      assert.equal(status, 404, `${method} ${path}`);
+      assert.equal(json.error.code, "not_found");
+    }
+    assert.deepEqual(seen, [], "nothing was forwarded to the extension");
     ws.close();
   });
 });
@@ -914,6 +913,29 @@ test("a legacy (pre-Stage-2) bare-array response is rejected as invalid_extensio
     assert.equal(json.error.code, ERROR_CODES.INVALID_EXTENSION_RESPONSE);
     ws.close();
   });
+});
+
+test("browser.list_tabs returns each tab's group membership, and a tab record without one is rejected", async () => {
+  const tab = { tabId: 5, windowId: 7, index: 0, active: true, pinned: false, audible: false, discarded: false, status: "complete", title: null, url: null };
+  for (const [tabs, expectedStatus] of [
+    [[{ ...tab, groupId: 3 }, { ...tab, tabId: 6, groupId: -1 }], 200],
+    [[tab], 502],
+  ]) {
+    await withService({}, async (_service, port) => {
+      const ws = await openAuthenticated(port);
+      const result = listTabsResult({ tabs, returnedCount: tabs.length, totalCount: tabs.length });
+      autoRespond(ws, result);
+      const { status, json } = await httpRequest({
+        port,
+        path: `/api/browser.list_tabs?windowId=7&browserSessionId=${SESSION_ID}`,
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      assert.equal(status, expectedStatus);
+      if (expectedStatus === 200) assert.deepEqual(json.result.tabs.map((t) => t.groupId), [3, -1]);
+      else assert.equal(json.error.code, ERROR_CODES.INVALID_EXTENSION_RESPONSE);
+      ws.close();
+    });
+  }
 });
 
 test("a response whose sourceOperation does not match the requested method is rejected as invalid_extension_response", async () => {
