@@ -65,7 +65,7 @@ These change independently. `npm run check:versions` fails if the product versio
 npm run release
 ```
 
-The default output is `dist/release/` (ignored by git): Chrome and Firefox extension zips, a source zip, SHA-256 checksums, and a manifest with the product, protocol, and result-schema versions. Builds are byte-for-byte deterministic. Every archive is built from explicit file lists — the source zip holds only the runtime service and extension files, `package.json`, the lock file, `README.md`, `project.md`, `docs/architecture.md`, `docs/development.md`, and `docs/refocus-plan.md` — and a name check refuses credential, database, pid, and port files. A custom output directory may be passed to `node build/release.mjs <outDir>`, subject to the script's safety checks.
+The default output is `dist/release/` (ignored by git): Chrome and Firefox extension zips, a source zip, SHA-256 checksums, and a manifest with the product, protocol, and result-schema versions. Builds are byte-for-byte deterministic. Every archive is built from explicit file lists — the source zip holds only the runtime service and extension files, `package.json`, the lock file, `README.md`, `docs/project.md`, `docs/architecture.md`, `docs/development.md`, and `docs/refocus-plan.md` — and a name check refuses credential, database, pid, and port files. A custom output directory may be passed to `node build/release.mjs <outDir>`, subject to the script's safety checks.
 
 ## CI
 
