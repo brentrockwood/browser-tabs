@@ -65,7 +65,7 @@ const SOURCE_FILES = [
   "package.json",
   "package-lock.json",
   "README.md",
-  "project.md",
+  "docs/project.md",
   "docs/architecture.md",
   "docs/development.md",
   "docs/refocus-plan.md",

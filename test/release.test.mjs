@@ -109,6 +109,7 @@ test("the source archive includes only service and extension runtime source plus
     assert.ok(names.includes(`${prefix}package.json`));
     assert.ok(names.includes(`${prefix}service/credential.mjs`));
     assert.ok(names.includes(`${prefix}docs/architecture.md`));
+    assert.ok(names.includes(`${prefix}docs/project.md`));
     assert.ok(names.includes(`${prefix}docs/refocus-plan.md`));
     assert.ok(!names.includes(`${prefix}docs/implementation-history.md`), "the historical diary is not shipped");
     // Removed features must not ship: the review UI, the agent client, and the

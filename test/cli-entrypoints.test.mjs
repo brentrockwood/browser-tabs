@@ -28,7 +28,7 @@ const COPIED_FILES = [
   "package.json",
   "package-lock.json",
   "README.md",
-  "project.md",
+  "docs/project.md",
   "build/build-extension.mjs",
   "build/release.mjs",
   "build/zip.mjs",

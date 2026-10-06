@@ -2,7 +2,7 @@
 
 Browser Tabs makes a person's own browser available to local programs as a small, typed interface. A WebExtension exposes browser state; a service running as the same user on loopback authenticates callers and validates everything that crosses between them. The browser stays the place where the person browses, and any reasoning about what to do with that state happens outside the project.
 
-The project started larger: a SQLite store of captures and derived records, a review UI, a second scoped token for agents, and preview-then-approve browser actions. In practice that machinery was more than any consumer needed. The [refocus](docs/refocus-plan.md) reduced it to what a caller actually uses: read the browser, and organize tabs into groups directly. The earlier design and its verification record are kept, as history only, in [docs/implementation-history.md](docs/implementation-history.md).
+The project started larger: a SQLite store of captures and derived records, a review UI, a second scoped token for agents, and preview-then-approve browser actions. In practice that machinery was more than any consumer needed. The [refocus](refocus-plan.md) reduced it to what a caller actually uses: read the browser, and organize tabs into groups directly. The earlier design and its verification record are kept, as history only, in [docs/implementation-history.md](implementation-history.md).
 
 ## Scope
 
@@ -16,7 +16,7 @@ browser.list_tab_groups
 browser.query_history
 ```
 
-The [README](README.md) documents each request and result. Chrome and Chromium support all eight; Firefox supports the reads and reports tab-group methods unsupported.
+The [README](../README.md) documents each request and result. Chrome and Chromium support all eight; Firefox supports the reads and reports tab-group methods unsupported.
 
 ## Trust model
 

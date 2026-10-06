@@ -210,5 +210,5 @@ To uninstall, stop the service, remove the extension, and delete `~/.browser-tab
 
 - [Architecture and security](docs/architecture.md)
 - [Development, testing, and releases](docs/development.md)
-- [Project scope](project.md)
+- [Project scope](docs/project.md)
 - [Refocus plan](docs/refocus-plan.md) — how the project reached this shape
