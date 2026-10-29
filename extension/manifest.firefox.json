@@ -13,7 +13,7 @@
   },
   "browser_specific_settings": {
     "gecko": {
-      "id": "browser-tabs@brentrockwood.com",
+      "id": "browser-tabs@rockwoodlab.com",
       "strict_min_version": "115.0"
     }
   },

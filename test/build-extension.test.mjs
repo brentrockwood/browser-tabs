@@ -44,7 +44,7 @@ test("buildFirefoxExtension produces a scripts-array manifest with no tabGroups 
     const manifest = JSON.parse(await readFile(join(outDir, "manifest.json"), "utf8"));
     assert.equal(manifest.manifest_version, 3);
     assert.deepEqual(manifest.background, { scripts: ["background.bundle.js"] });
-    assert.equal(manifest.browser_specific_settings.gecko.id, "browser-tabs@brentrockwood.com");
+    assert.equal(manifest.browser_specific_settings.gecko.id, "browser-tabs@rockwoodlab.com");
     assert.ok(!manifest.permissions.includes("tabGroups"));
     assert.ok(manifest.permissions.includes("history"));
     assert.equal(manifest.version, result.version);
