@@ -33,7 +33,8 @@ jobs:
   # above, so this job is allowed to fail without blocking the required
   # unit-tests job, and the smoke scripts themselves already distinguish a
   # real product failure (`SMOKE_FAIL`, exit 1) from an environment blocker
-  # (`SMOKE_BLOCKED`, exit 2) — see test/smoke/*.mjs's own header comments.
+  # (`SMOKE_BLOCKED`, exit 2). Each smoke step maps only exit 2 to success so
+  # infrastructure limitations do not leave a misleading red job.
   browser-smoke:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -57,12 +58,12 @@ jobs:
       - name: Chromium read-API smoke
         env:
           CHROME_PATH: /usr/bin/chromium-browser
-        run: npm run test:smoke
+        run: npm run test:smoke || test $? -eq 2
       - name: Chromium bridge, mutation, and restart smoke
         env:
           CHROME_PATH: /usr/bin/chromium-browser
-        run: npm run test:smoke:bridge
+        run: npm run test:smoke:bridge || test $? -eq 2
       - name: Firefox read-API and unsupported-mutation smoke
         env:
           FIREFOX_PATH: /usr/bin/firefox
-        run: npm run test:smoke:firefox
+        run: npm run test:smoke:firefox || test $? -eq 2
