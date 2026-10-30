@@ -48,9 +48,12 @@ jobs:
         id: firefox
         uses: browser-actions/setup-firefox@0bc507ddf224827e3b1af68e014d5e42ab93e795 # v1
       - name: Install geckodriver
-        uses: browser-actions/setup-geckodriver@bf8266f624ca122cedb6d0381a031f18f6c431cd
-        with:
-          token: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/geckodriver.tar.gz"
+          curl -fsSL https://github.com/mozilla/geckodriver/releases/download/v0.37.1/geckodriver-v0.37.1-linux64.tar.gz -o "$archive"
+          echo "e815130ea95983e162ae91843b48d3a3ce991735635fce83a647afde21e09f7e  $archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Chromium read-API smoke
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
