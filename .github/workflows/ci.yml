@@ -27,43 +27,39 @@ jobs:
       - name: Service lifecycle (start/health/authenticated request/restart/stop, no database)
         run: npm run check:service-lifecycle
 
-  # Repeatable browser smoke tests. Best-effort: installing
-  # a real, GUI-capable Chromium and Firefox build (plus geckodriver) on a
-  # hosted CI runner is inherently more fragile than the unit-tests job
-  # above, so this job is allowed to fail without blocking the required
-  # unit-tests job, and the smoke scripts themselves already distinguish a
-  # real product failure (`SMOKE_FAIL`, exit 1) from an environment blocker
-  # (`SMOKE_BLOCKED`, exit 2). Each smoke step maps only exit 2 to success so
-  # infrastructure limitations do not leave a misleading red job.
+  # Real-browser smoke tests use standalone official browser builds instead of
+  # Ubuntu's Snap launchers. SMOKE_FAIL (exit 1) and SMOKE_BLOCKED (exit 2)
+  # both fail this job so a green check proves the browser tests actually ran.
   browser-smoke:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
       - run: npm ci
-      - name: Install Chromium and Firefox
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser firefox
+      - name: Install Chrome for Testing
+        id: chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+        with:
+          chrome-version: stable
+          install-dependencies: true
+      - name: Install Firefox
+        id: firefox
+        uses: browser-actions/setup-firefox@0bc507ddf224827e3b1af68e014d5e42ab93e795 # v1
       - name: Install geckodriver
-        run: |
-          tag="$(curl -fsSL https://api.github.com/repos/mozilla/geckodriver/releases/latest | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).tag_name))')"
-          curl -fsSL "https://github.com/mozilla/geckodriver/releases/download/${tag}/geckodriver-${tag}-linux64.tar.gz" -o geckodriver.tar.gz
-          tar -xzf geckodriver.tar.gz
-          sudo mv geckodriver /usr/local/bin/geckodriver
-          sudo chmod +x /usr/local/bin/geckodriver
+        uses: browser-actions/setup-geckodriver@bf8266f624ca122cedb6d0381a031f18f6c431cd
+        with:
+          token: ${{ github.token }}
       - name: Chromium read-API smoke
         env:
-          CHROME_PATH: /usr/bin/chromium-browser
-        run: npm run test:smoke || test $? -eq 2
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run test:smoke
       - name: Chromium bridge, mutation, and restart smoke
         env:
-          CHROME_PATH: /usr/bin/chromium-browser
-        run: npm run test:smoke:bridge || test $? -eq 2
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run test:smoke:bridge
       - name: Firefox read-API and unsupported-mutation smoke
         env:
-          FIREFOX_PATH: /usr/bin/firefox
-        run: npm run test:smoke:firefox || test $? -eq 2
+          FIREFOX_PATH: ${{ steps.firefox.outputs.firefox-path }}
+        run: npm run test:smoke:firefox
