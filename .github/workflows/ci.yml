@@ -44,6 +44,10 @@ jobs:
         with:
           chrome-version: stable
           install-dependencies: true
+      - name: Configure Chrome for the hosted runner
+        run: |
+          printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "${{ steps.chrome.outputs.chrome-path }}" > "$RUNNER_TEMP/chrome-ci"
+          chmod +x "$RUNNER_TEMP/chrome-ci"
       - name: Install Firefox
         id: firefox
         uses: browser-actions/setup-firefox@0bc507ddf224827e3b1af68e014d5e42ab93e795 # v1
@@ -56,11 +60,11 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Chromium read-API smoke
         env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          CHROME_PATH: ${{ runner.temp }}/chrome-ci
         run: npm run test:smoke
       - name: Chromium bridge, mutation, and restart smoke
         env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          CHROME_PATH: ${{ runner.temp }}/chrome-ci
         run: npm run test:smoke:bridge
       - name: Firefox read-API and unsupported-mutation smoke
         env:
