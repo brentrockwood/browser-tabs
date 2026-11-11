@@ -1,13 +1,13 @@
 # Browser Tabs
 
-Browser Tabs is a small local interface to your browser. A WebExtension talks to a Node.js service on `127.0.0.1`, and local programs call that service over HTTP to list windows, tabs, and tab groups, read a tab's rendered text, query history, and make three kinds of tab-group change: create a group, rename or recolor one, and move tabs into or out of groups.
+Browser Tabs is a small local interface to your browser. A WebExtension talks to a Node.js service on `127.0.0.1`, and local programs call that service over HTTP to list windows, tabs, and tab groups, read a tab's rendered text, query history, create and pin tabs, and organize tab groups.
 
 Everything stays on your machine. There is one pairing token, no database, and no model integration.
 
 ## Requirements
 
 - Node.js 24 or newer, and npm
-- Chrome, Chromium, or Firefox (Firefox supports the reads; tab-group changes report `unsupported`)
+- Chrome, Chromium, or Firefox (Firefox supports reads, tab creation, and pinning; tab-group changes report `unsupported`)
 - macOS or Linux for the service
 
 ## Install
@@ -82,7 +82,7 @@ curl -H "Authorization: Bearer $TOKEN" -H "X-Protocol-Version: 7" \
   http://127.0.0.1:8743/api/browser.list_windows
 ```
 
-The API has exactly eight methods. Reads use `GET /api/<method>` with query parameters; changes use `POST /api/<method>` with a JSON body. Any other path, or the wrong HTTP method for a name, is `404 not_found`.
+The API has ten methods. Reads use `GET /api/<method>` with query parameters; changes use `POST /api/<method>` with a JSON body. Any other path, or the wrong HTTP method for a name, is `404 not_found`.
 
 | Method | Request |
 | --- | --- |
@@ -91,6 +91,8 @@ The API has exactly eight methods. Reads use `GET /api/<method>` with query para
 | `browser.list_tab_groups` | `GET ?windowId=&browserSessionId=` |
 | `browser.read_tab` | `GET ?tabId=&browserSessionId=` |
 | `browser.query_history` | `GET ?startTime=&endTime=` plus optional `maxResults`, `cursor` |
+| `browser.create_tab` | `POST {"browserSessionId", "url", "windowId", "pinned"?, "groupId"?}` |
+| `browser.set_tab_pinned` | `POST {"browserSessionId", "tabId", "pinned"}` |
 | `browser.create_tab_group` | `POST {"browserSessionId", "tabIds", "title"?, "color"?}` |
 | `browser.update_tab_group` | `POST {"browserSessionId", "groupId", "title"?, "color"?}` |
 | `browser.move_tabs` | `POST {"browserSessionId", "tabIds", "groupId"}` |
@@ -138,10 +140,16 @@ Titles, URLs, page text, and history entries are untrusted browser content, retu
 
 ### Changes
 
-The three change methods act directly: no preview, approval, or stored record. Each one validates the body (at most 16 KiB; unknown fields are refused, so an option the API does not have can never be silently ignored), forwards it to the extension once, and returns what the browser reports afterwards. Before changing anything the extension checks the session, re-reads the tabs and group involved, and applies these rules:
+The five change methods act directly: no preview, approval, or stored record. Each one validates the body (at most 16 KiB; unknown fields are refused, so an option the API does not have can never be silently ignored), forwards it to the extension once, and returns what the browser reports afterwards. Before changing anything the extension checks the session, re-reads the tabs and group involved, and applies these rules:
 
 - `tabIds` lists 1–100 distinct tabs. All must be in one window and none may be pinned.
 - `color` is one of `grey`, `blue`, `red`, `yellow`, `green`, `pink`, `purple`, `cyan`, `orange`. `title` is plain text up to 100 characters.
+
+**`browser.create_tab`** opens an explicit absolute URL in an explicit existing window. Relative URLs, JavaScript URLs, whitespace, and control characters are refused; other schemes remain subject to the browser's restrictions. `pinned` is optional (default `false`); `groupId` is an optional existing group in that window (omitted or `null` means no group). `pinned: true` with a group is invalid. The browser's normal active-tab behavior applies; there is no `active` option. Creation uses one `tabs.create` call, followed by one `tabs.group` call only when a group was requested. If grouping fails, the created tab remains and the result is `incomplete`, `changed: true`, `code: "group_failed"`, with its `tabId` and `windowId`. No retry or rollback is attempted.
+
+**`browser.set_tab_pinned`** pins or unpins an existing tab with an explicit boolean. Pinning a grouped tab is refused as `grouped_tab`; ungroup it explicitly first. An already-matching state is refused as `no_change`. The browser may reposition the tab when its pinned state changes.
+
+Both tab methods return `tab` in the same shape as `browser.list_tabs`, read back after the change. An `ok` result confirms identity, window, pinned state, and group membership, not that the page finished loading or retained the original URL after redirects. Read-back failure or disagreement returns `incomplete`, `changed: true`, `code: "observe_failed"`, with `tabId` and `windowId`. A rejected create/update call reports `changed: null` with `tab_create_failed`/`tab_update_failed`.
 
 **`browser.create_tab_group`** makes one group around the tabs, in their window. Title and color are optional; a new group's title may not be empty (omit it instead). The tabs may already be in other groups. The result is the new `group` and the `tabs` as observed in it.
 
@@ -150,6 +158,8 @@ The three change methods act directly: no preview, approval, or stored record. E
 **`browser.move_tabs`** has an explicit destination. With a `groupId`, the tabs move into that existing group, which must be in their window. With `"groupId": null`, they leave their groups. Tabs may come from several groups, and a group left with no tabs is removed by the browser itself — there is no separate delete. If every tab is already where it would go, the request is refused as `no_change`. The result is `group` (`null` for an ungroup) and the `tabs` as observed afterwards.
 
 ```json
+{ "browserSessionId": "…", "url": "https://example.com/", "windowId": 2, "groupId": 7 }
+{ "browserSessionId": "…", "tabId": 12, "pinned": true }
 { "browserSessionId": "…", "tabIds": [12, 13], "title": "Reading", "color": "blue" }
 { "browserSessionId": "…", "groupId": 7, "title": "Research", "color": "red" }
 { "browserSessionId": "…", "tabIds": [12, 13], "groupId": 7 }
@@ -160,11 +170,11 @@ Every change response states `changed`, in the result or in the error:
 
 | `changed` | Meaning | Typical status / code |
 | --- | --- | --- |
-| `true` | The browser was changed. `ok` means fully observed. | `ok`, or `incomplete` with `group_update_failed` (a new group exists without its title/color) or `observe_failed` (the read-back failed or disagreed) |
-| `false` | Nothing was changed. | `stale_session`, `stale_handle`, `pinned_tab`, `window_mismatch`, `no_change`, `invalid_params`, `unsupported_feature`; also every HTTP error before the request reached the extension |
-| `null` | The one browser call was attempted, but whether it took effect is unknown. | `group_failed`, `ungroup_failed`, `group_update_failed` (update), or a lost answer: `504 request_timeout`, `503 disconnected`, `502 invalid_extension_response` |
+| `true` | The browser was changed. `ok` means fully observed. | `ok`, or `incomplete` with `group_failed` (a created tab could not be grouped), `group_update_failed` (a new group exists without its title/color), or `observe_failed` (the read-back failed or disagreed) |
+| `false` | Nothing was changed. | `stale_session`, `stale_handle`, `pinned_tab`, `grouped_tab`, `window_mismatch`, `no_change`, `invalid_params`, `unsupported_feature`; also every HTTP error before the request reached the extension |
+| `null` | The one browser call was attempted, but whether it took effect is unknown. | `tab_create_failed`, `tab_update_failed`, `group_failed`, `ungroup_failed`, `group_update_failed` (update), or a lost answer: `504 request_timeout`, `503 disconnected`, `502 invalid_extension_response` |
 
-An `incomplete` result also carries `groupId`, `windowId`, and `tabIds` — `null`, or the requested tabs that were actually observed where they were sent, in request order. Nothing is ever retried automatically: re-read the browser before deciding to send the request again. The browser has no atomic read-and-change, so a change made by hand between the extension's re-read and its call is not detected.
+For the three group methods, an `incomplete` result also carries `groupId`, `windowId`, and `tabIds` — `null`, or the requested tabs that were actually observed where they were sent, in request order. Nothing is ever retried automatically: re-read the browser before deciding to send the request again. The browser has no atomic read-and-change, so a change made by hand between the extension's re-read and its call is not detected.
 
 Not supported: moving tabs between windows, moving a whole group to another window, ordering tabs, and changing a group's collapsed state (it is reported, never changed).
 
@@ -188,7 +198,8 @@ Not supported: moving tabs between windows, moving a whole group to another wind
 | --- | --- | --- |
 | Reads | Yes | Yes |
 | `browser.list_tab_groups` | Yes | `unsupported` |
-| Tab-group changes | Yes | `unsupported`, `changed: false` |
+| Tab creation (without a group), pin/unpin | Yes | Yes |
+| Tab-group changes, grouped tab creation | Yes | `unsupported`, `changed: false` |
 
 Support is detected from the APIs the browser exposes, not from its name.
 
@@ -202,7 +213,7 @@ npm run service -- stop
 npm run service -- start
 ```
 
-Reload the extension after rebuilding. The pairing token survives upgrades. An extension and service on different protocol versions refuse to pair, so rebuild and reload both together.
+These two tab methods are additive to protocol 7; older builds do not implement them. Rebuild the service and extension together. Reload the extension after rebuilding. The pairing token survives upgrades. An extension and service on different protocol versions refuse to pair, so rebuild and reload both together.
 
 To uninstall, stop the service, remove the extension, and delete `~/.browser-tabs/`.
 

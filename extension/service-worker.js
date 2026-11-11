@@ -11,9 +11,12 @@ import {
   captureEnvelope,
   compareHistoryEntries,
   isValidHandle,
+  isValidTabRecord,
   isValidSessionId,
   isValidTimestamp,
   normalizeCreateTabGroupRequest,
+  normalizeCreateTabRequest,
+  normalizeSetTabPinnedRequest,
   normalizeHistoryEntry,
   normalizeMoveTabsRequest,
   normalizeTab,
@@ -462,7 +465,7 @@ function partial(op, code, detail, { groupId = null, windowId = null, tabIds = n
 }
 
 // Re-reads every selected tab immediately before a mutation and applies the
-// rules every mutation shares: each handle still resolves to that tab, all of
+// rules every grouping mutation shares: each handle still resolves to that tab, all of
 // them are in one window, and none is pinned (grouping a pinned tab could
 // unpin or reorder it). Returns `{ refusal }` or `{ tabs, windowId }`.
 async function readSelectedTabs(op, tabIds) {
@@ -715,6 +718,95 @@ export async function moveTabs(params) {
   return { ...envelope(op, "ok"), changed: true, group: null, tabs: observed };
 }
 
+function partialTab(op, code, detail, tabId, windowId) {
+  return { ...envelope(op, "incomplete"), changed: true, code, detail, tabId, windowId };
+}
+
+async function observeTab(op, tabId, windowId, pinned, groupId) {
+  try {
+    const tab = normalizeTab(await browserApi.tabs.get(tabId));
+    if (isValidTabRecord(tab) && tab.tabId === tabId && tab.windowId === windowId &&
+        tab.pinned === pinned && tab.groupId === groupId) {
+      return { ...envelope(op, "ok"), changed: true, tab };
+    }
+    return partialTab(op, ERROR_CODES.OBSERVE_FAILED, "the tab was not observed in the requested state", tabId, windowId);
+  } catch (error) {
+    return partialTab(op, ERROR_CODES.OBSERVE_FAILED, errMsg(error), tabId, windowId);
+  }
+}
+
+export async function createTab(params) {
+  await sessionReady;
+  const op = "browser.create_tab";
+  const sessionError = checkSession(op, params?.browserSessionId);
+  if (sessionError) return refuse(sessionError);
+  const checked = normalizeCreateTabRequest(params);
+  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
+  const { url, windowId, pinned, groupId } = checked.request;
+  if (groupId !== null && !groupsSupported()) return refuse(unsupportedGroups(op));
+  try {
+    const window = await browserApi.windows.get(windowId);
+    if (window?.id !== windowId) throw new Error("windows.get did not return the requested window");
+  } catch (error) {
+    return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error)));
+  }
+  if (groupId !== null) {
+    const destination = await readGroup(op, groupId);
+    if (destination.refusal) return destination.refusal;
+    if (destination.group.windowId !== windowId) {
+      return refuse(errorResult(op, ERROR_CODES.WINDOW_MISMATCH, "the destination group is not in the requested window"));
+    }
+  }
+  let created;
+  try {
+    created = await browserApi.tabs.create({ url, windowId, pinned });
+  } catch (error) {
+    return unknownChange(op, ERROR_CODES.TAB_CREATE_FAILED, errMsg(error));
+  }
+  if (!isValidHandle(created?.id)) {
+    return unknownChange(op, ERROR_CODES.OBSERVE_FAILED, "tabs.create returned no usable tab id");
+  }
+  const tabId = created.id;
+  // Check the new tab before grouping too: never implicitly unpin or move it.
+  const observed = await observeTab(op, tabId, windowId, pinned, TAB_GROUP_ID_NONE);
+  if (observed.status !== "ok" || groupId === null) return observed;
+  try {
+    await browserApi.tabs.group({ groupId, tabIds: [tabId] });
+  } catch (error) {
+    return partialTab(op, ERROR_CODES.GROUP_FAILED, errMsg(error), tabId, windowId);
+  }
+  return observeTab(op, tabId, windowId, pinned, groupId);
+}
+
+export async function setTabPinned(params) {
+  await sessionReady;
+  const op = "browser.set_tab_pinned";
+  const sessionError = checkSession(op, params?.browserSessionId);
+  if (sessionError) return refuse(sessionError);
+  const checked = normalizeSetTabPinnedRequest(params);
+  if (!checked.valid) return refuse(errorResult(op, ERROR_CODES.INVALID_PARAMS, checked.reason));
+  const { tabId, pinned } = checked.request;
+  let current;
+  try {
+    current = await browserApi.tabs.get(tabId);
+    if (current?.id !== tabId || !isValidHandle(current.windowId)) throw new Error("tabs.get did not return the requested tab");
+  } catch (error) {
+    return refuse(errorResult(op, ERROR_CODES.STALE_HANDLE, errMsg(error)));
+  }
+  if (pinned && tabGroupMembership(current) !== TAB_GROUP_ID_NONE) {
+    return refuse(errorResult(op, ERROR_CODES.GROUPED_TAB, "a grouped tab cannot be pinned; ungroup it explicitly first"));
+  }
+  if (Boolean(current.pinned) === pinned) {
+    return refuse(errorResult(op, ERROR_CODES.NO_CHANGE, "the tab already has the requested pinned state"));
+  }
+  try {
+    await browserApi.tabs.update(tabId, { pinned });
+  } catch (error) {
+    return unknownChange(op, ERROR_CODES.TAB_UPDATE_FAILED, errMsg(error));
+  }
+  return observeTab(op, tabId, current.windowId, pinned, tabGroupMembership(current));
+}
+
 // Shared by the extension's own runtime.onMessage listener and by requests
 // forwarded over the service WebSocket, so both entry points dispatch
 // identically — for read-only methods. Browser mutations are deliberately not
@@ -746,13 +838,15 @@ export async function routeMessage(message) {
 }
 
 // The service WebSocket's dispatcher: everything routeMessage handles, plus
-// the three tab-group mutations. Only requests from the authenticated service
+// the browser mutations. Only requests from the authenticated service
 // reach it; `runtime.onMessage` below uses the read-only routeMessage, so
 // extension pages and other message senders cannot change the browser.
 // A forwarded request's parameters arrive as the message's own fields
 // alongside `method`, which is not a request field and is dropped here.
 export async function routeServiceMessage(message) {
   const { method, ...params } = message ?? {};
+  if (method === "browser.create_tab") return createTab(params);
+  if (method === "browser.set_tab_pinned") return setTabPinned(params);
   if (method === "browser.create_tab_group") return createTabGroup(params);
   if (method === "browser.update_tab_group") return updateTabGroup(params);
   if (method === "browser.move_tabs") return moveTabs(params);

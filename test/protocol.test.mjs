@@ -450,7 +450,7 @@ test("validateMethodResult checks query_history-specific fields, including a nul
   );
 });
 
-test("the protocol version is 7, the reduced eight-method contract", () => {
+test("the protocol version remains 7 for additive methods", () => {
   assert.equal(PROTOCOL_VERSION, 7);
 });
 

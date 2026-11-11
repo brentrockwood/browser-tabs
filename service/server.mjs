@@ -11,8 +11,11 @@ import {
   PROTOCOL_VERSION,
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_MS,
+  TAB_GROUP_ID_NONE,
   WS_MESSAGE_TYPES,
   normalizeCreateTabGroupRequest,
+  normalizeCreateTabRequest,
+  normalizeSetTabPinnedRequest,
   normalizeMoveTabsRequest,
   normalizeUpdateTabGroupRequest,
   validateMethodResult,
@@ -75,18 +78,19 @@ const API_ROUTES = new Map([
   ],
 ]);
 
-// The three direct tab-group mutations, exposed as POST /api/<method> routes
+// The direct browser mutations, exposed as POST /api/<method> routes
 // with a JSON body, each paired with the shared request validator
 // (extension/protocol.js) the extension re-applies before mutating anything.
 // No preview, approval, or stored record is involved: a valid request is
 // forwarded once, and the extension's observed outcome is returned.
 const MUTATION_ROUTES = new Map([
+  ["browser.create_tab", normalizeCreateTabRequest],
+  ["browser.set_tab_pinned", normalizeSetTabPinnedRequest],
   ["browser.create_tab_group", normalizeCreateTabGroupRequest],
   ["browser.update_tab_group", normalizeUpdateTabGroupRequest],
   ["browser.move_tabs", normalizeMoveTabsRequest],
 ]);
-// A mutation body is at most 100 tab ids and a short title; anything larger
-// is refused before it is parsed.
+// Bound mutation bodies, including caller-supplied URLs, before parsing.
 const MAX_MUTATION_BODY_BYTES = 16 * 1024;
 
 // HTTP statuses for the stable transport-error codes a caller can receive
@@ -184,6 +188,17 @@ function respondJson(res, status, body) {
 function mutationResultMatchesRequest(method, request, result) {
   if (result.changed !== true) return true;
   if (result.browserSessionId !== request.browserSessionId) return false;
+  if (method === "browser.create_tab" || method === "browser.set_tab_pinned") {
+    if (result.status === "ok") {
+      if (result.tab.pinned !== request.pinned) return false;
+      return method === "browser.create_tab"
+        ? result.tab.windowId === request.windowId && result.tab.groupId === (request.groupId ?? TAB_GROUP_ID_NONE)
+        : result.tab.tabId === request.tabId;
+    }
+    return method === "browser.create_tab"
+      ? result.windowId === request.windowId
+      : result.tabId === request.tabId;
+  }
   const requestedGroup = method === "browser.create_tab_group" ? undefined : request.groupId;
   if (result.status === "ok") {
     if (method === "browser.update_tab_group") return result.group.groupId === requestedGroup;
@@ -456,7 +471,7 @@ export function createService({
     return parsed;
   }
 
-  // One direct tab-group mutation: authenticate, bound and validate the body
+  // One direct browser mutation: authenticate, bound and validate the body
   // with the shared request validator, forward it to the extension once, and
   // return the extension's validated, observed outcome. Never retried. Every
   // response — result or error — states `changed`: `false` when nothing can

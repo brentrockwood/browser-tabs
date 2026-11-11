@@ -6,17 +6,17 @@ The project started larger: a SQLite store of captures and derived records, a re
 
 ## Scope
 
-Eight browser methods, one pairing token, and the operational `health`, `status`, and `stop`:
+Ten browser methods, one pairing token, and the operational `health`, `status`, and `stop`:
 
 ```text
 browser.list_windows        browser.create_tab_group
 browser.list_tabs           browser.update_tab_group
 browser.read_tab            browser.move_tabs
-browser.list_tab_groups
-browser.query_history
+browser.list_tab_groups     browser.create_tab
+browser.query_history       browser.set_tab_pinned
 ```
 
-The [README](../README.md) documents each request and result. Chrome and Chromium support all eight; Firefox supports the reads and reports tab-group methods unsupported.
+The [README](../README.md) documents each request and result. Chrome and Chromium support all ten; Firefox supports reads, tab creation, and pinning and reports tab-group methods unsupported.
 
 ## Trust model
 

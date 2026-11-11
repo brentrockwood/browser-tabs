@@ -53,13 +53,13 @@ export const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 // gets a stable `unsupported_protocol_version` error instead of an undefined
 // result.
 //
-// Version 7 is the reduced contract: five reads (`browser.list_windows`,
+// Version 7 began as the reduced contract: five reads (`browser.list_windows`,
 // `browser.list_tabs`, `browser.read_tab`, `browser.list_tab_groups`,
 // `browser.query_history`) and three direct tab-group mutations
 // (`browser.create_tab_group`, `browser.update_tab_group`,
 // `browser.move_tabs`). Earlier versions carried preview/approval actions and
 // other methods that no longer exist, so the handshake refuses any older
-// extension outright.
+// extension outright. It also supports additive create-tab and pin mutations.
 export const PROTOCOL_VERSION = 7;
 
 // The most tabs one mutation request may name. Bounds the request body, the
@@ -166,6 +166,9 @@ export const ERROR_CODES = Object.freeze({
   // before anything is changed: a pinned tab, tabs (or the destination group)
   // in more than one window, and a request that would change nothing.
   PINNED_TAB: "pinned_tab",
+  GROUPED_TAB: "grouped_tab",
+  TAB_CREATE_FAILED: "tab_create_failed",
+  TAB_UPDATE_FAILED: "tab_update_failed",
   WINDOW_MISMATCH: "window_mismatch",
   NO_CHANGE: "no_change",
   // The one mutation call (`tabs.group`, `tabs.ungroup`, or
@@ -337,6 +340,34 @@ export function normalizeMoveTabsRequest(value) {
   return { valid: true, request: { tabIds: [...value.tabIds], groupId: value.groupId } };
 }
 
+export function normalizeCreateTabRequest(value) {
+  const shapeError = requestObjectError(value, ["browserSessionId", "url", "windowId", "pinned", "groupId"]);
+  if (shapeError) return invalidRequest(shapeError);
+  if (!isValidHandle(value.windowId)) return invalidRequest("windowId must be a non-negative safe integer");
+  if (typeof value.url !== "string" || value.url !== value.url.trim() || /[\s\u0000-\u001f\u007f-\u009f]/.test(value.url)) {
+    return invalidRequest("url must be an explicit absolute URL without whitespace or control characters");
+  }
+  try {
+    if (new URL(value.url).protocol === "javascript:") return invalidRequest("JavaScript URLs are not supported");
+  } catch {
+    return invalidRequest("url must be an explicit absolute URL");
+  }
+  const pinned = value.pinned === undefined ? false : value.pinned;
+  const groupId = value.groupId ?? null;
+  if (typeof pinned !== "boolean") return invalidRequest("pinned must be a boolean");
+  if (groupId !== null && !isValidHandle(groupId)) return invalidRequest("groupId must be a non-negative safe integer or null");
+  if (pinned && groupId !== null) return invalidRequest("a pinned tab cannot be created in a group");
+  return { valid: true, request: { url: value.url, windowId: value.windowId, pinned, groupId } };
+}
+
+export function normalizeSetTabPinnedRequest(value) {
+  const shapeError = requestObjectError(value, ["browserSessionId", "tabId", "pinned"]);
+  if (shapeError) return invalidRequest(shapeError);
+  if (!isValidHandle(value.tabId)) return invalidRequest("tabId must be a non-negative safe integer");
+  if (typeof value.pinned !== "boolean") return invalidRequest("pinned must be a boolean");
+  return { valid: true, request: { tabId: value.tabId, pinned: value.pinned } };
+}
+
 // Every status a `browser.*` result's envelope may carry. "incomplete" is
 // used by `browser.query_history` when its explicit scan ceiling
 // (MAX_HISTORY_SCAN) is reached before a full page can be determined (see
@@ -450,6 +481,8 @@ function isValidHistoryEntryRecord(value) {
 // fixed strings routeMessage already dispatched on), so there is no
 // prototype-pollution surface here.
 const OK_SHAPE_VALIDATORS = {
+  "browser.create_tab": (result) => result.changed === true && isValidTabRecord(result.tab) && (!result.tab.pinned || result.tab.groupId === TAB_GROUP_ID_NONE),
+  "browser.set_tab_pinned": (result) => result.changed === true && isValidTabRecord(result.tab) && (!result.tab.pinned || result.tab.groupId === TAB_GROUP_ID_NONE),
   "browser.list_windows": (result) =>
     isValidRecordList(result.windows, isValidWindowRecord) &&
     isNonNegativeInteger(result.returnedCount) &&
@@ -577,13 +610,13 @@ export function validateMethodResult(method, result) {
   if (!isNonEmptyString(result.code)) {
     return { valid: false, reason: `a "${result.status}" result must carry a non-empty "code"` };
   }
-  if (MUTATION_METHODS.includes(method) && !isValidMutationNonOkShape(result)) {
+  if (MUTATION_METHODS.includes(method) && !isValidMutationNonOkShape(result, method)) {
     return { valid: false, reason: `a "${result.status}" result for "${method}" must state whether the browser was changed, consistently` };
   }
   return { valid: true };
 }
 
-export const MUTATION_METHODS = Object.freeze(["browser.create_tab_group", "browser.update_tab_group", "browser.move_tabs"]);
+export const MUTATION_METHODS = Object.freeze(["browser.create_tab", "browser.set_tab_pinned", "browser.create_tab_group", "browser.update_tab_group", "browser.move_tabs"]);
 
 // A non-"ok" mutation result states whether the browser changed in one of
 // three ways. `changed: false`: refused before the one mutation call, so
@@ -595,8 +628,14 @@ export const MUTATION_METHODS = Object.freeze(["browser.create_tab_group", "brow
 // `incomplete`, carrying the handles that are known (`groupId`/`windowId`
 // null when unknown) and `tabIds`: null, or the ordered subset of the
 // requested tabs that *were* observed in their requested place. Only an "ok"
-// result says every tab was.
-function isValidMutationNonOkShape(result) {
+// result says every tab was. Single-tab mutations instead carry the known
+// tabId and windowId when incomplete.
+function isValidMutationNonOkShape(result, method) {
+  if ((method === "browser.create_tab" || method === "browser.set_tab_pinned") && result.changed === true) {
+    return result.status === "incomplete" &&
+      (result.code === ERROR_CODES.OBSERVE_FAILED || (method === "browser.create_tab" && result.code === ERROR_CODES.GROUP_FAILED)) &&
+      isValidHandle(result.tabId) && isValidHandle(result.windowId);
+  }
   if (result.changed === false) return result.status !== "incomplete";
   if (result.changed === null) return result.status === "error";
   return (

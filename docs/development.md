@@ -30,7 +30,8 @@ The main test files:
 | `test/service-worker.test.mjs` | the five reads, sessions, the read-only message listener |
 | `test/tab-group-mutations.test.mjs` | change requests and results, and the extension's three changes against a stateful mock browser |
 | `test/bridge.test.mjs` | the service/extension transport, read routes, bounds, the exact route surface |
-| `test/mutation-routes.test.mjs` | the three change routes over HTTP: auth, body bounds, forwarding, `changed` on every response |
+| `test/tab-mutations.test.mjs` | create/pin validation, authenticated-only dispatch, state checks, and partial outcomes against a mock browser |
+| `test/mutation-routes.test.mjs` | the five change routes over HTTP: auth, body bounds, forwarding, `changed` on every response |
 | `test/host-defense.test.mjs` | `Host` header checks |
 | `test/credential.test.mjs` | the pairing token file |
 | `test/release.test.mjs`, `test/build-extension.test.mjs`, `test/versions.test.mjs` | packaging |
@@ -43,7 +44,7 @@ CHROME_PATH=/path/to/chrome-for-testing npm run test:smoke:bridge   # full bridg
 FIREFOX_PATH=/path/to/firefox GECKODRIVER_PATH=/path/to/geckodriver npm run test:smoke:firefox
 ```
 
-The bridge smoke runs the real service and extension: reads, every change and refusal checked against the browser's own tabs and groups, survival past the service-worker idle window, recovery after a service restart and a browser restart, and session rotation. It takes several minutes because it waits out the idle window and the reconnect alarm on purpose. The Firefox smoke installs the built package, checks the reads, and checks that all three changes answer `unsupported` with `changed: false`.
+The bridge smoke runs the real service and extension: reads, group changes and refusals checked against the browser's own tabs and groups, survival past the service-worker idle window, recovery after a service restart and a browser restart, and session rotation. It takes several minutes because it waits out the idle window and the reconnect alarm on purpose. The new create/pin methods have mock-browser and HTTP tests; live-browser coverage is not yet included. The Firefox smoke installs the built package, checks the reads, and checks that all three group changes answer `unsupported` with `changed: false`.
 
 Set `SMOKE_HEADLESS=false` for a headed run. The Chromium scripts also accept `CHROMIUM_PATH`. Each script ends with `SMOKE_PASS`, `SMOKE_FAIL` (a product assertion failed), or `SMOKE_BLOCKED` (the environment could not run it).
 

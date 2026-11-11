@@ -286,3 +286,97 @@ test("mutation requests count against the same rate limit as reads", async () =>
     ws.close();
   });
 });
+
+const CREATED_TAB = {
+  tabId: 5, windowId: 2, index: 0, active: true, pinned: false, audible: false,
+  discarded: false, groupId: -1, status: "loading", title: null, url: "https://example.com/",
+};
+
+for (const [method, body] of [
+  ["browser.create_tab", { windowId: 2, url: "https://example.com/", pinned: true }],
+  ["browser.set_tab_pinned", { tabId: 5, pinned: true }],
+]) {
+  const path = `/api/${method}`;
+  const request = { browserSessionId: SESSION_ID, ...body };
+  const good = () => envelope(method, "ok", { changed: true, tab: { ...CREATED_TAB, pinned: true } });
+
+  test(`${method}: authenticated POST forwards normalized fields once and binds the result`, async () => {
+    await withService({}, async (port) => {
+      const ws = await openExtension(port);
+      const seen = respondWith(ws, good);
+      for (const authorization of [undefined, "Bearer wrong"]) {
+        const denied = await httpRequest({ port, path, body: request, headers: { authorization } });
+        assert.equal(denied.status, 401);
+        assert.equal(denied.json.error.changed, false);
+      }
+      const version = await httpRequest({ port, path, body: request, headers: { "x-protocol-version": "0" } });
+      assert.equal(version.status, 400);
+      const invalid = await httpRequest({ port, path, body: { ...request, active: false } });
+      assert.equal(invalid.status, 400);
+      assert.equal(invalid.json.error.changed, false);
+      assert.equal(seen.length, 0);
+      const response = await httpRequest({ port, path, body: request });
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.json.result, good());
+      assert.equal(seen.length, 1);
+      assert.deepEqual(seen[0].params, method === "browser.create_tab" ? { ...request, groupId: null } : request);
+      ws.close();
+    });
+  });
+
+  test(`${method}: wrong session, identity, pin state and malformed results become unknown outcomes`, async () => {
+    await withService({}, async (port) => {
+      const ws = await openExtension(port);
+      let result;
+      const seen = respondWith(ws, () => result);
+      const patches = [
+        { browserSessionId: "other" }, { sourceOperation: "browser.list_tabs" },
+        { tab: { ...good().tab, pinned: false } }, { tab: {} },
+        { tab: { ...good().tab, [method === "browser.create_tab" ? "windowId" : "tabId"]: 999 } },
+        { status: "incomplete", code: "observe_failed", tabId: method === "browser.create_tab" ? 5 : 999, windowId: 999 },
+      ];
+      if (method === "browser.create_tab") patches.push({ tab: { ...good().tab, pinned: false, groupId: 3 } });
+      for (const patch of patches) {
+        result = { ...good(), ...patch };
+        const response = await httpRequest({ port, path, body: request });
+        assert.equal(response.status, 502, JSON.stringify(patch));
+        assert.equal(response.json.error.code, "invalid_extension_response");
+        assert.equal(response.json.error.changed, null);
+      }
+      assert.equal(seen.length, patches.length);
+      ws.close();
+    });
+  });
+
+  test(`${method}: timeout is unknown and is not retried`, async () => {
+    await withService({ requestTimeoutMs: 30 }, async (port) => {
+      const ws = await openExtension(port);
+      const seen = respondWith(ws, () => undefined);
+      const response = await httpRequest({ port, path, body: request });
+      assert.equal(response.status, 504);
+      assert.equal(response.json.error.changed, null);
+      assert.equal(seen.length, 1);
+      ws.close();
+    });
+  });
+}
+
+test("create_tab: grouped success binds membership and partial grouping failure retains the created tab", async () => {
+  await withService({}, async (port) => {
+    const ws = await openExtension(port);
+    let result = envelope("browser.create_tab", "ok", { changed: true, tab: { ...CREATED_TAB, groupId: 3 } });
+    const seen = respondWith(ws, () => result);
+    const send = () => httpRequest({ port, path: "/api/browser.create_tab", body: {
+      browserSessionId: SESSION_ID, url: "https://example.com/", windowId: 2, groupId: 3,
+    } });
+    assert.equal((await send()).status, 200);
+    result.tab.groupId = 4;
+    assert.equal((await send()).status, 502);
+    result = envelope("browser.create_tab", "incomplete", {
+      changed: true, code: "group_failed", tabId: 5, windowId: 2,
+    });
+    assert.deepEqual((await send()).json.result, result);
+    assert.equal(seen.length, 3);
+    ws.close();
+  });
+});
